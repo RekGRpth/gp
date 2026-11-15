@@ -80,10 +80,10 @@ like(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM r WHERE r.a = t1.
 	qr/GpSlice/, 'a replicated subquery is available on every segment');
 like(plan_for('SELECT t1.a, (SELECT count(*) FROM r) FROM t1'),
 	qr/GpSlice/, 'an uncorrelated replicated scalar subquery is safe');
-unlike(plan_for('SELECT t1.a, (SELECT count(*) FROM t2) FROM t1'),
-	qr/GpSlice/, 'an uncorrelated hashed scalar subquery stays on the coordinator');
-unlike(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM u WHERE u.a = t1.a)'),
-	qr/GpSlice/, 'a noncolocated correlated input stays on the coordinator');
+like(plan_for('SELECT t1.a, (SELECT count(*) FROM t2) FROM t1'),
+	qr/GpSlice(?s:.*)gp\.peer_query/, 'an uncorrelated hashed scalar subquery is broadcast whole');
+like(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM u WHERE u.a = t1.a)'),
+	qr/GpSlice(?s:.*)gp\.peer_query/, 'a two-way correlated input uses Motion at its own level');
 like(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM t2 t2x WHERE t2x.a = t2.a))'),
 	qr/GpSlice/, 'nested correlated levels use their exact parent depth');
 like(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM t2 t2x WHERE t2x.a = t2.a AND EXISTS (SELECT 1 FROM t2 t2y WHERE t2y.a = t2x.a)))'),

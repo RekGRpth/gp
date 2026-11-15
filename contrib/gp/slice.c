@@ -2735,7 +2735,7 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 	if (!redistributing && list_length(tables) > 2 && !multiway)
 		return false;
 	jointype = gp_slice_join_type_of(original);
-	if (list_length(tables) != 2 &&
+	if ((list_length(tables) != 2 || original->hasSubLinks) &&
 		!gp_slice_join_all_inner_levels(tables))
 		return false;
 	if (redistributing)
@@ -2974,9 +2974,6 @@ gp_slice_join_query(Query *parse)
 		GpJoinTable *stay;
 		List	   *moves;
 
-		/* Two-way correlated Motion remains on the coordinator */
-		if (parse->hasSubLinks && list_length(tables) <= 2)
-			return NULL;
 		if (gp_dispatch_in_xact() ||
 			(list_length(tables) > 2 &&
 			 !gp_slice_join_broadcast_component(parse, tables, conds,
@@ -3035,8 +3032,6 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	if (!gp_slice_join_colocated(original, tables, conds) &&
 		(locus.kind == GP_LOCUS_COORDINATOR || original->hasSubLinks))
 	{
-		if (original->hasSubLinks && list_length(tables) <= 2)
-			return false;
 		{
 			bool		motion_ok = gp_slice_join_motion(original, tables, conds,
 													 &single_segment, &agg_stay);
