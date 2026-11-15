@@ -556,14 +556,18 @@ condition the planner pushed into the aggregate's `HAVING` and outputs it
 pruned.  A plan that answers the `ORDER BY` by its own order is left alone,
 and so is a subquery with a limit of its own and a subquery joined to a table.
 
-A correlated subquery can also run as part of a local slice when every hashed
+A correlated subquery can run as part of a local slice when every hashed
 input at every supported level is connected to the others by the whole
 distribution key; replicated inputs need no such connection.  The analysis
 keeps the nesting depth and ancestor queries of every condition.  An outer Var
 must have the exact `varlevelsup` of its owning ancestor, so equal RT indexes
 of unrelated or sibling levels cannot prove colocation.  Nested correlated
-levels are supported under the same rule; unconnected hashed inputs and
-correlated plans that need Motion stay on the coordinator.  This covers
+levels are supported under the same rule.
+
+A multiway all-inner query without an aggregate can instead use Motion for its
+nested hashed inputs.  Every moved RTE is rewritten in the query that owns it,
+never merely at the top level.  Two-way correlated Motion, nested outer joins,
+and aggregates over nested Motion stay on the coordinator.  These paths cover
 correlated `EXISTS`, scalar aggregates, and outer aggregates without changing
 the original SQL.
 
@@ -754,6 +758,7 @@ start their own clusters:
 | `036_cte_locus.pl` | Nonrecursive materialized CTEs: the locus comes from `PlannedStmt.subplans`, while projection, a condition, sort and limit above `CteScan` preserve it; replicated CTEs, and why outer joins, multiple CTEs and recursion stay on the coordinator |
 | `037_distinct_locus.pl` | `DISTINCT` and `DISTINCT ON`: the whole distribution key in the output, compound keys and their prefixes, replicated inputs, and `Unique` kept above the distributed scan to preserve ordering |
 | `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by expressions and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole on this path |
+| `042_correlated_locus.pl` | Correlated and nested subqueries: exact ancestor ownership, colocated and replicated inputs, multiway Motion in the owning query level, independent sibling broadcast, differential answers, and two-way, outer-join and aggregate Motion fallbacks |
 | `044_tpch.pl` | All 22 TPC-H queries on a small deterministic data set: every answer matches ordinary `local_*` tables, and the expected set of distributed-slice plans is fixed. Query texts come from DuckDB 1.5.4 `extension/tpch/dbgen/queries`; this is a correctness and plan regression, not a dbgen or performance benchmark |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched

@@ -2024,12 +2024,12 @@ gp_slice_join_redistributable(Query *parse, List *tables, List *conds,
 		return false;
 
 	/* The key columns must hash to one place, so they are of one type */
-	rel1 = table_open(rt_fetch(first->rti, parse->rtable)->relid,
+	rel1 = table_open(rt_fetch(first->rti, first->query->rtable)->relid,
 					  AccessShareLock);
 	foreach(lc, pending)
 	{
 		GpJoinTable *table = lfirst(lc);
-		Relation	rel2 = table_open(rt_fetch(table->rti, parse->rtable)->relid,
+		Relation	rel2 = table_open(rt_fetch(table->rti, table->query->rtable)->relid,
 									AccessShareLock);
 		bool		ok = true;
 
@@ -2288,7 +2288,7 @@ gp_slice_redistribute_rte_keys(Query *remote, GpJoinTable *stay, GpJoinTable *mo
 							 const Bitmapset *needed,
 							 bool default_collation)
 {
-	RangeTblEntry *rte = rt_fetch(move->rti, remote->rtable);
+	RangeTblEntry *rte;
 	Relation	rel;
 	TupleDesc	tupdesc;
 	StringInfoData sql;
@@ -2304,6 +2304,10 @@ gp_slice_redistribute_rte_keys(Query *remote, GpJoinTable *stay, GpJoinTable *mo
 	Const	   *arg;
 	Oid			peer_query_oid;
 
+	/* Equal RT indexes of different query levels name different tables */
+	if (move->query != NULL)
+		remote = move->query;
+	rte = rt_fetch(move->rti, remote->rtable);
 	rel = table_open(rte->relid, AccessShareLock);
 	tupdesc = RelationGetDescr(rel);
 
@@ -2677,6 +2681,27 @@ gp_slice_join_all_inner_from(Query *parse)
 	return true;
 }
 
+static bool
+gp_slice_join_all_inner_levels(List *tables)
+{
+	List	   *queries = NIL;
+	ListCell   *lc;
+
+	foreach(lc, tables)
+	{
+		GpJoinTable *table = lfirst(lc);
+
+		if (!list_member_ptr(queries, table->query))
+			queries = lappend(queries, table->query);
+	}
+	foreach(lc, queries)
+	{
+		if (!gp_slice_join_all_inner_from(lfirst(lc)))
+			return false;
+	}
+	return true;
+}
+
 /*
  * Move the sides of a join of colocation groups.  An inner join moves every
  * table of another group by the hash of its key under the map of the first.
@@ -2711,10 +2736,8 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 		return false;
 	jointype = gp_slice_join_type_of(original);
 	if (list_length(tables) != 2 &&
-		!gp_slice_join_all_inner_from(original))
-	{
+		!gp_slice_join_all_inner_levels(tables))
 		return false;
-	}
 	if (redistributing)
 	{
 		move = linitial(moves);
@@ -2940,9 +2963,7 @@ gp_slice_join_query(Query *parse)
 	if (!IsA(parse->jointree, FromExpr) || parse->jointree->fromlist == NIL)
 		return NULL;
 	if (!gp_slice_join_from(parse, &tables, &conds))
-	{
-			return NULL;
-	}
+		return NULL;
 	if (parse->hasSubLinks &&
 		!gp_slice_join_sublinks(parse, &tables, &conds))
 		return NULL;
@@ -2953,8 +2974,9 @@ gp_slice_join_query(Query *parse)
 		GpJoinTable *stay;
 		List	   *moves;
 
-		/* Nested RTEs cannot be rewritten into Motion by the simple join path */
-		if (parse->hasSubLinks)
+		/* Aggregate target lists and two-way correlated Motion stay here */
+		if (parse->hasSubLinks &&
+			(list_length(tables) <= 2 || parse->hasAggs))
 			return NULL;
 		if (gp_dispatch_in_xact() ||
 			(list_length(tables) > 2 &&
@@ -3006,18 +3028,22 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
 	if (!gp_slice_join_from(original, &tables, &conds))
 		return false;
+	if (original->hasSubLinks &&
+		!gp_slice_join_sublinks(original, &tables, &conds))
+		return false;
 	if (!gp_slice_join_load_policies(original, tables))
 		return false;
-	if (locus.kind == GP_LOCUS_COORDINATOR &&
-		!gp_slice_join_colocated(original, tables, conds))
+	if (!gp_slice_join_colocated(original, tables, conds) &&
+		(locus.kind == GP_LOCUS_COORDINATOR || original->hasSubLinks))
 	{
-		if (original->hasSubLinks)
+		if (original->hasSubLinks &&
+			(list_length(tables) <= 2 || original->hasAggs))
 			return false;
 		{
 			bool		motion_ok = gp_slice_join_motion(original, tables, conds,
 													 &single_segment, &agg_stay);
 
-						if (!motion_ok)
+			if (!motion_ok)
 				return false;
 		}
 
@@ -3115,13 +3141,16 @@ gp_slice_subquery_replicated(Query *subquery, bool is_join)
 
 		if (!gp_slice_join_from(subquery, &tables, &conds))
 			return false;
+		if (subquery->hasSubLinks &&
+			!gp_slice_join_sublinks(subquery, &tables, &conds))
+			return false;
 		if (!gp_slice_join_colocated(subquery, tables, conds))
 		{
 			GpJoinTable *stay;
 			List	   *moves;
 
 			/* Both sides of a full join are broadcast to one segment */
-			return list_length(tables) == 2 &&
+			return !subquery->hasSubLinks && list_length(tables) == 2 &&
 				gp_slice_join_type_of(subquery) == JOIN_FULL &&
 				(gp_slice_join_redistributable(subquery, tables, conds,
 											   &stay, &moves) ||
@@ -3302,8 +3331,11 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 
 		if (!gp_slice_join_from(candidate, &tables, &conds))
 			return gp_locus_make(GP_LOCUS_COORDINATOR);
-		if (locus.kind == GP_LOCUS_COORDINATOR &&
-			!gp_slice_join_colocated(candidate, tables, conds))
+		if (candidate->hasSubLinks &&
+			!gp_slice_join_sublinks(candidate, &tables, &conds))
+			return gp_locus_make(GP_LOCUS_COORDINATOR);
+		if (!gp_slice_join_colocated(candidate, tables, conds) &&
+			(locus.kind == GP_LOCUS_COORDINATOR || candidate->hasSubLinks))
 		{
 			if (!gp_slice_join_motion(candidate, tables, conds, &single_segment,
 									  &agg_stay))
