@@ -96,8 +96,10 @@ like(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t
 	qr/GpSlice(?s:.*)gp\.peer_query/, 'three levels can broadcast a noncolocated input');
 unlike(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 LEFT JOIN u ON u.a = t2.a WHERE t2.a = t1.a)'),
 	qr/GpSlice/, 'a nested multiway outer join stays on the coordinator');
-unlike(plan_for('SELECT t1.a, count(*) FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2.a)) GROUP BY t1.a'),
-	qr/GpSlice/, 'an aggregate over nested multiway Motion stays on the coordinator');
+like(plan_for('SELECT t1.a, count(*) FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2.a)) GROUP BY t1.a'),
+	qr/GpSlice(?s:.*)gp\.peer_query/, 'an outer aggregate can follow nested multiway Motion');
+like(plan_for('SELECT t1.v, sum(t1.v) FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2.a)) GROUP BY t1.v'),
+	qr/GpSlice/, 'a partial aggregate can follow nested multiway Motion');
 
 run('SET enable_mergejoin = off');
 my @queries = (
@@ -115,6 +117,7 @@ my @queries = (
 	'SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM t2 t2x WHERE t2x.a = t2.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2x.a))) ORDER BY t1.a',
 	'SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 LEFT JOIN u ON u.a = t2.a WHERE t2.a = t1.a) ORDER BY t1.a',
 	'SELECT t1.a, count(*) FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2.a)) GROUP BY t1.a ORDER BY t1.a',
+	'SELECT t1.v, sum(t1.v) FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2.a)) GROUP BY t1.v ORDER BY t1.v',
 );
 foreach my $query (@queries)
 {

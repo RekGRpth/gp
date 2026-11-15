@@ -62,7 +62,7 @@ my $tpch_dir = dirname(__FILE__) . '/tpch';
 run(slurp_file("$tpch_dir/setup.sql"));
 
 my %slice = map { $_ => 1 }
-  qw(q01 q02 q03 q04 q05 q06 q10 q12 q14 q19 q20);
+  qw(q01 q02 q03 q04 q05 q06 q10 q11 q12 q14 q17 q18 q19 q20);
 foreach my $number (1 .. 22)
 {
 	my $name = sprintf('q%02d', $number);

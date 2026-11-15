@@ -2974,9 +2974,8 @@ gp_slice_join_query(Query *parse)
 		GpJoinTable *stay;
 		List	   *moves;
 
-		/* Aggregate target lists and two-way correlated Motion stay here */
-		if (parse->hasSubLinks &&
-			(list_length(tables) <= 2 || parse->hasAggs))
+		/* Two-way correlated Motion remains on the coordinator */
+		if (parse->hasSubLinks && list_length(tables) <= 2)
 			return NULL;
 		if (gp_dispatch_in_xact() ||
 			(list_length(tables) > 2 &&
@@ -3036,8 +3035,7 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	if (!gp_slice_join_colocated(original, tables, conds) &&
 		(locus.kind == GP_LOCUS_COORDINATOR || original->hasSubLinks))
 	{
-		if (original->hasSubLinks &&
-			(list_length(tables) <= 2 || original->hasAggs))
+		if (original->hasSubLinks && list_length(tables) <= 2)
 			return false;
 		{
 			bool		motion_ok = gp_slice_join_motion(original, tables, conds,
@@ -3080,8 +3078,9 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 
 		if (gp_slice_join_partial(original, stmt, plan, parent, sort_above, motion))
 			return true;
-		if (gp_slice_join_redistributed_agg(original, stmt, plan, parent,
-										 sort_above, tables))
+		if ((!original->hasSubLinks || !motion) &&
+			gp_slice_join_redistributed_agg(original, stmt, plan, parent,
+											sort_above, tables))
 			return true;
 		if (original->groupClause == NIL)
 			return false;
@@ -3337,6 +3336,8 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 		if (!gp_slice_join_colocated(candidate, tables, conds) &&
 			(locus.kind == GP_LOCUS_COORDINATOR || candidate->hasSubLinks))
 		{
+			if (candidate->hasSubLinks && candidate->hasAggs)
+				return gp_locus_make(GP_LOCUS_COORDINATOR);
 			if (!gp_slice_join_motion(candidate, tables, conds, &single_segment,
 									  &agg_stay))
 				return gp_locus_make(GP_LOCUS_COORDINATOR);
@@ -3629,16 +3630,36 @@ gp_slice_partial_finish(Agg *agg, GpPartialState *state,
 		return false;
 
 	{
+		AttrNumber *oldcols = agg->grpColIdx;
+		Oid		   *oldoperators = agg->grpOperators;
+		Oid		   *oldcollations = agg->grpCollations;
 		AttrNumber *grpColIdx = palloc_array(AttrNumber, list_length(state->keys));
+		Oid		   *operators = palloc_array(Oid, list_length(state->keys));
+		Oid		   *collations = palloc_array(Oid, list_length(state->keys));
 		int			i = 0;
 
 		foreach(lc, state->keys)
 		{
 			GpPartialKey *key = lfirst(lc);
+			int			j;
 
-			grpColIdx[i++] = key->pos;
+			grpColIdx[i] = key->pos;
+			for (j = 0; j < agg->numCols; j++)
+			{
+				TargetEntry *old = list_nth(below->targetlist, oldcols[j] - 1);
+
+				if (old->ressortgroupref == key->ressortgroupref)
+					break;
+			}
+			if (j == agg->numCols)
+				return false;
+			operators[i] = oldoperators[j];
+			collations[i] = oldcollations[j];
+			i++;
 		}
 		agg->grpColIdx = grpColIdx;
+		agg->grpOperators = operators;
+		agg->grpCollations = collations;
 	}
 	agg->aggsplit = AGGSPLIT_SIMPLE;
 	agg->plan.targetlist = tlist;
