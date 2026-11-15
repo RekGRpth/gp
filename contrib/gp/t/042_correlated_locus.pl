@@ -100,6 +100,8 @@ like(plan_for('SELECT t1.a, count(*) FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHER
 	qr/GpSlice(?s:.*)gp\.peer_query/, 'an outer aggregate can follow nested multiway Motion');
 like(plan_for('SELECT t1.v, sum(t1.v) FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2.a)) GROUP BY t1.v'),
 	qr/GpSlice/, 'a partial aggregate can follow nested multiway Motion');
+like(plan_for('SELECT t1.v, count(DISTINCT t1.a) FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2.a)) GROUP BY t1.v'),
+	qr/GpSlice/, 'a distinct aggregate can redistribute nested multiway Motion');
 
 run('SET enable_mergejoin = off');
 my @queries = (
@@ -118,6 +120,7 @@ my @queries = (
 	'SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 LEFT JOIN u ON u.a = t2.a WHERE t2.a = t1.a) ORDER BY t1.a',
 	'SELECT t1.a, count(*) FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2.a)) GROUP BY t1.a ORDER BY t1.a',
 	'SELECT t1.v, sum(t1.v) FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2.a)) GROUP BY t1.v ORDER BY t1.v',
+	'SELECT t1.v, count(DISTINCT t1.a) FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2.a)) GROUP BY t1.v ORDER BY t1.v',
 );
 foreach my $query (@queries)
 {

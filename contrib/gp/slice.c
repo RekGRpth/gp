@@ -3078,9 +3078,8 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 
 		if (gp_slice_join_partial(original, stmt, plan, parent, sort_above, motion))
 			return true;
-		if ((!original->hasSubLinks || !motion) &&
-			gp_slice_join_redistributed_agg(original, stmt, plan, parent,
-											sort_above, tables))
+		if (gp_slice_join_redistributed_agg(original, stmt, plan, parent,
+										 sort_above, tables))
 			return true;
 		if (original->groupClause == NIL)
 			return false;
