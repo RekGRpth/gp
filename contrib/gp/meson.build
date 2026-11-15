@@ -100,6 +100,7 @@ tests += {
       't/041_join_partial_agg.pl',
       't/042_correlated_locus.pl',
       't/043_multiway_broadcast.pl',
+      't/044_tpch.pl',
     ],
   },
 }
