@@ -1631,7 +1631,8 @@ gp_slice_make(Plan *src, Query *original, bool replicated, bool motion,
 typedef struct GpJoinTable
 {
 	Index		rti;
-	Query	   *query;
+	Query	   *query;			/* query level that owns rti */
+	int			depth;			/* nesting level of that query */
 	GpPolicy	policy;
 } GpJoinTable;
 
@@ -1640,18 +1641,26 @@ typedef struct GpJoinTable
  * at the top of an AND or below it, with each Var at its own query level
  */
 static bool
-gp_slice_join_var_owned(Var *var, Query *condquery, GpJoinTable *table,
-						AttrNumber key)
+gp_slice_join_var_owned(Var *var, Query *condquery, int cond_depth,
+						List *ancestors, GpJoinTable *table, AttrNumber key)
 {
 	if (var->varno != table->rti || var->varattno != key)
 		return false;
-	return table->query == condquery ? var->varlevelsup == 0 :
-		var->varlevelsup > 0;
+	if (var->varlevelsup == 0)
+		return table->query == condquery;
+	if (table->query == condquery ||
+		var->varlevelsup != cond_depth - table->depth ||
+		var->varlevelsup > list_length(ancestors))
+		return false;
+	return list_nth(ancestors, cond_depth - var->varlevelsup) == table->query;
 }
 
+/* Whether any of the join conditions equates the two columns */
+
 static bool
-gp_slice_join_pair(Node *qual, Query *condquery, GpJoinTable *table1,
-				   GpJoinTable *table2, AttrNumber k1, AttrNumber k2)
+gp_slice_join_pair(Node *qual, Query *condquery, int cond_depth,
+				   List *ancestors, GpJoinTable *table1, GpJoinTable *table2,
+				   AttrNumber k1, AttrNumber k2)
 {
 	OpExpr	   *op;
 	Var		   *var1;
@@ -1665,7 +1674,8 @@ gp_slice_join_pair(Node *qual, Query *condquery, GpJoinTable *table1,
 
 		foreach(lc, ((BoolExpr *) qual)->args)
 		{
-			if (gp_slice_join_pair(lfirst(lc), condquery, table1, table2, k1, k2))
+			if (gp_slice_join_pair(lfirst(lc), condquery, cond_depth, ancestors,
+								   table1, table2, k1, k2))
 				return true;
 		}
 		return false;
@@ -1682,10 +1692,10 @@ gp_slice_join_pair(Node *qual, Query *condquery, GpJoinTable *table1,
 	var1 = (Var *) linitial(op->args);
 	var2 = (Var *) lsecond(op->args);
 
-	return (gp_slice_join_var_owned(var1, condquery, table1, k1) &&
-			gp_slice_join_var_owned(var2, condquery, table2, k2)) ||
-		(gp_slice_join_var_owned(var2, condquery, table1, k1) &&
-		 gp_slice_join_var_owned(var1, condquery, table2, k2));
+	return (gp_slice_join_var_owned(var1, condquery, cond_depth, ancestors, table1, k1) &&
+			gp_slice_join_var_owned(var2, condquery, cond_depth, ancestors, table2, k2)) ||
+		(gp_slice_join_var_owned(var2, condquery, cond_depth, ancestors, table1, k1) &&
+		 gp_slice_join_var_owned(var1, condquery, cond_depth, ancestors, table2, k2));
 }
 
 /* A join condition and the query level that owns its RT indexes */
@@ -1693,6 +1703,8 @@ typedef struct GpJoinCond
 {
 	Query	   *query;
 	Node	   *qual;
+	int			depth;
+	List	   *ancestors;		/* query levels above this condition */
 } GpJoinCond;
 
 /* Whether any of the join conditions equates the two columns */
@@ -1709,7 +1721,8 @@ gp_slice_join_pair_list(List *conds, GpJoinTable *table1,
 		/* Do not confuse equal RT indexes of unrelated query levels */
 		if (cond->query != table1->query && cond->query != table2->query)
 			continue;
-		if (gp_slice_join_pair(cond->qual, cond->query, table1, table2, k1, k2))
+		if (gp_slice_join_pair(cond->qual, cond->query, cond->depth,
+							   cond->ancestors, table1, table2, k1, k2))
 			return true;
 	}
 	return false;
@@ -1720,7 +1733,8 @@ gp_slice_join_pair_list(List *conds, GpJoinTable *table1,
  * false when a leaf is not a base table or a join type is not supported
  */
 static bool
-gp_slice_join_collect(Node *node, Query *query, List **tables, List **conds)
+gp_slice_join_collect(Node *node, Query *query, int depth, List *ancestors,
+					  List **tables, List **conds)
 {
 	JoinExpr   *join;
 
@@ -1730,6 +1744,7 @@ gp_slice_join_collect(Node *node, Query *query, List **tables, List **conds)
 
 		table->rti = ((RangeTblRef *) node)->rtindex;
 		table->query = query;
+		table->depth = depth;
 		*tables = lappend(*tables, table);
 		return true;
 	}
@@ -1745,15 +1760,18 @@ gp_slice_join_collect(Node *node, Query *query, List **tables, List **conds)
 
 		cond->query = query;
 		cond->qual = join->quals;
+		cond->depth = depth;
+		cond->ancestors = ancestors;
 		*conds = lappend(*conds, cond);
 	}
-	return gp_slice_join_collect(join->larg, query, tables, conds) &&
-		gp_slice_join_collect(join->rarg, query, tables, conds);
+	return gp_slice_join_collect(join->larg, query, depth, ancestors, tables, conds) &&
+		gp_slice_join_collect(join->rarg, query, depth, ancestors, tables, conds);
 }
 
 /* A comma-separated FROM list is a set of inner joins too */
 static bool
-gp_slice_join_from(Query *parse, List **tables, List **conds)
+gp_slice_join_from_depth(Query *parse, int depth, List *ancestors,
+						 List **tables, List **conds)
 {
 	ListCell   *lc;
 
@@ -1761,7 +1779,7 @@ gp_slice_join_from(Query *parse, List **tables, List **conds)
 		return false;
 	foreach(lc, parse->jointree->fromlist)
 	{
-		if (!gp_slice_join_collect(lfirst(lc), parse, tables, conds))
+		if (!gp_slice_join_collect(lfirst(lc), parse, depth, ancestors, tables, conds))
 			return false;
 	}
 	if (parse->jointree->quals != NULL)
@@ -1770,15 +1788,24 @@ gp_slice_join_from(Query *parse, List **tables, List **conds)
 
 		cond->query = parse;
 		cond->qual = parse->jointree->quals;
+		cond->depth = depth;
+		cond->ancestors = ancestors;
 		*conds = lappend(*conds, cond);
 	}
 	return true;
+}
+
+static bool
+gp_slice_join_from(Query *parse, List **tables, List **conds)
+{
+	return gp_slice_join_from_depth(parse, 0, NIL, tables, conds);
 }
 
 typedef struct GpJoinSubqueries
 {
 	List	  **tables;
 	List	  **conds;
+	List	   *ancestors;
 	int			depth;
 	bool		ok;
 } GpJoinSubqueries;
@@ -1804,32 +1831,33 @@ gp_slice_join_sublink_walker(Node *node, GpJoinSubqueries *state)
 		return true;
 	}
 	subquery = (Query *) sublink->subselect;
-	/* Multiple outer levels need full varlevelsup-to-parent resolution later */
-	if (state->depth > 0)
+	if (!gp_slice_join_from_depth(subquery, state->depth, state->ancestors,
+								  state->tables, state->conds))
 	{
 		state->ok = false;
 		return true;
 	}
-	state->depth++;
-	if (!gp_slice_join_from(subquery, state->tables, state->conds))
 	{
-		state->ok = false;
-		state->depth--;
-		return true;
-	}
-	{
-		bool		failed = query_tree_walker(subquery,
-										   gp_slice_join_sublink_walker, state, 0);
+		GpJoinSubqueries nested = *state;
 
-		state->depth--;
-		return failed;
+		nested.depth = state->depth + 1;
+		nested.ancestors = lappend(list_copy(state->ancestors), subquery);
+		return query_tree_walker(subquery, gp_slice_join_sublink_walker,
+								 &nested, 0);
 	}
 }
 
 static bool
 gp_slice_join_sublinks(Query *parse, List **tables, List **conds)
 {
-	GpJoinSubqueries state = { .tables = tables, .conds = conds, .ok = true };
+	GpJoinSubqueries state =
+	{
+		.tables = tables,
+		.conds = conds,
+		.ancestors = list_make1(parse),
+		.depth = 1,
+		.ok = true
+	};
 
 	(void) query_tree_walker(parse, gp_slice_join_sublink_walker, &state, 0);
 	return state.ok;
