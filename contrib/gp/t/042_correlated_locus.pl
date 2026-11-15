@@ -84,8 +84,12 @@ unlike(plan_for('SELECT t1.a, (SELECT count(*) FROM t2) FROM t1'),
 	qr/GpSlice/, 'an uncorrelated hashed scalar subquery stays on the coordinator');
 unlike(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM u WHERE u.a = t1.a)'),
 	qr/GpSlice/, 'a noncolocated correlated input stays on the coordinator');
-unlike(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM t2 t2x WHERE t2x.a = t2.a))'),
-	qr/GpSlice/, 'nested correlated levels stay on the coordinator');
+like(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM t2 t2x WHERE t2x.a = t2.a))'),
+	qr/GpSlice/, 'nested correlated levels use their exact parent depth');
+like(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM t2 t2x WHERE t2x.a = t2.a AND EXISTS (SELECT 1 FROM t2 t2y WHERE t2y.a = t2x.a)))'),
+	qr/GpSlice/, 'three correlated levels use their exact parent depth');
+unlike(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 a WHERE a.a = t1.a AND EXISTS (SELECT 1 FROM t2 c WHERE c.a = a.a)) AND EXISTS (SELECT 1 FROM t2 b)'),
+	qr/GpSlice/, 'an uncorrelated sibling cannot borrow a correlated parent');
 
 run('SET enable_mergejoin = off');
 my @queries = (
@@ -97,6 +101,8 @@ my @queries = (
 	'SELECT t1.a, (SELECT count(*) FROM t2) FROM t1 ORDER BY t1.a',
 	'SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM u WHERE u.a = t1.a) ORDER BY t1.a',
 	'SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM t2 t2x WHERE t2x.a = t2.a)) ORDER BY t1.a',
+	'SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM t2 t2x WHERE t2x.a = t2.a AND EXISTS (SELECT 1 FROM t2 t2y WHERE t2y.a = t2x.a))) ORDER BY t1.a',
+	'SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 a WHERE a.a = t1.a AND EXISTS (SELECT 1 FROM t2 c WHERE c.a = a.a)) AND EXISTS (SELECT 1 FROM t2 b) ORDER BY t1.a',
 );
 foreach my $query (@queries)
 {
