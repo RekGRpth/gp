@@ -40,7 +40,7 @@ $coordinator->poll_query_until('postgres',
   or die 'the segments did not report their interconnect ports';
 
 sub run { return $coordinator->safe_psql('postgres', shift); }
-sub plan_for { return $coordinator->safe_psql('postgres', "EXPLAIN (COSTS OFF) $_[0]"); }
+sub plan_for { return $coordinator->safe_psql('postgres', "EXPLAIN (COSTS OFF, VERBOSE) $_[0]"); }
 
 run('CREATE TABLE t1 (a int, v numeric)');
 run("SELECT gp.distribute('t1', ARRAY['a'])");
@@ -88,8 +88,16 @@ like(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t
 	qr/GpSlice/, 'nested correlated levels use their exact parent depth');
 like(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM t2 t2x WHERE t2x.a = t2.a AND EXISTS (SELECT 1 FROM t2 t2y WHERE t2y.a = t2x.a)))'),
 	qr/GpSlice/, 'three correlated levels use their exact parent depth');
-unlike(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 a WHERE a.a = t1.a AND EXISTS (SELECT 1 FROM t2 c WHERE c.a = a.a)) AND EXISTS (SELECT 1 FROM t2 b)'),
-	qr/GpSlice/, 'an uncorrelated sibling cannot borrow a correlated parent');
+like(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 a WHERE a.a = t1.a AND EXISTS (SELECT 1 FROM t2 c WHERE c.a = a.a)) AND EXISTS (SELECT 1 FROM t2 b)'),
+	qr/GpSlice/, 'an uncorrelated sibling is broadcast independently');
+like(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2.a))'),
+	qr/GpSlice(?s:.*)gp\.peer_query/, 'nested multiway Motion rewrites the input of its own level');
+like(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM t2 t2x WHERE t2x.a = t2.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2x.a)))'),
+	qr/GpSlice(?s:.*)gp\.peer_query/, 'three levels can broadcast a noncolocated input');
+unlike(plan_for('SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 LEFT JOIN u ON u.a = t2.a WHERE t2.a = t1.a)'),
+	qr/GpSlice/, 'a nested multiway outer join stays on the coordinator');
+unlike(plan_for('SELECT t1.a, count(*) FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2.a)) GROUP BY t1.a'),
+	qr/GpSlice/, 'an aggregate over nested multiway Motion stays on the coordinator');
 
 run('SET enable_mergejoin = off');
 my @queries = (
@@ -103,6 +111,10 @@ my @queries = (
 	'SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM t2 t2x WHERE t2x.a = t2.a)) ORDER BY t1.a',
 	'SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM t2 t2x WHERE t2x.a = t2.a AND EXISTS (SELECT 1 FROM t2 t2y WHERE t2y.a = t2x.a))) ORDER BY t1.a',
 	'SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 a WHERE a.a = t1.a AND EXISTS (SELECT 1 FROM t2 c WHERE c.a = a.a)) AND EXISTS (SELECT 1 FROM t2 b) ORDER BY t1.a',
+	'SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2.a)) ORDER BY t1.a',
+	'SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM t2 t2x WHERE t2x.a = t2.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2x.a))) ORDER BY t1.a',
+	'SELECT t1.a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 LEFT JOIN u ON u.a = t2.a WHERE t2.a = t1.a) ORDER BY t1.a',
+	'SELECT t1.a, count(*) FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND EXISTS (SELECT 1 FROM u WHERE u.a = t2.a)) GROUP BY t1.a ORDER BY t1.a',
 );
 foreach my $query (@queries)
 {
