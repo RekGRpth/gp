@@ -754,6 +754,7 @@ start their own clusters:
 | `036_cte_locus.pl` | Nonrecursive materialized CTEs: the locus comes from `PlannedStmt.subplans`, while projection, a condition, sort and limit above `CteScan` preserve it; replicated CTEs, and why outer joins, multiple CTEs and recursion stay on the coordinator |
 | `037_distinct_locus.pl` | `DISTINCT` and `DISTINCT ON`: the whole distribution key in the output, compound keys and their prefixes, replicated inputs, and `Unique` kept above the distributed scan to preserve ordering |
 | `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by expressions and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole on this path |
+| `044_tpch.pl` | All 22 TPC-H queries on a small deterministic data set: every answer matches ordinary `local_*` tables, and the expected set of distributed-slice plans is fixed. Query texts come from DuckDB 1.5.4 `extension/tpch/dbgen/queries`; this is a correctness and plan regression, not a dbgen or performance benchmark |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
