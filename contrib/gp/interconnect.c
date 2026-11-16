@@ -443,7 +443,8 @@ gp_ic_shutdown_write(pgsocket fd)
 typedef struct GpFragmentDest
 {
 	DestReceiver pub;
-	pgsocket fd;
+	pgsocket	fd;
+	uint32		row_number;
 } GpFragmentDest;
 
 /* One tuple of the executor, as a row of the protocol */
@@ -455,6 +456,11 @@ gp_ic_receive_tuple(TupleTableSlot *slot, DestReceiver *self)
 	StringInfoData message;
 
 	initStringInfo(&message);
+	{
+		uint32		net_row = htonl(++dest->row_number);
+
+		appendBinaryStringInfo(&message, (char *) &net_row, sizeof(net_row));
+	}
 	slot_getallattrs(slot);
 	for (int i = 0; i < desc->natts; i++)
 	{
@@ -1623,6 +1629,7 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 	MemoryContext rowcxt;
 	char	   *token;
 	bool		retry = false;
+	uint32		row_number = 0;
 
 	token = gp_interconnect_token();
 	if (token == NULL)
@@ -1813,9 +1820,24 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 						errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("an unknown message in the interconnect answer"));
 			{
-				MemoryContext oldcontext = MemoryContextSwitchTo(rowcxt);
+				uint32		net_row;
+				uint32		expected;
+				MemoryContext oldcontext;
 
-				gp_interconnect_row(store, tupdesc, recv, ioparam, data, len);
+				if (len < sizeof(net_row))
+					ereport(ERROR,
+							errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("a short row number in the interconnect answer"));
+				memcpy(&net_row, data, sizeof(net_row));
+				expected = ++row_number;
+				if (ntohl(net_row) != expected)
+					ereport(ERROR,
+							errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("interconnect row number %u, expected %u on %s",
+								   ntohl(net_row), expected, host));
+				oldcontext = MemoryContextSwitchTo(rowcxt);
+				gp_interconnect_row(store, tupdesc, recv, ioparam,
+									data + sizeof(net_row), len - sizeof(net_row));
 				MemoryContextSwitchTo(oldcontext);
 				MemoryContextReset(rowcxt);
 			}

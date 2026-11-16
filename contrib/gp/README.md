@@ -411,10 +411,12 @@ The client connects there and sends the serialized plan again; no plan or
 accepted socket has to be passed between processes.  The worker authenticates
 the request with the cluster token, connects to the requested database and
 role, deserializes the plan, locks the range table and runs the executor.  It
-returns binary tuples followed by EOS, or an error message, and exits.  Shared
-slots pass through STARTING, READY, ASSIGNED and BUSY back to FREE, and the
-broker reaps stopped workers.  Nested Motion to the same segment therefore
-gets another worker instead of waiting for a busy single listener.
+returns binary tuples followed by EOS, or an error message, and exits.  Each
+row carries a connection-local sequence number, which the receiver checks to
+catch a duplicated or missing protocol message.  Shared slots pass through
+STARTING, READY, ASSIGNED and BUSY back to FREE, and the broker reaps stopped
+workers.  Nested Motion to the same segment therefore gets another worker
+instead of waiting for a busy single listener.
 
 All autonomous readers of one statement share one snapshot per segment.
 Before the first of them starts, and under the statement's distributed
