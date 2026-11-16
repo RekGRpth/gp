@@ -564,9 +564,12 @@ One derived `FROM` level can also be analyzed recursively.  Its base tables
 keep their owning query for Motion, and its output columns can feed a full
 aggregate redistributed by the outer grouping columns.  This supports an
 all-inner derived join of at most six base inputs; larger derived joins wait
-for a cost bound on nested Motion.  Derived outer joins use the previous
-subquery path instead.  Global aggregates over a derived table stay on the
-coordinator, because their partial target list is not supported.
+for a cost bound on nested Motion.  A derived outer join of two hashed
+tables can feed the same redistributed aggregate: the fragment redistributes
+the null-supplying side by the join column under the map of the other side,
+so every derived group is complete on one segment; full joins and global
+aggregates over a derived table stay on the coordinator, because their
+partial target list is not supported.
 
 A correlated subquery can run as part of a local slice when every hashed
 input at every supported level is connected to the others by the whole
@@ -760,7 +763,7 @@ start their own clusters:
 | `024_recovery.pl` | The recovery worker of the coordinator: a segment lost during `COMMIT PREPARED` has its transaction committed, a coordinator lost between the prepare and its commit has it rolled back on the segments |
 | `025_agg_pushdown.pl` | Aggregates on the segments: grouping by the key of the distribution, redistribution by other hashable columns, replicated tables, subqueries, inheritance boundaries, unhashable-type, own-write, session-setting and dropped-column fallbacks |
 | `026_join_pushdown.pl` | Joins and aggregates over them on the segments: one colocation group joined by the key, replicated tables, outer joins, joins of three and more tables, what is not pushed, the same answers as on the coordinator |
-| `027_subquery_pushdown.pl` | Aggregates and colocated joins inside a subquery of a non-colocated query run on the segments; projections, conditions, sorts and limits keep that locus and renumber hash keys, including pushed `HAVING`, pruned outputs and compound keys; equal hash keys prove colocation without Motion; a derived all-inner level can join a base table and feed a redistributed aggregate; limits and derived outer joins keep their respective fallbacks |
+| `027_subquery_pushdown.pl` | Aggregates and colocated joins inside a subquery of a non-colocated query run on the segments; projections, conditions, sorts and limits keep that locus and renumber hash keys, including pushed `HAVING`, pruned outputs and compound keys; equal hash keys prove colocation without Motion; a derived all-inner level can join a base table and feed a redistributed aggregate, and a derived left join of two hashed tables can feed one too; limits and full-join derived shapes keep their fallbacks |
 | `029_redistributed_join.pl` | `GpMotion` replaces the peer-query marker; inner joins of two and more colocation groups redistribute by the whole key; without one, a two-table join broadcasts the second table under any condition, outer joins broadcast the null-supplying side, and full joins broadcast both sides to one segment; expressions, cross joins, aggregates, subqueries, writes and dropped columns are checked |
 | `030_interconnect_port.pl` | A broker takes any free TCP port and reports it, and clients connect to the reported port alone; a server sits on the port a rule would compute, and nothing of the cluster ever goes there |
 | `031_interconnect_cancel.pl` | A query that dies of its statement timeout stops the workers of its fragments on the segments, though no row ever came to tell them so, and a next query reads the same rows |

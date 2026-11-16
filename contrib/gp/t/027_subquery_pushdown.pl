@@ -80,6 +80,8 @@ like($condition_plan, qr/GpSlice/, 'a condition of the outer query keeps its loc
 like($condition_plan, qr/Subquery Scan/, 'the outer condition stays above the distributed subquery');
 like(plan_for('SELECT u.d, s.cnt FROM u JOIN (SELECT a, count(*) AS cnt FROM t GROUP BY a) s ON u.a = s.a'),
 	qr/GpSlice/, 'a derived table can join a base table with Motion');
+like(plan_for('SELECT s.n, count(*) FROM (SELECT u.a, count(t.c) AS n FROM u LEFT JOIN t ON u.a = t.a AND t.b <> \'zz\' GROUP BY u.a) s GROUP BY s.n'),
+	qr/GpSlice/, 'a grouped aggregate over a derived left join is redistributed');
 
 my @queries = (
 	'SELECT s.a, s.cnt FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s ORDER BY s.a LIMIT 5',
@@ -100,6 +102,7 @@ my @queries = (
 	'SELECT s.a, s.d FROM (SELECT t.a, r.d FROM t JOIN r ON t.a = r.a) s ORDER BY s.a LIMIT 4',
 	'SELECT s.cnt + 1 FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s WHERE s.cnt = 100 AND s.a > 2 ORDER BY 1 LIMIT 3',
 	'SELECT u.d, s.cnt FROM u JOIN (SELECT a, count(*) AS cnt FROM t GROUP BY a) s ON u.a = s.a ORDER BY u.d, s.cnt LIMIT 5',
+	'SELECT s.n, count(*) FROM (SELECT u.a, count(t.c) AS n FROM u LEFT JOIN t ON u.a = t.a AND t.b <> \'zz\' GROUP BY u.a) s GROUP BY s.n ORDER BY s.n',
 );
 foreach my $query (@queries)
 {
