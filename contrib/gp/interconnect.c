@@ -1822,6 +1822,7 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 			{
 				uint32		net_row;
 				uint32		expected;
+				uint32		received;
 				MemoryContext oldcontext;
 
 				if (len < sizeof(net_row))
@@ -1830,11 +1831,12 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 							errmsg("a short row number in the interconnect answer"));
 				memcpy(&net_row, data, sizeof(net_row));
 				expected = ++row_number;
-				if (ntohl(net_row) != expected)
+				received = (uint32) ntohl(net_row);
+				if (received != expected)
 					ereport(ERROR,
 							errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("interconnect row number %u, expected %u on %s",
-								   ntohl(net_row), expected, host));
+								   received, expected, host));
 				oldcontext = MemoryContextSwitchTo(rowcxt);
 				gp_interconnect_row(store, tupdesc, recv, ioparam,
 									data + sizeof(net_row), len - sizeof(net_row));
