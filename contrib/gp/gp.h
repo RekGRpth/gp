@@ -131,6 +131,8 @@ extern bool gp_slice_cte_plan(Query *parse, PlannedStmt *stmt);
 extern Query *gp_slice_cte_query(Query *parse);
 extern bool gp_slice_cte_agg_plan(Query *original, PlannedStmt *stmt);
 extern Query *gp_slice_cte_agg_query(Query *parse);
+extern bool gp_slice_cte_join_plan(Query *original, PlannedStmt *stmt);
+extern Query *gp_slice_cte_join_query(Query *parse);
 extern bool gp_slice_window_plan(Query *parse, PlannedStmt *stmt);
 extern Query *gp_slice_window_query(Query *parse);
 extern bool gp_slice_union_plan(Query *parse, PlannedStmt *stmt);
