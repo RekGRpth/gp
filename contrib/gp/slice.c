@@ -3601,6 +3601,17 @@ gp_partial_mutator(Node *node, GpPartialState *state)
 	return expression_tree_mutator(node, gp_partial_mutator, state);
 }
 
+/* A final aggregate may read only the columns of the segments' answer */
+static bool
+gp_partial_final_vars(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var) && ((Var *) node)->varno != OUTER_VAR)
+		return true;
+	return expression_tree_walker(node, gp_partial_final_vars, context);
+}
+
 /* Finish a partial aggregate over the slice built from its remote query */
 static bool
 gp_slice_partial_finish(Agg *agg, GpPartialState *state,
@@ -3657,9 +3668,23 @@ gp_slice_partial_finish(Agg *agg, GpPartialState *state,
 		out->ressortgroupref = tle->ressortgroupref;
 		tlist = lappend(tlist, out);
 	}
-	agg->plan.qual = (List *) gp_partial_mutator((Node *) final_qual, state);
-	if (!state->ok)
-		return false;
+	{
+		List	   *qual = (List *) gp_partial_mutator((Node *) final_qual, state);
+
+		if (!state->ok)
+			return false;
+
+		/*
+		 * An unmatched key leaves a Var of the old input behind, and the
+		 * executor asserts against it.  Planned grouping of a query whose
+		 * grouping moved into a grouping rangetable entry is such a case:
+		 * refuse the rewrite, the coordinator plan answers it as before.
+		 */
+		if (gp_partial_final_vars((Node *) tlist, NULL) ||
+			gp_partial_final_vars((Node *) qual, NULL))
+			return false;
+		agg->plan.qual = qual;
+	}
 
 	{
 		AttrNumber *oldcols = agg->grpColIdx;
