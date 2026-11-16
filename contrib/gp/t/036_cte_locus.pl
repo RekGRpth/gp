@@ -2,7 +2,9 @@
 # Licensed under the PostgreSQL License, see LICENSE
 
 # A nonrecursive CTE has a locus of its own through PlannedStmt.subplans.
-# Projection, a condition, sort and limit above CteScan preserve it
+# Projection, a condition, sort and limit above CteScan preserve it.  An
+# aggregate CTE runs on the segments even when the outer query keeps its
+# join, its sublinks and its aggregates on the coordinator
 
 use strict;
 use warnings FATAL => 'all';
@@ -77,6 +79,33 @@ unlike(plan_for('WITH s AS MATERIALIZED (SELECT a FROM t), q AS (SELECT a FROM s
 unlike(plan_for('WITH RECURSIVE s(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM s WHERE a < 3) SELECT a FROM s'),
 	qr/GpSlice/, 'a recursive CTE stays on the coordinator');
 
+# An aggregate CTE runs on the segments as a subplan of its own, and the
+# join, the sublinks and the aggregates of the outer query stay above it
+like(plan_for('WITH s AS MATERIALIZED (SELECT b, count(*) AS c FROM t GROUP BY b) SELECT * FROM s'),
+	qr/GpSlice/, 'an aggregate CTE runs on the segments');
+like(plan_for('WITH s AS MATERIALIZED (SELECT a, count(*) AS c FROM t GROUP BY a) SELECT * FROM s'),
+	qr/GpSlice/, 'an aggregate CTE grouped by the key runs on the segments');
+like(plan_for('WITH s AS MATERIALIZED (SELECT a, count(*) AS c FROM r GROUP BY a) SELECT * FROM s'),
+	qr/GpSlice/, 'an aggregate CTE of a replicated table runs on one segment');
+like(plan_for("WITH s AS MATERIALIZED (SELECT b, sum(v) AS total FROM t GROUP BY b)
+	SELECT s.b, s.total FROM s, t WHERE s.b = t.b
+	  AND s.total = (SELECT max(total) FROM s)"),
+	qr/GpSlice/, 'a join and a sublink of the outer query keep the aggregate CTE on the segments');
+like(plan_for('WITH s AS MATERIALIZED (SELECT b, count(*) AS c FROM t GROUP BY b) SELECT count(*) FROM s'),
+	qr/GpSlice/, 'an aggregate above the CTE keeps the aggregate CTE on the segments');
+unlike(plan_for('WITH s AS MATERIALIZED (SELECT b, sum(v) AS total FROM t GROUP BY b ORDER BY total DESC) SELECT * FROM s'),
+	qr/GpSlice/, 'an ORDER BY inside the CTE stays on the coordinator');
+unlike(plan_for('WITH s AS MATERIALIZED (SELECT b, count(*) AS c FROM t GROUP BY b), q AS MATERIALIZED (SELECT * FROM s) SELECT * FROM q'),
+	qr/GpSlice/, 'an aggregate CTE under another CTE stays on the coordinator');
+
+# The columns of the replaced subplan deparse against the whole statement
+like($coordinator->safe_psql('postgres',
+	'EXPLAIN (VERBOSE, COSTS OFF) WITH s AS MATERIALIZED
+		(SELECT b AS bb, sum(v) AS total FROM t GROUP BY bb)
+		SELECT * FROM s'),
+	qr/Output: s\.bb, s\.total/,
+	'the columns of the aggregate CTE deparse against the statement');
+
 my @queries = (
 	'WITH s AS MATERIALIZED (SELECT a, b, v FROM t) SELECT a, b, v FROM s ORDER BY a, b',
 	'WITH s AS MATERIALIZED (SELECT a FROM t) SELECT a FROM s WHERE a > 1 ORDER BY a',
@@ -84,6 +113,15 @@ my @queries = (
 	'WITH s AS MATERIALIZED (SELECT a FROM t) SELECT a FROM s ORDER BY a LIMIT 2',
 	'WITH s AS MATERIALIZED (SELECT a FROM r) SELECT a FROM s ORDER BY a',
 	'WITH s AS MATERIALIZED (SELECT a FROM t) SELECT s.a, t.a FROM s, t ORDER BY s.a, t.a',
+	'WITH s AS MATERIALIZED (SELECT b, count(*) AS c FROM t GROUP BY b) SELECT * FROM s ORDER BY b',
+	'WITH s AS MATERIALIZED (SELECT a, count(*) AS c FROM t GROUP BY a) SELECT * FROM s ORDER BY a',
+	'WITH s AS MATERIALIZED (SELECT b, v, sum(v) AS total FROM t GROUP BY b, v) SELECT * FROM s ORDER BY b, v',
+	'WITH s AS MATERIALIZED (SELECT a, b, sum(v) AS total FROM t GROUP BY a, b) SELECT * FROM s ORDER BY a, b',
+	'WITH s AS MATERIALIZED (SELECT a, count(*) AS c FROM r GROUP BY a) SELECT * FROM s ORDER BY a',
+	'WITH s AS MATERIALIZED (SELECT b, count(*) AS c FROM t GROUP BY b) SELECT count(*) FROM s',
+	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS total FROM t GROUP BY b)
+		SELECT s.b, s.total FROM s, t WHERE s.b = t.b
+		  AND s.total = (SELECT max(total) FROM s) ORDER BY s.b',
 );
 foreach my $query (@queries)
 {

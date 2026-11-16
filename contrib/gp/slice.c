@@ -1102,6 +1102,188 @@ gp_slice_cte_plan(Query *original, PlannedStmt *stmt)
 	return true;
 }
 
+/*
+ * Whether every CteScan of the statement reads the same subplan, and its
+ * number.  The scans sit in the plan tree and in the subplans themselves,
+ * for the InitPlan above a CteScan keeps the scan of its own.
+ */
+static bool
+gp_slice_cte_agg_scan(Plan *plan, int *cteplanid)
+{
+	if (plan == NULL)
+		return true;
+	if (IsA(plan, CteScan))
+	{
+		if (*cteplanid != 0 && *cteplanid != ((CteScan *) plan)->ctePlanId)
+			return false;
+		*cteplanid = ((CteScan *) plan)->ctePlanId;
+	}
+	if (!gp_slice_cte_agg_scan(plan->lefttree, cteplanid) ||
+		!gp_slice_cte_agg_scan(plan->righttree, cteplanid))
+		return false;
+	if (IsA(plan, SubqueryScan))
+		return gp_slice_cte_agg_scan(((SubqueryScan *) plan)->subplan, cteplanid);
+	if (IsA(plan, Append))
+	{
+		foreach_ptr(Plan, child, ((Append *) plan)->appendplans)
+			if (!gp_slice_cte_agg_scan(child, cteplanid))
+				return false;
+	}
+	if (IsA(plan, MergeAppend))
+	{
+		foreach_ptr(Plan, child, ((MergeAppend *) plan)->mergeplans)
+			if (!gp_slice_cte_agg_scan(child, cteplanid))
+				return false;
+	}
+	return true;
+}
+
+/*
+ * The query of a nonrecursive CTE is an aggregate of one table, which the
+ * segments can answer whole.  The outer query — with its join, its sublinks
+ * and its aggregates — stays on the coordinator above the scans of the CTE.
+ * A copy of the CTE query is returned for the SQL of the segments, or NULL
+ * when the CTE is not such an aggregate.
+ */
+Query *
+gp_slice_cte_agg_query(Query *parse)
+{
+	CommonTableExpr *cte;
+
+	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
+		list_length(parse->cteList) != 1)
+		return NULL;
+	cte = linitial_node(CommonTableExpr, parse->cteList);
+	if (cte->cterecursive)
+		return NULL;
+	return gp_slice_agg_query(castNode(Query, cte->ctequery));
+}
+
+/*
+ * Replace the aggregate of a CTE with a scan that runs it on the segments,
+ * in the subplan that the CteScan nodes of the statement read.  The outer
+ * query keeps its plan: it sees the same rows of the CTE as before.  A CTE
+ * whose grouping covers the key of the distribution is answered where the
+ * table is; over another grouping the rows of the table move by the
+ * grouping columns, so every group is whole on one segment.
+ */
+bool
+gp_slice_cte_agg_plan(Query *original, PlannedStmt *stmt)
+{
+	Plan	   *subplan;
+	Plan	   *parent = NULL;
+	Plan	   *plan;
+	Plan	   *below;
+	Agg		   *agg;
+	ListCell   *cell;
+	ListCell   *lc;
+	Index		varno;
+	int			cteplanid = 0;
+	bool		found = false;
+	bool		replicated = false;
+	bool		motion = false;
+	GpLocus		locus;
+	CustomScan *cscan;
+
+	/* Every CteScan of the statement must name the one subplan of the CTE */
+	if (!gp_slice_cte_agg_scan(stmt->planTree, &cteplanid))
+		return false;
+	foreach_ptr(Plan, sub, stmt->subplans)
+		if (!gp_slice_cte_agg_scan(sub, &cteplanid))
+			return false;
+	if (cteplanid <= 0 || cteplanid > list_length(stmt->subplans))
+		return false;
+
+	/*
+	 * The ORDER BY of the CTE leaves a sort inside the subplan, above the
+	 * aggregate, and may add its keys to the columns of the segments.  The
+	 * replacement is not made for that case: such a CTE stays on the
+	 * coordinator.
+	 */
+	if (original->sortClause != NIL)
+		return false;
+
+	/* Find the aggregate of the subplan, below its sorts and limits */
+	subplan = list_nth(stmt->subplans, cteplanid - 1);
+	plan = subplan;
+	while (plan != NULL && !IsA(plan, Agg))
+	{
+		if (plan->righttree != NULL)
+			return false;
+		parent = plan;
+		plan = plan->lefttree;
+	}
+	if (plan == NULL)
+		return false;
+	agg = (Agg *) plan;
+
+	/* Below the aggregate there is the gather of the table and nothing else */
+	below = agg->plan.lefttree;
+	while (below != NULL && (IsA(below, Sort) || IsA(below, IncrementalSort)))
+		below = below->lefttree;
+	if (below == NULL || !gp_is_gather(below))
+		return false;
+
+	locus = gp_locus_plan(&agg->plan, stmt->rtable, stmt->subplans);
+	if (locus.kind == GP_LOCUS_COORDINATOR)
+	{
+		/* A grouping that is not colocated can still move by its columns */
+		if (!gp_slice_agg_locus(original, agg, below, &replicated, &motion, &locus))
+			return false;
+	}
+	else
+		replicated = locus.kind == GP_LOCUS_ONE_SEGMENT;
+
+	/* The columns the segments return are the target list of the CTE */
+	if (list_length(agg->plan.targetlist) !=
+		list_length(original->targetList))
+		return false;
+
+	cscan = gp_slice_make(&agg->plan, original, replicated, motion,
+						  original->sortClause);
+
+	/*
+	 * gp_slice_make keeps the target list of the query as the descriptor of
+	 * what the segments return.  That list names its columns by the numbers
+	 * of the rtable of the CTE, and a grouping column may name the grouping
+	 * itself; EXPLAIN deparses the descriptor against the rtable of the
+	 * whole statement.  Name every column as the column of the CTE that it
+	 * is.
+	 */
+	varno = 0;
+	foreach_node(RangeTblEntry, rte, stmt->rtable)
+	{
+		varno++;
+		if (rte->rtekind == RTE_CTE)
+		{
+			found = true;
+			break;
+		}
+	}
+	if (!found)
+		return false;
+	foreach(lc, cscan->custom_scan_tlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		Var		   *var = makeVar(varno, tle->resno,
+									 exprType((Node *) tle->expr),
+									 exprTypmod((Node *) tle->expr),
+									 exprCollation((Node *) tle->expr), 0);
+
+		tle->expr = (Expr *) var;
+	}
+
+	if (parent == NULL)
+	{
+		cell = list_nth_cell(stmt->subplans, cteplanid - 1);
+		lfirst(cell) = &cscan->scan.plan;
+	}
+	else
+		parent->lefttree = &cscan->scan.plan;
+
+	return true;
+}
+
 /* A window query over one distributed table, with every partition local */
 Query *
 gp_slice_window_query(Query *parse)
