@@ -2132,6 +2132,91 @@ gp_slice_join_redistributable(Query *parse, List *tables, List *conds,
 	return true;
 }
 
+/* Whether any join of the tree is a full one */
+static bool
+gp_slice_join_has_full(Node *node)
+{
+	JoinExpr   *join;
+
+	if (node == NULL || !IsA(node, JoinExpr))
+		return false;
+	join = (JoinExpr *) node;
+	if (join->jointype == JOIN_FULL)
+		return true;
+	return gp_slice_join_has_full(join->larg) ||
+		gp_slice_join_has_full(join->rarg);
+}
+
+/* Whether a derived input joins its tables by a full join */
+static bool
+gp_slice_join_derived_full(Query *parse)
+{
+	foreach_node(RangeTblEntry, rte, parse->rtable)
+	{
+		if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL &&
+			IsA(rte->subquery->jointree, FromExpr) &&
+			gp_slice_join_has_full((Node *) rte->subquery->jointree->fromlist))
+			return true;
+	}
+	return false;
+}
+
+/* Whether the Var belongs to the table at this query level */
+static bool
+gp_slice_join_var_of(Var *var, GpJoinTable *table, Query *query)
+{
+	return var->varlevelsup == 0 && var->varattno > 0 &&
+		var->varno == table->rti && table->query == query;
+}
+
+/*
+ * Whether a condition equates a column of the stay table with a column of
+ * the move table, and return that column of the move table
+ */
+static bool
+gp_slice_join_move_key(Node *node, Query *query, GpJoinTable *stay,
+					   GpJoinTable *move, AttrNumber *move_attno)
+{
+	OpExpr	   *op;
+	Var		   *var1;
+	Var		   *var2;
+	ListCell   *lc;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, BoolExpr) && ((BoolExpr *) node)->boolop == AND_EXPR)
+	{
+		foreach(lc, ((BoolExpr *) node)->args)
+			if (gp_slice_join_move_key(lfirst(lc), query, stay, move,
+									   move_attno))
+				return true;
+		return false;
+	}
+	if (!IsA(node, OpExpr))
+		return false;
+	op = (OpExpr *) node;
+	if (list_length(op->args) != 2 ||
+		get_opname(op->opno) == NULL ||
+		strcmp(get_opname(op->opno), "=") != 0 ||
+		!IsA(linitial(op->args), Var) || !IsA(lsecond(op->args), Var))
+		return false;
+	var1 = (Var *) linitial(op->args);
+	var2 = (Var *) lsecond(op->args);
+	if (gp_slice_join_var_of(var1, stay, query) &&
+		gp_slice_join_var_of(var2, move, query))
+	{
+		*move_attno = var2->varattno;
+		return true;
+	}
+	if (gp_slice_join_var_of(var2, stay, query) &&
+		gp_slice_join_var_of(var1, move, query))
+	{
+		*move_attno = var1->varattno;
+		return true;
+	}
+	return false;
+}
+
 /* A colocated component of a join graph, ignoring all other tables */
 static List *
 gp_slice_join_component(List *tables, List *conds, GpJoinTable *root)
@@ -3003,10 +3088,19 @@ gp_slice_join_query(Query *parse)
 		return NULL;
 	if (list_length(tables) < 2)
 		return NULL;
-	/* Large derived joins wait for a cost bound on their nested Motion */
+	/*
+	 * Large derived joins wait for a cost bound on their nested Motion.  A
+	 * derived outer join cannot be rewritten into Motion at the top level,
+	 * but a grouped aggregate over it can redistribute the whole derived
+	 * answer, unless a full join keeps it whole on one segment alone.
+	 */
 	if (gp_slice_join_derived(parse) &&
 		(!gp_slice_join_all_inner_levels(tables) || list_length(tables) > 6))
-		return NULL;
+	{
+		if (!parse->hasAggs || parse->groupClause == NIL ||
+			list_length(tables) > 6 || gp_slice_join_derived_full(parse))
+			return NULL;
+	}
 	if (!gp_slice_join_colocated(parse, tables, conds))
 	{
 		GpJoinTable *stay;
@@ -3068,7 +3162,9 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	if (!gp_slice_join_load_policies(original, tables))
 		return false;
 	if (!gp_slice_join_colocated(original, tables, conds) &&
-		(locus.kind == GP_LOCUS_COORDINATOR || original->hasSubLinks))
+		(locus.kind == GP_LOCUS_COORDINATOR || original->hasSubLinks) &&
+		!(gp_slice_join_derived(original) &&
+		  !gp_slice_join_all_inner_levels(tables)))
 	{
 		{
 			bool		motion_ok = gp_slice_join_motion(original, tables, conds,
@@ -4208,6 +4304,63 @@ gp_slice_join_redistributed_agg(Query *original, PlannedStmt *stmt, Plan *plan,
 	}
 	if (maptable == NULL)
 		return false;
+
+	/*
+	 * A derived outer join cannot leave its Motion to the hooks of the
+	 * fragment planning: the inner query is serialized as it is, and each
+	 * segment would join its local rows only.  When the join equates a
+	 * column of one table with a column of the other, redistribute the
+	 * second table by that column under the map of the first: every join
+	 * pair then meets on one segment, so the derived answer is complete
+	 * there.  Tables of one colocation group need no Motion at all.
+	 */
+	if (gp_slice_join_derived(original) &&
+		!gp_slice_join_all_inner_levels(tables))
+	{
+		GpJoinTable *stay = NULL;
+		GpJoinTable *move = NULL;
+		AttrNumber	move_attno = 0;
+		AttrNumber	keyatts[1];
+		List	   *inner_tables = NIL;
+		List	   *inner_conds = NIL;
+		ListCell   *lc2;
+		bool		found = false;
+
+		if (list_length(tables) != 2)
+			return false;
+		inner_tables = NIL;
+		inner_conds = NIL;
+		if (!gp_slice_join_from(inner, &inner_tables, &inner_conds) ||
+			!gp_slice_join_load_policies(inner, inner_tables))
+			return false;
+		stay = linitial(inner_tables);
+		move = lsecond(inner_tables);
+		if (stay->policy.replicated || stay->policy.colocation_id == 0 ||
+			move->policy.replicated || move->policy.colocation_id == 0)
+			return false;
+		if (stay->policy.colocation_id != move->policy.colocation_id)
+		{
+			foreach(lc2, inner_conds)
+			{
+				GpJoinCond *cond = lfirst(lc2);
+				AttrNumber	attno = 0;
+
+				if (gp_slice_join_move_key(cond->qual, cond->query, stay,
+										   move, &attno))
+				{
+					move_attno = attno;
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+				return false;
+			keyatts[0] = move_attno;
+			if (!gp_slice_redistribute_rte_keys(inner, stay, move, false, 1,
+												keyatts, NULL, false))
+				return false;
+		}
+	}
 
 	/* Keep on the asking segment only rows whose grouping key belongs to it */
 	initStringInfo(&sql);
