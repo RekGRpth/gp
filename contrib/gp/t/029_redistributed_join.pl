@@ -151,8 +151,8 @@ like(plan_for('SELECT a FROM (SELECT t1.a AS a FROM t1 FULL JOIN t2 ON t1.a + 20
 	qr/GpSlice/, 'a full join by another expression moves inside a subquery');
 like(plan_for('SELECT t2.a, count(*) FROM t1 CROSS JOIN t2 GROUP BY t2.a'),
 	qr/GpSlice/, 'an aggregate by the broadcast side is redistributed');
-unlike(plan_for('SELECT a, n FROM (SELECT t2.a AS a, count(*) AS n FROM t1 JOIN t2 ON t1.a + 20 = t2.a GROUP BY t2.a) s'),
-	qr/GpSlice/, 'a broadcast-side aggregate in a subquery stays too');
+like(plan_for('SELECT a, n FROM (SELECT t2.a AS a, count(*) AS n FROM t1 JOIN t2 ON t1.a + 20 = t2.a GROUP BY t2.a) s'),
+	qr/GpSlice/, 'a broadcast-side aggregate redistributes a derived table too');
 
 # Execute the ordered queries through hash joins too: a merge join answers
 # their ORDER BY itself and deliberately stays on the coordinator

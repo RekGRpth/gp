@@ -1728,6 +1728,9 @@ gp_slice_join_pair_list(List *conds, GpJoinTable *table1,
 	return false;
 }
 
+static bool gp_slice_join_from_depth(Query *parse, int depth, List *ancestors,
+									 List **tables, List **conds);
+
 /*
  * Collect the base tables of a join tree and all its join conditions;
  * false when a leaf is not a base table or a join type is not supported
@@ -1740,9 +1743,23 @@ gp_slice_join_collect(Node *node, Query *query, int depth, List *ancestors,
 
 	if (IsA(node, RangeTblRef))
 	{
-		GpJoinTable *table = palloc0(sizeof(GpJoinTable));
+		Index		rti = ((RangeTblRef *) node)->rtindex;
+		RangeTblEntry *rte = rt_fetch(rti, query->rtable);
+		GpJoinTable *table;
 
-		table->rti = ((RangeTblRef *) node)->rtindex;
+		if (rte->rtekind == RTE_SUBQUERY)
+		{
+			List	   *nested;
+
+			/* Keep the ownership and the ancestry of one derived FROM level */
+			if (depth > 0 || rte->subquery == NULL)
+				return false;
+			nested = lappend(list_copy(ancestors), query);
+			return gp_slice_join_from_depth(rte->subquery, depth + 1,
+											nested, tables, conds);
+		}
+		table = palloc0(sizeof(GpJoinTable));
+		table->rti = rti;
 		table->query = query;
 		table->depth = depth;
 		*tables = lappend(*tables, table);
@@ -1820,8 +1837,15 @@ gp_slice_join_sublink_walker(Node *node, GpJoinSubqueries *state)
 	if (node == NULL)
 		return false;
 	if (IsA(node, Query))
+	{
+		GpJoinSubqueries nested = *state;
+
+		/* A subquery in FROM is a level too, not only a SubLink is one */
+		nested.depth = state->depth + 1;
+		nested.ancestors = lappend(list_copy(state->ancestors), node);
 		return query_tree_walker((Query *) node, gp_slice_join_sublink_walker,
-							 state, 0);
+							 &nested, 0);
+	}
 	if (!IsA(node, SubLink))
 		return expression_tree_walker(node, gp_slice_join_sublink_walker, state);
 	sublink = (SubLink *) node;
@@ -2682,6 +2706,15 @@ gp_slice_join_all_inner_from(Query *parse)
 }
 
 static bool
+gp_slice_join_derived(Query *parse)
+{
+	foreach_node(RangeTblEntry, rte, parse->rtable)
+		if (rte->rtekind == RTE_SUBQUERY)
+			return true;
+	return false;
+}
+
+static bool
 gp_slice_join_all_inner_levels(List *tables)
 {
 	List	   *queries = NIL;
@@ -2735,7 +2768,8 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 	if (!redistributing && list_length(tables) > 2 && !multiway)
 		return false;
 	jointype = gp_slice_join_type_of(original);
-	if ((list_length(tables) != 2 || original->hasSubLinks) &&
+	if ((list_length(tables) != 2 || original->hasSubLinks ||
+		 gp_slice_join_derived(original)) &&
 		!gp_slice_join_all_inner_levels(tables))
 		return false;
 	if (redistributing)
@@ -2968,6 +3002,10 @@ gp_slice_join_query(Query *parse)
 		!gp_slice_join_sublinks(parse, &tables, &conds))
 		return NULL;
 	if (list_length(tables) < 2)
+		return NULL;
+	/* Large derived joins wait for a cost bound on their nested Motion */
+	if (gp_slice_join_derived(parse) &&
+		(!gp_slice_join_all_inner_levels(tables) || list_length(tables) > 6))
 		return NULL;
 	if (!gp_slice_join_colocated(parse, tables, conds))
 	{
@@ -3795,7 +3833,7 @@ gp_slice_join_partial(Query *original, PlannedStmt *stmt, Plan *plan,
 	Agg		   *agg;
 	Query	   *remote;
 
-	if (!IsA(plan, Agg))
+	if (!IsA(plan, Agg) || gp_slice_join_derived(original))
 		return false;
 	agg = (Agg *) plan;
 	if (agg->numCols != list_length(original->groupClause))
@@ -4058,6 +4096,26 @@ gp_slice_join_redistributed_agg(Query *original, PlannedStmt *stmt, Plan *plan,
 		TupleDesc	tupdesc;
 		int			rti = foreach_current_index(lc) + 1;
 
+		if (input->rtekind == RTE_SUBQUERY)
+		{
+			if (input->subquery == NULL)
+				return false;
+			foreach_node(TargetEntry, subtle, input->subquery->targetList)
+			{
+				Var		   *var;
+				TargetEntry *tle;
+
+				if (subtle->resjunk)
+					continue;
+				var = makeVar(rti, subtle->resno, exprType((Node *) subtle->expr),
+							  exprTypmod((Node *) subtle->expr),
+							  exprCollation((Node *) subtle->expr), 0);
+				pos++;
+				tle = makeTargetEntry((Expr *) var, pos, psprintf("c%d", pos), false);
+				inner->targetList = lappend(inner->targetList, tle);
+			}
+			continue;
+		}
 		if (input->rtekind != RTE_RELATION &&
 			(input->rtekind != RTE_FUNCTION || !OidIsValid(input->relid)))
 			continue;
