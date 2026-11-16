@@ -1217,6 +1217,15 @@ gp_slice_cte_agg_plan(Query *original, PlannedStmt *stmt)
 		return false;
 	agg = (Agg *) plan;
 
+	/*
+	 * A sorted aggregation hands the order of its groups up: the planner
+	 * may plan a merge join above the scan of the CTE in the faith that the
+	 * scan comes out sorted, and the answer of the segments arrives in no
+	 * order.  Keep such a CTE on the coordinator
+	 */
+	if (agg->aggstrategy == AGG_SORTED || agg->aggstrategy == AGG_MIXED)
+		return false;
+
 	/* Below the aggregate there is the gather of the table and nothing else */
 	below = agg->plan.lefttree;
 	while (below != NULL && (IsA(below, Sort) || IsA(below, IncrementalSort)))
@@ -2711,6 +2720,621 @@ gp_slice_hashable(Oid typid)
 							 HASHEXTENDED_PROC);
 	return OidIsValid(proc);
 }
+
+/* The two leaves of the FROM of a join of one CTE and one table */
+typedef struct GpCteJoinSides
+{
+	Index		cterti;			/* the RT index of the CTE */
+	Index		tableti;		/* the RT index of the table */
+} GpCteJoinSides;
+
+/* A grouping column of the CTE equated with a column of the table */
+typedef struct GpCteJoinPair
+{
+	Index		resno;			/* the position of the column in the CTE */
+	AttrNumber	groupattno;		/* the column of the table of the CTE */
+	AttrNumber	tableattno;		/* the column of the table of the join */
+	Oid			type;			/* the common type of the two columns */
+} GpCteJoinPair;
+
+/*
+ * The column of the table of the CTE that one output column of the CTE
+ * comes from.  A grouping column of this PostgreSQL names the grouping
+ * itself, whose expressions carry the columns of the table
+ */
+static Var *
+gp_slice_cte_join_group_var(Query *ctequery, TargetEntry *tle)
+{
+	Var		   *var;
+	RangeTblEntry *rte;
+
+	if (!IsA(tle->expr, Var) || ((Var *) tle->expr)->varlevelsup != 0)
+		return NULL;
+	var = (Var *) tle->expr;
+	if (var->varattno <= 0 || var->varno > list_length(ctequery->rtable))
+		return NULL;
+	rte = rt_fetch(var->varno, ctequery->rtable);
+	if (rte->rtekind == RTE_GROUP)
+	{
+		Node	   *expr;
+
+		if (var->varattno > list_length(rte->groupexprs))
+			return NULL;
+		expr = list_nth(rte->groupexprs, var->varattno - 1);
+		if (!IsA(expr, Var))
+			return NULL;
+		var = (Var *) expr;
+	}
+	if (var->varlevelsup != 0 || var->varattno <= 0 ||
+		var->varno > list_length(ctequery->rtable))
+		return NULL;
+	rte = rt_fetch(var->varno, ctequery->rtable);
+	if (rte->rtekind != RTE_RELATION)
+		return NULL;
+	return var;
+}
+
+/*
+ * Collect the equalities of a CTE column with a column of the table, at the
+ * top of an AND or below it.  Every equality of other kinds stays out
+ */
+static void
+gp_slice_cte_join_pairs(Node *qual, GpCteJoinSides *sides, Query *ctequery,
+						List **pairs)
+{
+	OpExpr	   *op;
+	Var		   *ctevar;
+	Var		   *tablevar;
+	TargetEntry *tle;
+	Var		   *groupvar;
+	GpCteJoinPair *pair;
+
+	if (qual == NULL)
+		return;
+	if (IsA(qual, BoolExpr) && ((BoolExpr *) qual)->boolop == AND_EXPR)
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((BoolExpr *) qual)->args)
+			gp_slice_cte_join_pairs(lfirst(lc), sides, ctequery, pairs);
+		return;
+	}
+	if (!IsA(qual, OpExpr))
+		return;
+	op = (OpExpr *) qual;
+	if (list_length(op->args) != 2 || get_opname(op->opno) == NULL ||
+		strcmp(get_opname(op->opno), "=") != 0 ||
+		!IsA(linitial(op->args), Var) || !IsA(lsecond(op->args), Var))
+		return;
+	if (((Var *) linitial(op->args))->varno == sides->cterti &&
+		((Var *) lsecond(op->args))->varno == sides->tableti)
+	{
+		ctevar = (Var *) linitial(op->args);
+		tablevar = (Var *) lsecond(op->args);
+	}
+	else if (((Var *) lsecond(op->args))->varno == sides->cterti &&
+			 ((Var *) linitial(op->args))->varno == sides->tableti)
+	{
+		ctevar = (Var *) lsecond(op->args);
+		tablevar = (Var *) linitial(op->args);
+	}
+	else
+		return;
+	if (ctevar->varlevelsup != 0 || tablevar->varlevelsup != 0 ||
+		ctevar->varattno <= 0 || tablevar->varattno <= 0)
+		return;
+	tle = get_tle_by_resno(ctequery->targetList, ctevar->varattno);
+	if (tle == NULL)
+		return;
+	groupvar = gp_slice_cte_join_group_var(ctequery, tle);
+	if (groupvar == NULL || groupvar->vartype != tablevar->vartype)
+		return;
+	pair = palloc0(sizeof(GpCteJoinPair));
+	pair->resno = tle->resno;
+	pair->groupattno = groupvar->varattno;
+	pair->tableattno = tablevar->varattno;
+	pair->type = tablevar->vartype;
+	*pairs = lappend(*pairs, pair);
+}
+
+/*
+ * Whether every grouping column of the CTE is a column of its answer
+ * equated with a column of the table, and none of the pairs repeats a
+ * column of the table.  The keys of the table side and the grouping
+ * columns of the table of the CTE, both in the order of the grouping, go
+ * out for the pulls of the two sides by the hash of their columns
+ */
+static bool
+gp_slice_cte_join_keys(Query *ctequery, List *pairs, AttrNumber **tablekeys,
+					   AttrNumber **groupkeys)
+{
+	AttrNumber *keyatts;
+	AttrNumber *groupatts;
+	int			nkeys = list_length(ctequery->groupClause);
+	int			i = 0;
+
+	if (nkeys == 0 || list_length(pairs) < nkeys)
+		return false;
+	keyatts = palloc_array(AttrNumber, nkeys);
+	groupatts = palloc_array(AttrNumber, nkeys);
+	foreach_node(SortGroupClause, sc, ctequery->groupClause)
+	{
+		TargetEntry *tle = get_sortgroupclause_tle(sc, ctequery->targetList);
+		Var		   *groupvar;
+		GpCteJoinPair *found = NULL;
+		ListCell   *lc2;
+
+		if (tle->resjunk)
+			return false;
+		groupvar = gp_slice_cte_join_group_var(ctequery, tle);
+		if (groupvar == NULL || !gp_slice_hashable(groupvar->vartype))
+			return false;
+		foreach(lc2, pairs)
+		{
+			GpCteJoinPair *pair = lfirst(lc2);
+
+			if (pair->resno == tle->resno)
+			{
+				found = pair;
+				break;
+			}
+		}
+		if (found == NULL || !gp_slice_hashable(found->type) ||
+			found->groupattno != groupvar->varattno)
+			return false;
+		for (int j = 0; j < i; j++)
+			if (keyatts[j] == found->tableattno)
+				return false;
+		keyatts[i] = found->tableattno;
+		groupatts[i] = groupvar->varattno;
+		i++;
+	}
+	if (tablekeys != NULL)
+		*tablekeys = keyatts;
+	if (groupkeys != NULL)
+		*groupkeys = groupatts;
+	return true;
+}
+
+/* The two leaves of the FROM: one CTE and one table, joined or comma-joined */
+static bool
+gp_slice_cte_join_leaves(Query *parse, GpCteJoinSides *sides)
+{
+	FromExpr   *from = (FromExpr *) parse->jointree;
+	List	   *leaves = NIL;
+	ListCell   *lc;
+
+	sides->cterti = 0;
+	sides->tableti = 0;
+	if (!IsA(parse->jointree, FromExpr))
+		return false;
+	if (list_length(from->fromlist) == 1 && IsA(linitial(from->fromlist), JoinExpr))
+	{
+		JoinExpr   *join = linitial_node(JoinExpr, from->fromlist);
+
+		if (!IsA(join->larg, RangeTblRef) || !IsA(join->rarg, RangeTblRef))
+			return false;
+		leaves = list_make2(join->larg, join->rarg);
+	}
+	else if (list_length(from->fromlist) == 2)
+		leaves = from->fromlist;
+	else
+		return false;
+	foreach(lc, leaves)
+	{
+		Index		rti = lfirst_node(RangeTblRef, lc)->rtindex;
+		RangeTblEntry *rte = rt_fetch(rti, parse->rtable);
+
+		if (rte->rtekind == RTE_CTE)
+		{
+			if (sides->cterti != 0)
+				return false;
+			sides->cterti = rti;
+		}
+		else if (rte->rtekind == RTE_RELATION)
+		{
+			if (sides->tableti != 0)
+				return false;
+			sides->tableti = rti;
+		}
+		else
+			return false;
+	}
+	return sides->cterti != 0 && sides->tableti != 0;
+}
+
+/* Whether the relation keeps row security or inheritance children */
+static bool
+gp_slice_cte_join_protected(RangeTblEntry *rte)
+{
+	HeapTuple	tuple;
+	Form_pg_class rel;
+
+	if (rte->inh)
+		return true;
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(rte->relid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for relation %u", rte->relid);
+	rel = (Form_pg_class) GETSTRUCT(tuple);
+	if (rel->relrowsecurity || rel->relforcerowsecurity)
+	{
+		ReleaseSysCache(tuple);
+		return true;
+	}
+	ReleaseSysCache(tuple);
+	return false;
+}
+
+/* The relations of the query and of its CTE keep RLS or children */
+static bool
+gp_slice_cte_join_rls(Query *ctequery, Query *parse)
+{
+	foreach_node(RangeTblEntry, rte, parse->rtable)
+		if (rte->rtekind == RTE_RELATION && gp_slice_cte_join_protected(rte))
+			return true;
+	foreach_node(RangeTblEntry, rte, ctequery->rtable)
+		if (rte->rtekind == RTE_RELATION && gp_slice_cte_join_protected(rte))
+			return true;
+	return false;
+}
+
+/*
+ * The join of one aggregate CTE with one hashed table, where every grouping
+ * column of the CTE is equated with a column of the table.  The rows of the
+ * table move by the hash of those columns under the map of the table of the
+ * CTE, and the rows of the table of the CTE move by its grouping columns,
+ * so every pair of the join meets on one segment.  A copy of the query is
+ * returned for the SQL of the segments, or NULL when it is not such a join
+ */
+Query *
+gp_slice_cte_join_query(Query *parse)
+{
+	CommonTableExpr *cte;
+	Query	   *ctequery;
+	RangeTblEntry *rte;
+	GpCteJoinSides sides;
+	GpPolicy	policy;
+	GpPolicy	ctepolicy;
+	List	   *pairs = NIL;
+	ListCell   *lc;
+	bool		covering;
+
+	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
+		list_length(parse->cteList) != 1 ||
+		parse->hasSubLinks || parse->hasWindowFuncs || parse->hasAggs ||
+		parse->hasTargetSRFs || parse->hasRowSecurity ||
+		parse->setOperations != NULL || parse->groupingSets != NIL ||
+		parse->distinctClause != NIL || parse->rowMarks != NIL)
+		return NULL;
+	if (!gp_slice_cte_join_leaves(parse, &sides))
+		return NULL;
+	cte = linitial_node(CommonTableExpr, parse->cteList);
+	if (cte->cterecursive)
+		return NULL;
+	ctequery = castNode(Query, cte->ctequery);
+	if (ctequery->sortClause != NIL || gp_slice_agg_query(ctequery) == NULL)
+		return NULL;
+
+	/* The table of the CTE keeps its rows apart, as the motion needs */
+	rte = rt_fetch(linitial_node(RangeTblRef,
+								 ((FromExpr *) ctequery->jointree)->fromlist)->rtindex,
+				   ctequery->rtable);
+	if (rte->rtekind != RTE_RELATION || !gp_policy_get(rte->relid, &ctepolicy) ||
+		ctepolicy.replicated)
+		return NULL;
+
+	/* The table of the join is hashed, as its rows move by the join */
+	rte = rt_fetch(sides.tableti, parse->rtable);
+	if (!gp_policy_get(rte->relid, &policy) || policy.replicated)
+		return NULL;
+
+	/*
+	 * A CTE whose grouping covers the key of its table needs no motion and
+	 * keeps the locus of the subplan: leave it to the subplan path
+	 */
+	covering = true;
+	for (int i = 0; i < ctepolicy.nkeys && covering; i++)
+	{
+		bool		grouped = false;
+
+		foreach_node(SortGroupClause, sc, ctequery->groupClause)
+		{
+			TargetEntry *tle = get_sortgroupclause_tle(sc, ctequery->targetList);
+			Var		   *groupvar;
+
+			if (tle->resjunk)
+				continue;
+			groupvar = gp_slice_cte_join_group_var(ctequery, tle);
+			if (groupvar != NULL && groupvar->varattno == ctepolicy.keys[i])
+			{
+				grouped = true;
+				break;
+			}
+		}
+		covering = grouped;
+	}
+	if (covering)
+		return NULL;
+
+	gp_slice_cte_join_pairs((Node *) ((FromExpr *) parse->jointree)->quals,
+							&sides, ctequery, &pairs);
+	foreach(lc, ((FromExpr *) parse->jointree)->fromlist)
+		if (IsA(lfirst(lc), JoinExpr))
+			gp_slice_cte_join_pairs(((JoinExpr *) lfirst(lc))->quals, &sides,
+									ctequery, &pairs);
+	if (!gp_slice_cte_join_keys(ctequery, pairs, NULL, NULL))
+		return NULL;
+	if (gp_dispatch_in_xact())
+		return NULL;
+	return gp_slice_query_copy(parse);
+}
+
+/*
+ * Replace the plan of a join of one aggregate CTE with one table by a scan
+ * that runs it on the segments: the CTE is computed there by its grouping
+ * columns, and the rows of the table move by the equated columns, so every
+ * pair of the join meets on one segment.  A kept side of an outer join
+ * stays where its rows are; the null-supplying side of a kept CTE is
+ * broadcast to every segment.  The sort and the limit of the query stay
+ * above the scan
+ */
+bool
+gp_slice_cte_join_plan(Query *original, PlannedStmt *stmt)
+{
+	Plan	   *parent = NULL;
+	Plan	   *plan = stmt->planTree;
+	Plan	   *subplan;
+	Plan	   *below;
+	Plan	   *ctescan = NULL;
+	Plan	   *tableplan = NULL;
+	Join	   *join;
+	Agg		   *agg;
+	Query	   *ctequery;
+	RangeTblEntry *rte;
+	CommonTableExpr *cte;
+	GpCteJoinSides sides;
+	Index		planrti;
+	int			nentries;
+	GpJoinTable	ctetable = {0};
+	GpJoinTable	jointable = {0};
+	GpPolicy	ctepolicy;
+	GpPolicy	policy;
+	List	   *pairs = NIL;
+	ListCell   *lc;
+	AttrNumber *tablekeys;
+	AttrNumber *groupkeys;
+	int			nkeys;
+	bool		sort_above = false;
+	bool		cte_kept;
+
+	while (plan != NULL && (IsA(plan, Sort) || IsA(plan, Limit)))
+	{
+		if (IsA(plan, Sort))
+			sort_above = true;
+		parent = plan;
+		plan = plan->lefttree;
+	}
+	if (plan == NULL || (!IsA(plan, NestLoop) && !IsA(plan, HashJoin) &&
+						 !IsA(plan, MergeJoin)))
+		return false;
+	join = (Join *) plan;
+	if (join->jointype != JOIN_INNER && join->jointype != JOIN_LEFT &&
+		join->jointype != JOIN_RIGHT)
+		return false;
+
+	/* Non-aggregate plans without a final Sort keep their ordering here */
+	if (original->sortClause != NIL && !sort_above)
+		return false;
+
+	/*
+	 * One side is the scan of the CTE, the other is the gather of the
+	 * table.  The build side of a hash join hangs under its Hash
+	 */
+	{
+		Plan	   *left = join->plan.lefttree;
+		Plan	   *right = join->plan.righttree;
+
+		if (IsA(left, Hash))
+			left = left->lefttree;
+		if (IsA(right, Hash))
+			right = right->lefttree;
+		if (IsA(left, CteScan) && gp_is_gather(right))
+		{
+			ctescan = left;
+			tableplan = right;
+			cte_kept = join->jointype == JOIN_LEFT;
+		}
+		else if (IsA(right, CteScan) && gp_is_gather(left))
+		{
+			ctescan = right;
+			tableplan = left;
+			cte_kept = join->jointype == JOIN_RIGHT;
+		}
+		else
+			return false;
+	}
+
+	/* The gather scans the table of the query, not another relation */
+	rte = rt_fetch(((Scan *) tableplan)->scanrelid, stmt->rtable);
+	planrti = 0;
+	nentries = 0;
+	foreach_node(RangeTblEntry, entry, original->rtable)
+	{
+		nentries++;
+		if (entry->rtekind == RTE_RELATION && entry->relid == rte->relid)
+		{
+			planrti = nentries;
+			break;
+		}
+	}
+	if (planrti == 0)
+		return false;
+
+	/* The subplan of the CTE is the aggregate over the gather, as before */
+	if (((CteScan *) ctescan)->ctePlanId <= 0 ||
+		((CteScan *) ctescan)->ctePlanId > list_length(stmt->subplans))
+		return false;
+	subplan = list_nth(stmt->subplans, ((CteScan *) ctescan)->ctePlanId - 1);
+	plan = subplan;
+	while (plan != NULL && !IsA(plan, Agg))
+	{
+		if (plan->righttree != NULL)
+			return false;
+		plan = plan->lefttree;
+	}
+	if (plan == NULL)
+		return false;
+	agg = (Agg *) plan;
+	below = agg->plan.lefttree;
+	while (below != NULL && (IsA(below, Sort) || IsA(below, IncrementalSort)))
+		below = below->lefttree;
+	if (below == NULL || !gp_is_gather(below))
+		return false;
+
+	/* The analysis of the query, the same the eligibility went through */
+	cte = linitial_node(CommonTableExpr, original->cteList);
+	ctequery = castNode(Query, cte->ctequery);
+	if (!gp_slice_cte_join_leaves(original, &sides))
+		return false;
+	if (sides.tableti != planrti)
+		return false;
+	rte = rt_fetch(sides.tableti, original->rtable);
+	if (!gp_policy_get(rte->relid, &policy))
+		return false;
+	ctetable.rti = linitial_node(RangeTblRef,
+								 ((FromExpr *) ctequery->jointree)->fromlist)->rtindex;
+	rte = rt_fetch(ctetable.rti, ctequery->rtable);
+	if (rte->rtekind != RTE_RELATION ||
+		!gp_policy_get(rte->relid, &ctepolicy))
+		return false;
+	ctetable.query = ctequery;
+	ctetable.policy = ctepolicy;
+	jointable.rti = sides.tableti;
+	jointable.query = original;
+	jointable.policy = policy;
+
+	gp_slice_cte_join_pairs((Node *) ((FromExpr *) original->jointree)->quals,
+							&sides, ctequery, &pairs);
+	foreach(lc, ((FromExpr *) original->jointree)->fromlist)
+		if (IsA(lfirst(lc), JoinExpr))
+			gp_slice_cte_join_pairs(((JoinExpr *) lfirst(lc))->quals, &sides,
+									ctequery, &pairs);
+	if (!gp_slice_cte_join_keys(ctequery, pairs, &tablekeys, &groupkeys))
+		return false;
+	nkeys = list_length(ctequery->groupClause);
+
+	/*
+	 * The grouping columns of the plan name the columns of the table of the
+	 * CTE: the same columns the analysis found, in the same order
+	 */
+	for (int i = 0; i < nkeys; i++)
+	{
+		TargetEntry *tle = list_nth(below->targetlist, agg->grpColIdx[i] - 1);
+		Var		   *var;
+
+		if (!IsA(tle->expr, Var) || ((Var *) tle->expr)->varattno <= 0)
+			return false;
+		var = (Var *) tle->expr;
+
+		/* The plan groups by the same column the analysis found */
+		if (var->varattno != groupkeys[i])
+			return false;
+	}
+
+	/*
+	 * The table of the CTE moves by its grouping columns under the map of
+	 * the side that keeps its rows.  An inner join keeps the CTE and moves
+	 * the rows of the table by the hash of the equated columns under the
+	 * same map, so every pair meets on one segment
+	 */
+	if (join->jointype == JOIN_INNER || cte_kept)
+	{
+		if (!gp_slice_redistribute_rte_keys(original, &ctetable, &ctetable,
+											false, nkeys, groupkeys,
+											NULL, false))
+			return false;
+		if (join->jointype == JOIN_INNER)
+		{
+			/*
+			 * The rows of the table move by the hash of the equated
+			 * columns under the same map, so every pair meets
+			 */
+			if (!gp_slice_redistribute_rte_keys(original, &ctetable, &jointable,
+												false, nkeys, tablekeys,
+												NULL, false))
+				return false;
+		}
+		else
+		{
+			/*
+			 * A kept CTE holds every unmatched group of its own: the
+			 * null-supplying table broadcasts to every segment
+			 */
+			if (!gp_slice_redistribute_rte_keys(original, &ctetable, &jointable,
+												true, policy.nkeys, policy.keys,
+												NULL, false))
+				return false;
+		}
+	}
+	else
+	{
+		/*
+		 * The table keeps its rows, and the CTE meets it where it stands.
+		 * That is only possible when the key of the distribution of the
+		 * table is the equated columns themselves.  Over any other key
+		 * the rows of the table move by the equated columns instead, the
+		 * way an inner join moves them: a kept row then stands beside its
+		 * partner, or alone, with the columns of the CTE null
+		 */
+		bool		stationary = policy.nkeys == nkeys;
+
+		for (int i = 0; stationary && i < nkeys; i++)
+			stationary = policy.keys[i] == tablekeys[i];
+		if (stationary)
+		{
+			if (!gp_slice_redistribute_rte_keys(original, &jointable, &ctetable,
+												false, nkeys, groupkeys,
+												NULL, false))
+				return false;
+		}
+		else
+		{
+			if (!gp_slice_redistribute_rte_keys(original, &ctetable, &ctetable,
+												false, nkeys, groupkeys,
+												NULL, false))
+				return false;
+			if (!gp_slice_redistribute_rte_keys(original, &ctetable, &jointable,
+												false, nkeys, tablekeys,
+												NULL, false))
+				return false;
+		}
+	}
+
+	/* The columns the segments return are the target list of the join */
+	if (list_length(join->plan.targetlist) != list_length(original->targetList))
+		return false;
+
+	{
+		CustomScan *cscan = gp_slice_make(&join->plan, original, false, true,
+										  original->sortClause);
+
+		/*
+		 * The tables of the CTE hide from the walk of gp_slice_autonomous:
+		 * keep such a slice on libpq, whose connections see the policies
+		 */
+		if (gp_slice_cte_join_rls(ctequery, original))
+			lfourth(cscan->custom_private) = makeBoolean(false);
+
+		if (parent == NULL)
+			stmt->planTree = &cscan->scan.plan;
+		else
+			parent->lefttree = &cscan->scan.plan;
+	}
+
+	stmt->parallelModeNeeded = false;
+	return true;
+}
+
 
 /*
  * Whether an aggregate of one table can run on the segments.  A replicated

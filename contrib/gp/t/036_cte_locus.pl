@@ -48,6 +48,7 @@ sub local_query
 
 	$query =~ s/\bt\b/l/g;
 	$query =~ s/\br\b/lr/g;
+	$query =~ s/\bu\b/lu/g;
 	return $query;
 }
 
@@ -57,8 +58,12 @@ run("INSERT INTO t VALUES (1, 'x', 1), (1, 'y', 2), (2, 'x', 3), (2, 'y', 4)");
 run('CREATE TABLE r (a int)');
 run("SELECT gp.distribute('r', NULL)");
 run('INSERT INTO r VALUES (10), (20)');
+run('CREATE TABLE u (b text, n int)');
+run("SELECT gp.distribute('u', ARRAY['b'])");
+run("INSERT INTO u VALUES ('x', 1), ('y', 2)");
 run('CREATE TABLE l AS SELECT * FROM t');
 run('CREATE TABLE lr AS SELECT * FROM r');
+run('CREATE TABLE lu AS SELECT * FROM u');
 
 like(plan_for('WITH s AS MATERIALIZED (SELECT a, b, v FROM t) SELECT a, b, v FROM s'),
 	qr/GpSlice/, 'a nonrecursive CTE runs on the segments');
@@ -106,6 +111,23 @@ like($coordinator->safe_psql('postgres',
 	qr/Output: s\.bb, s\.total/,
 	'the columns of the aggregate CTE deparse against the statement');
 
+# The join of an aggregate CTE with a table runs on the segments when every
+# grouping column of the CTE is equated with a column of the table
+like(plan_for('WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t FROM s, t WHERE s.b = t.b'),
+	qr/GpSlice/, 'the join of an aggregate CTE runs on the segments');
+unlike(plan_for('WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t FROM s, t WHERE s.b = t.b'),
+	qr/CTE Scan/, 'the join of an aggregate CTE needs no scan of the CTE');
+like(plan_for('WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, t.a FROM s LEFT JOIN t ON s.b = t.b'),
+	qr/GpSlice/, 'a left join with the CTE kept runs on the segments');
+like(plan_for('WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, t.a FROM t LEFT JOIN s ON s.b = t.b'),
+	qr/GpSlice/, 'a left join with the table kept runs on the segments');
+like(plan_for('WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, u.n FROM s LEFT JOIN u ON s.b = u.b'),
+	qr/GpSlice/, 'the CTE meets a table keyed by its grouping column where it stands');
+like(plan_for('WITH s AS MATERIALIZED (SELECT b, count(DISTINCT a) AS c FROM t GROUP BY b) SELECT s.b, s.c FROM s, t WHERE s.b = t.b'),
+	qr/GpSlice/, 'a distinct aggregate in the CTE joins when the groups are hashed');
+like(plan_for('WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t FROM s FULL JOIN t ON s.b = t.b'),
+	qr/CTE Scan/, 'a full join of the CTE keeps the scan of the CTE');
+
 my @queries = (
 	'WITH s AS MATERIALIZED (SELECT a, b, v FROM t) SELECT a, b, v FROM s ORDER BY a, b',
 	'WITH s AS MATERIALIZED (SELECT a FROM t) SELECT a FROM s WHERE a > 1 ORDER BY a',
@@ -122,6 +144,13 @@ my @queries = (
 	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS total FROM t GROUP BY b)
 		SELECT s.b, s.total FROM s, t WHERE s.b = t.b
 		  AND s.total = (SELECT max(total) FROM s) ORDER BY s.b',
+	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t FROM s, t WHERE s.b = t.b ORDER BY 1',
+	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, t.a FROM s LEFT JOIN t ON s.b = t.b ORDER BY 1, 3',
+	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, t.a FROM t LEFT JOIN s ON s.b = t.b ORDER BY 1, 3',
+	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, t.a FROM s RIGHT JOIN t ON s.b = t.b ORDER BY 1, 3',
+	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, u.n FROM s LEFT JOIN u ON s.b = u.b ORDER BY 1',
+	'WITH s AS MATERIALIZED (SELECT b, count(DISTINCT a) AS c FROM t GROUP BY b) SELECT s.b, s.c FROM s, t WHERE s.b = t.b ORDER BY 1',
+	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t FROM s FULL JOIN t ON s.b = t.b ORDER BY 1',
 );
 foreach my $query (@queries)
 {
