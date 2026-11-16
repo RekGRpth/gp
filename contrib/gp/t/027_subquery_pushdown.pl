@@ -71,17 +71,21 @@ like(plan_for('SELECT a, b, sum(v) FROM m GROUP BY a, b'),
 	qr/GpSlice/, 'the whole compound distribution key stays hashed');
 like(plan_for('SELECT a, sum(v) FROM m GROUP BY a'),
 	qr/GpSlice/, 'a prefix of a compound key redistributes by the grouping columns');
+unlike(plan_for('SELECT sum(s.c) FROM (SELECT a, sum(c) AS c FROM t GROUP BY a) s'),
+	qr/GpSlice/, 'a global aggregate over a derived table stays on the coordinator');
 unlike(plan_for('SELECT * FROM (SELECT a, count(*) FROM t GROUP BY a LIMIT 3) s'),
 	qr/GpSlice/, 'a limit inside the subquery stops the pushdown');
 my $condition_plan = plan_for('SELECT s.a FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s WHERE s.cnt > 900');
 like($condition_plan, qr/GpSlice/, 'a condition of the outer query keeps its locus');
 like($condition_plan, qr/Subquery Scan/, 'the outer condition stays above the distributed subquery');
-unlike(plan_for('SELECT u.d, s.cnt FROM u JOIN (SELECT a, count(*) AS cnt FROM t GROUP BY a) s ON u.a = s.a'),
-	qr/GpSlice/, 'a subquery joined to a table stays on the coordinator');
+like(plan_for('SELECT u.d, s.cnt FROM u JOIN (SELECT a, count(*) AS cnt FROM t GROUP BY a) s ON u.a = s.a'),
+	qr/GpSlice/, 'a derived table can join a base table with Motion');
 
 my @queries = (
 	'SELECT s.a, s.cnt FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s ORDER BY s.a LIMIT 5',
 	'SELECT sum(s.c) FROM (SELECT a, sum(c) AS c FROM t GROUP BY a) s',
+	'SELECT s.a, sum(s.c) FROM (SELECT a, sum(c) AS c FROM t GROUP BY a) s GROUP BY s.a ORDER BY s.a',
+	'SELECT s.cnt, count(*) FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s GROUP BY s.cnt ORDER BY s.cnt',
 	'SELECT s.a, s.cnt FROM (SELECT t.a, count(*) AS cnt FROM t JOIN u ON t.a = u.a GROUP BY t.a) s ORDER BY s.a LIMIT 5',
 	'SELECT s.a, s.c, s.cnt FROM (SELECT t.a, u.d AS c, count(*) AS cnt FROM t JOIN u ON t.a = u.a GROUP BY t.a, u.d) s ORDER BY s.a, s.c LIMIT 5',
 	'SELECT count(*) FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s',
@@ -95,6 +99,7 @@ my @queries = (
 	'SELECT s.a, s.d FROM (SELECT t.a, u.d FROM t JOIN u ON t.a + 20 = u.a) s ORDER BY s.a, s.d LIMIT 4',
 	'SELECT s.a, s.d FROM (SELECT t.a, r.d FROM t JOIN r ON t.a = r.a) s ORDER BY s.a LIMIT 4',
 	'SELECT s.cnt + 1 FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s WHERE s.cnt = 100 AND s.a > 2 ORDER BY 1 LIMIT 3',
+	'SELECT u.d, s.cnt FROM u JOIN (SELECT a, count(*) AS cnt FROM t GROUP BY a) s ON u.a = s.a ORDER BY u.d, s.cnt LIMIT 5',
 );
 foreach my $query (@queries)
 {
