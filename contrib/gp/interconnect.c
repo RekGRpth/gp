@@ -162,7 +162,11 @@ gp_ic_read(pgsocket fd, void *buf, int len)
 			continue;
 		}
 		if (n <= 0)
+		{
+			if (n == 0)
+				errno = ECONNRESET;
 			return false;
+		}
 		p += n;
 		len -= n;
 	}
@@ -307,7 +311,16 @@ gp_ic_read_latched(pgsocket fd, WaitEventSet *wes, void *buf, int len)
 			continue;
 		}
 		if (n <= 0)
+		{
+			/*
+			 * A peer that closes its connection without a final message
+			 * leaves the errno of an earlier would-block read here: report
+			 * the close, not that stale would-block
+			 */
+			if (n == 0 || gp_ic_wouldblock())
+				errno = ECONNRESET;
 			return false;
+		}
 		p += n;
 		len -= n;
 	}
@@ -930,6 +943,10 @@ gp_ic_cancel_slot(pgsocket fd)
 	if (pid == 0)
 		ereport(LOG,
 				errmsg("no interconnect worker to stop in slot %d", slot_id));
+	else if (GetBackgroundWorkerTypeByPid(pid) == NULL)
+		ereport(LOG,
+				errmsg("the interconnect worker of slot %d is already gone",
+					   slot_id));
 	else if (kill(pid, SIGINT) != 0)
 		ereport(LOG,
 				errmsg("could not stop the interconnect worker of slot %d: %m",
@@ -1210,15 +1227,20 @@ gp_interconnect_request_main(Datum main_arg)
 	else
 		gp_ic_slot_set_port(slot, generation,
 							PostPortNumber + 20000 + (generation % 20000));
-	pg_write_barrier();
-	gp_ic_slot_publish(slot, generation, GP_IC_SLOT_READY);
-
+	/*
+	 * Everything that can fail must fail before the slot reads READY:
+	 * the broker hands the port out at that point, and a worker that
+	 * goes away after it leaves the client reading its silent close
+	 */
 	if (!pg_set_noblock(listener))
 	{
 		closesocket(listener);
 		gp_ic_slot_publish(slot, generation, GP_IC_SLOT_FREE);
 		proc_exit(1);
 	}
+	pg_write_barrier();
+	gp_ic_slot_publish(slot, generation, GP_IC_SLOT_READY);
+
 	wait_event = WaitEventExtensionNew("GpInterconnectRequest");
 	ResetLatch(MyLatch);
 	(void) WaitLatchOrSocket(MyLatch,
