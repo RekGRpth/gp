@@ -632,6 +632,7 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 	Query	   *grouping_original = NULL;
 	Query	   *distinct_original = NULL;
 	Query	   *insert_original = NULL;
+	List	   *initplan_cands = NIL;
 	bool		replaced = false;
 	int			saved_parallel_workers = max_parallel_workers_per_gather;
 
@@ -656,6 +657,8 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 		cte_join_original = gp_slice_cte_join_query(parse);
 		cte_agg_original = gp_slice_cte_agg_query(parse);
 	}
+	if (grouping_original == NULL)
+		initplan_cands = gp_slice_initplan_query(parse);
 	if (parse->commandType == CMD_INSERT)
 		insert_original = copyObject(parse);
 
@@ -663,7 +666,7 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 	if (union_original != NULL || window_original != NULL ||
 		cte_original != NULL || distinct_original != NULL ||
 		grouping_original != NULL || cte_agg_original != NULL ||
-		cte_join_original != NULL)
+		cte_join_original != NULL || initplan_cands != NIL)
 		max_parallel_workers_per_gather = 0;
 	PG_TRY();
 	{
@@ -685,6 +688,9 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 		IsUnderPostmaster && stmt->planTree != NULL &&
 		IsA(stmt->planTree, ModifyTable))
 		gp_dml_plan(parse, stmt, boundParams, query_string);
+
+	if (initplan_cands != NIL)
+		(void) gp_slice_initplan_plan(initplan_cands, stmt);
 
 	if (agg_original != NULL)
 		replaced = gp_slice_agg_plan(agg_original, stmt);

@@ -38,9 +38,11 @@
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_cast.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_class.h"
 #include "parser/parse_func.h"
+#include "parser/parse_agg.h"
 #include "parser/parse_oper.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_collation.h"
@@ -4866,8 +4868,7 @@ gp_partial_splittable(Aggref *aggref)
 		aggref->aggdistinct != NIL || aggref->aggorder != NIL ||
 		aggref->aggfilter != NULL ||
 		list_length(aggref->args) != 1 ||
-		list_length(aggref->aggargtypes) != 1 ||
-		linitial_oid(aggref->aggargtypes) != aggref->aggtype)
+		list_length(aggref->aggargtypes) != 1)
 		return false;
 
 	agg_tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggref->aggfnoid));
@@ -4911,6 +4912,30 @@ gp_partial_func(const char *name, Oid argtype)
 	return funcoid;
 }
 
+/*
+ * The transition type the executor reads from the aggregate itself: the
+ * planner resolves it in the tree it plans, and a copy taken before the
+ * planner carries none
+ */
+static void
+gp_partial_transtype(Aggref *aggref)
+{
+	HeapTuple	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggref->aggfnoid));
+
+	if (HeapTupleIsValid(tup))
+	{
+		Form_pg_aggregate aggform = (Form_pg_aggregate) GETSTRUCT(tup);
+		Oid			inputTypes[FUNC_MAX_ARGS];
+
+		get_aggregate_argtypes(aggref, inputTypes);
+		aggref->aggtranstype = resolve_aggregate_transtype(aggref->aggfnoid,
+														   aggform->aggtranstype,
+														   inputTypes,
+														   list_length(aggref->args));
+		ReleaseSysCache(tup);
+	}
+}
+
 /* The partial column of an average: its sum, or the count of its argument */
 static Expr *
 gp_partial_avg_column(Aggref *avgref, Oid funcoid, Oid resulttype)
@@ -4919,21 +4944,56 @@ gp_partial_avg_column(Aggref *avgref, Oid funcoid, Oid resulttype)
 
 	agg->aggfnoid = funcoid;
 	agg->aggtype = resulttype;
+	gp_partial_transtype(agg);
 	return (Expr *) agg;
+}
+
+/* The expression cast to another type by the function of its cast, or NULL */
+static Expr *
+gp_partial_cast(Expr *expr, Oid fromtype, Oid totype)
+{
+	HeapTuple	tup = SearchSysCache2(CASTSOURCETARGET,
+									  ObjectIdGetDatum(fromtype),
+									  ObjectIdGetDatum(totype));
+	Form_pg_cast castform;
+	FuncExpr   *func;
+
+	if (!HeapTupleIsValid(tup))
+		return NULL;
+	castform = (Form_pg_cast) GETSTRUCT(tup);
+	if (!OidIsValid(castform->castfunc))
+	{
+		ReleaseSysCache(tup);
+		return NULL;
+	}
+	func = makeNode(FuncExpr);
+	func->funcid = castform->castfunc;
+	func->funcresulttype = totype;
+	func->args = list_make1(expr);
+	ReleaseSysCache(tup);
+	return (Expr *) func;
 }
 
 /*
  * The final answer of an average: the sum of the partial sums divided by
- * the sum of the partial counts, NULL when no row had a value
+ * the sum of the partial counts, NULL when no row had a value.  The two
+ * combining aggregates take the numbers of the state the executor reads
+ * from the plan, as every aggregate of the final target does
  */
 static Expr *
-gp_partial_avg_final(GpPartialAvg *avg)
+gp_partial_avg_final(GpPartialAvg *avg, GpPartialState *state)
 {
 	Aggref	   *sum;
 	Aggref	   *count;
-	FuncExpr   *nullif;
+	Expr	   *divisor;
+	Expr	   *zero;
+	FuncExpr   *eq;
+	CaseWhen   *when;
+	CaseExpr   *caseexpr;
 	FuncExpr   *divide;
 	Var		   *var;
+	Oid			casetype;
+	Oid			eqop;
 	Oid			sumoid = gp_partial_func("sum",
 							  exprType((Node *) avg->sum));
 	Oid			cntsumoid = gp_partial_func("sum",
@@ -4948,41 +5008,105 @@ gp_partial_avg_final(GpPartialAvg *avg)
 	sum = makeNode(Aggref);
 	sum->aggfnoid = sumoid;
 	sum->aggtype = get_func_rettype(sumoid);
+	sum->aggkind = AGGKIND_NORMAL;
 	sum->args = list_make1(makeTargetEntry((Expr *) var, 1, NULL, false));
 	sum->aggargtypes = list_make1_oid(exprType((Node *) var));
 	sum->aggsplit = AGGSPLIT_SIMPLE;
+	gp_partial_transtype(sum);
+	sum->aggno = state->nextaggno;
+	sum->aggtransno = state->nextaggno;
+	state->nextaggno++;
 
+	/*
+	 * The sum of the partial counts: a sum over a whole-number column
+	 * answers in numeric, whatever the catalog keeps in the transition
+	 */
 	var = makeVar(OUTER_VAR, avg->pos_count, exprType((Node *) avg->count),
 				  -1, 0, 0);
 	count = makeNode(Aggref);
 	count->aggfnoid = cntsumoid;
 	count->aggtype = get_func_rettype(cntsumoid);
+	count->aggkind = AGGKIND_NORMAL;
 	count->args = list_make1(makeTargetEntry((Expr *) var, 1, NULL, false));
 	count->aggargtypes = list_make1_oid(exprType((Node *) var));
 	count->aggsplit = AGGSPLIT_SIMPLE;
+	gp_partial_transtype(count);
+	count->aggno = state->nextaggno;
+	count->aggtransno = state->nextaggno;
+	state->nextaggno++;
 
+	/*
+	 * The guard against the zero count: there is no nullif function in
+	 * the catalog, NULLIF is the sugar of the parser, so the case it
+	 * stands for is written out
+	 */
+	eqop = LookupOperName(NULL, list_make1(makeString((char *) "=")),
+						  count->aggtype, count->aggtype, true, -1);
+	if (!OidIsValid(eqop))
+		return NULL;
+	zero = gp_partial_cast((Expr *) makeConst(INT8OID, -1, InvalidOid, 8,
+											  Int64GetDatum(0), false, true),
+						   INT8OID, count->aggtype);
+	if (zero == NULL)
+		return NULL;
+
+	/*
+	 * The divide: by the sum of the counts in numeric where the sum
+	 * divides by numeric, else in the type of the sum through the cast of
+	 * the count sum, as the average of an interval divides by its whole
+	 * count
+	 */
+	opno = LookupOperName(NULL, list_make1(makeString((char *) "/")),
+						  sum->aggtype, count->aggtype, true, -1);
+	if (OidIsValid(opno))
 	{
-		Const	   *zero = makeConst(INT8OID, -1, InvalidOid, 8,
-									 Int64GetDatum(0), false, true);
-
-		opno = LookupOperName(NULL, list_make1(makeString((char *) "/")),
-							  sum->aggtype, INT8OID, true, -1);
-		if (!OidIsValid(opno))
-			return NULL;
-		nullif = makeNode(FuncExpr);
-		nullif->funcid = LookupFuncName(list_make2(makeString((char *) "pg_catalog"),
-												   makeString((char *) "nullif")),
-										2, (Oid[]) {sum->aggtype, INT8OID},
-										true);
-		if (!OidIsValid(nullif->funcid))
-			return NULL;
-		nullif->funcresulttype = sum->aggtype;
-		nullif->args = list_make2(count, zero);
+		divisor = (Expr *) count;
+		casetype = count->aggtype;
 	}
+	else
+	{
+		opno = LookupOperName(NULL, list_make1(makeString((char *) "/")),
+							  sum->aggtype, sum->aggtype, true, -1);
+		if (OidIsValid(opno))
+			casetype = sum->aggtype;
+		else
+		{
+			opno = LookupOperName(NULL, list_make1(makeString((char *) "/")),
+								  sum->aggtype, INT8OID, true, -1);
+			if (!OidIsValid(opno))
+				return NULL;
+			casetype = INT8OID;
+		}
+		divisor = gp_partial_cast((Expr *) copyObject(count), count->aggtype,
+								  casetype);
+		if (divisor == NULL)
+			return NULL;
+	}
+
+	/*
+	 * The answer must be of the type of the average itself: a divide that
+	 * answers another type would hand the executor a value of another type
+	 */
+	if (sum->aggtype != avg->aggref->aggtype)
+		return NULL;
+
+	eq = makeNode(FuncExpr);
+	eq->funcid = get_opcode(eqop);
+	eq->funcresulttype = BOOLOID;
+	eq->args = list_make2((Expr *) copyObject(count), zero);
+	when = makeNode(CaseWhen);
+	when->expr = (Expr *) eq;
+	when->result = (Expr *) makeNullConst(casetype, -1, InvalidOid);
+	caseexpr = makeNode(CaseExpr);
+	caseexpr->casetype = casetype;
+	caseexpr->casecollid = InvalidOid;
+	caseexpr->args = list_make1(when);
+	caseexpr->defresult = divisor;
+
 	divide = makeNode(FuncExpr);
 	divide->funcid = get_opcode(opno);
 	divide->funcresulttype = sum->aggtype;
-	divide->args = list_make2(sum, nullif);
+	divide->args = list_make2(sum, caseexpr);
 	return (Expr *) divide;
 }
 
@@ -5121,7 +5245,7 @@ gp_partial_mutator(Node *node, GpPartialState *state)
 
 			if (equal(pa->aggref, aggref))
 			{
-				Expr	   *final = gp_partial_avg_final(pa);
+				Expr	   *final = gp_partial_avg_final(pa, state);
 
 				if (final == NULL)
 				{
@@ -5144,6 +5268,7 @@ gp_partial_mutator(Node *node, GpPartialState *state)
 													   NULL, false));
 			combine->aggargtypes = list_make1_oid(aggref->aggtype);
 			combine->aggsplit = AGGSPLIT_SIMPLE;
+			gp_partial_transtype(combine);
 			combine->aggno = state->nextaggno;
 			combine->aggtransno = state->nextaggno;
 			state->nextaggno++;
@@ -5460,6 +5585,403 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 
 	(void) gp_slice_partial_finish(agg, &state, remote, false,
 								  parse->targetList, (List *) parse->havingQual);
+}
+
+/*
+ * A sublink of the query is an aggregate over one hashed table that the
+ * segments answer with partial columns: a copy of its query is collected
+ * for the SQL of the segments, keyed by the relid of that table.  Sublinks
+ * of other kinds are skipped: the planner answers them itself
+ */
+typedef struct GpInitplanCand
+{
+	Oid			relid;			/* the table the sublink aggregates over */
+	Aggref	   *aggref;			/* its aggregate, for pairing with the plan */
+	Query	   *query;			/* copy of the subselect for the segments */
+	bool		taken;			/* an init plan already pairs with it */
+} GpInitplanCand;
+
+/*
+ * The context of the walk: the tree walkers hand it over by pointer, so
+ * the candidates collected in the depth of the tree are not lost
+ */
+typedef struct GpInitplanContext
+{
+	List	   *cands;			/* the candidates collected so far */
+} GpInitplanContext;
+
+/* Whether the subselect reads a column of a query above it */
+static bool
+gp_slice_initplan_outer_vars(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+		return ((Var *) node)->varlevelsup != 0;
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, gp_slice_initplan_outer_vars,
+								 context, 0);
+	return expression_tree_walker(node, gp_slice_initplan_outer_vars, context);
+}
+
+static bool
+gp_slice_initplan_query_walker(Node *node, void *context)
+{
+	GpInitplanContext *ctx = (GpInitplanContext *) context;
+	ListCell   *lc;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, SubLink))
+	{
+		SubLink   *sub = (SubLink *) node;
+		RangeTblRef *ref;
+		RangeTblEntry *rte;
+		TargetEntry *tle;
+		GpInitplanCand *cand;
+		GpPolicy	policy;
+		Query	   *sq;
+
+		if (sub->subLinkType != EXPR_SUBLINK || !IsA(sub->subselect, Query))
+			return false;
+		sq = (Query *) sub->subselect;
+
+		/*
+		 * The candidate is one aggregate over one hashed table: the
+		 * segments answer a partial column pair of it.  No grouping: the
+		 * partial columns aggregate all rows together
+		 */
+		if (sq->commandType != CMD_SELECT || sq->hasWindowFuncs ||
+			sq->hasSubLinks || sq->setOperations != NULL ||
+			sq->cteList != NIL || sq->groupingSets != NIL ||
+			sq->groupClause != NIL || sq->havingQual != NULL ||
+			sq->rowMarks != NIL || sq->distinctClause != NIL ||
+			sq->limitCount != NULL || sq->limitOffset != NULL)
+			return false;
+		if (!IsA(sq->jointree, FromExpr) ||
+			list_length(((FromExpr *) sq->jointree)->fromlist) != 1 ||
+			!IsA(linitial(((FromExpr *) sq->jointree)->fromlist),
+				 RangeTblRef))
+			return false;
+		ref = linitial_node(RangeTblRef,
+							((FromExpr *) sq->jointree)->fromlist);
+		rte = rt_fetch(ref->rtindex, sq->rtable);
+
+		/*
+		 * A replicated table is answered whole by one segment already, and
+		 * a sum of the partial columns of all segments would count its rows
+		 * more than once
+		 */
+		if (rte->rtekind != RTE_RELATION || rte->relid == 0 ||
+			!gp_policy_get(rte->relid, &policy) || policy.replicated)
+			return false;
+		if (list_length(sq->targetList) != 1)
+			return false;
+		tle = linitial_node(TargetEntry, sq->targetList);
+		if (!IsA(tle->expr, Aggref) ||
+			!gp_partial_splittable((Aggref *) tle->expr))
+			return false;
+		if (gp_slice_initplan_outer_vars((Node *) sq, NULL))
+			return false;
+		foreach(lc, ctx->cands)
+		{
+			cand = lfirst(lc);
+
+			if (cand->relid == rte->relid)
+				return false;
+		}
+		cand = palloc0(sizeof(GpInitplanCand));
+		cand->relid = rte->relid;
+		cand->aggref = (Aggref *) tle->expr;
+		cand->query = copyObject(sq);
+		ctx->cands = lappend(ctx->cands, cand);
+		return true;
+	}
+	if (IsA(node, Query))
+	{
+		Query	   *q = (Query *) node;
+		ListCell   *rt;
+
+		/*
+		 * The sublinks live in the derived subqueries of the range table:
+		 * query_tree_walker does not descend there by itself.  The return
+		 * of the descent says nothing: a sublink that does not become a
+		 * candidate only stays with the planner
+		 */
+		foreach(rt, q->rtable)
+		{
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, rt);
+
+			if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL)
+				gp_slice_initplan_query_walker((Node *) rte->subquery,
+											   context);
+		}
+		return query_tree_walker((Query *) node,
+								 gp_slice_initplan_query_walker, context, 0);
+	}
+	return expression_tree_walker(node, gp_slice_initplan_query_walker,
+								  context);
+}
+
+/* Collect the pushable aggregate sublinks of the query */
+List *
+gp_slice_initplan_query(Query *parse)
+{
+	GpInitplanContext ctx;
+
+	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
+		parse->hasWindowFuncs || parse->setOperations != NULL ||
+		parse->groupingSets != NIL || parse->rowMarks != NIL)
+	{
+		return NIL;
+	}
+
+	ctx.cands = NIL;
+	gp_slice_initplan_query_walker((Node *) parse, &ctx);
+	return ctx.cands;
+}
+
+/*
+ * An init plan paired with its candidate: the subplan aggregate of the
+ * init plan is rewritten over the slice of the candidate
+ */
+typedef struct GpInitplanPair
+{
+	Agg		   *agg;			/* the subplan aggregate of the init plan */
+	GpInitplanCand *cand;		/* the candidate over the same table */
+} GpInitplanPair;
+
+/* Every plan node with init plans: the tree, both branches, the subqueries */
+static void
+gp_slice_initplan_plans(Plan *plan, List **plans)
+{
+	if (plan == NULL)
+		return;
+	if (plan->initPlan != NIL)
+		*plans = lappend(*plans, plan);
+	gp_slice_initplan_plans(plan->lefttree, plans);
+	gp_slice_initplan_plans(plan->righttree, plans);
+	if (IsA(plan, SubqueryScan))
+		gp_slice_initplan_plans(((SubqueryScan *) plan)->subplan, plans);
+}
+
+/*
+ * The aggregate of the init plan pairs with the candidate: the same
+ * aggregate over the same column of the table.  The aggregate of the plan
+ * reads the gather alone: its argument is a column of the table the gather
+ * scans.  A grouping or a HAVING leaves the init plan with the planner
+ */
+static bool
+gp_slice_initplan_pairs(GpInitplanCand *cand, Agg *agg, Plan *below)
+{
+	TargetEntry *tle;
+	TargetEntry *parg;
+	TargetEntry *carg;
+	Aggref	   *aggref;
+	Var		   *arg;
+	Var		   *cexpr;
+
+	if (agg->numCols != 0 || agg->plan.qual != NIL ||
+		list_length(agg->plan.targetlist) != 1)
+		return false;
+	tle = linitial_node(TargetEntry, agg->plan.targetlist);
+	if (!IsA(tle->expr, Aggref))
+		return false;
+	aggref = (Aggref *) tle->expr;
+	if (aggref->aggfnoid != cand->aggref->aggfnoid ||
+		list_length(aggref->args) != 1 ||
+		list_length(cand->aggref->args) != 1)
+		return false;
+	parg = linitial_node(TargetEntry, aggref->args);
+	carg = linitial_node(TargetEntry, cand->aggref->args);
+	if (!IsA(parg->expr, Var) || !IsA(carg->expr, Var))
+		return false;
+	arg = (Var *) parg->expr;
+
+	/*
+	 * The aggregate reads the output of the gather, and its variable names
+	 * a column of that output: resolve it down to a column of the scan
+	 */
+	while (arg->varno == OUTER_VAR || arg->varno == INNER_VAR)
+	{
+		TargetEntry *itl;
+
+		if (arg->varattno <= 0 || arg->varattno > list_length(below->targetlist))
+			return false;
+		itl = list_nth(below->targetlist, arg->varattno - 1);
+		if (!IsA(itl->expr, Var))
+			return false;
+		arg = (Var *) itl->expr;
+	}
+
+	/*
+	 * The variable of the plan names the scanned table by the number in
+	 * the rtable of the whole statement, and the variable of the query
+	 * names it by the number in the rtable of the subselect, so only the
+	 * column and the type are compared
+	 */
+	cexpr = (Var *) carg->expr;
+	if (arg->varno != ((Scan *) below)->scanrelid ||
+		arg->varattno != cexpr->varattno ||
+		arg->vartype != cexpr->vartype)
+		return false;
+	return true;
+}
+
+/*
+ * Rewrite the init plans of the query: an init plan that aggregates over
+ * the gather of the table named by a collected candidate is answered by
+ * the segments with partial columns, and the final aggregate of the init
+ * plan reads the columns of their answer.  Every init plan must find its
+ * own candidate: one left without a candidate, or paired with an aggregate
+ * of another shape, leaves the whole query with the coordinator
+ */
+bool
+gp_slice_initplan_plan(List *candidates, PlannedStmt *stmt)
+{
+	List	   *plans = NIL;
+	List	   *pairs = NIL;
+	ListCell   *lc;
+	ListCell   *lc2;
+	ListCell   *lc3;
+
+	if (stmt->planTree == NULL)
+		return false;
+	gp_slice_initplan_plans(stmt->planTree, &plans);
+
+	/*
+	 * The first pass pairs every init plan with an unused candidate: two
+	 * init plans over one table would both take the one candidate, and the
+	 * second has no answer of its own
+	 */
+	foreach(lc, plans)
+	{
+		Plan	   *node = lfirst(lc);
+
+		foreach(lc2, node->initPlan)
+		{
+			SubPlan    *ip = castNode(SubPlan, lfirst(lc2));
+			Plan	   *sub;
+			Agg		   *agg;
+			Plan	   *below;
+			RangeTblEntry *rte;
+			GpInitplanCand *cand = NULL;
+			GpInitplanPair *pair;
+			Oid			relid;
+
+			if (!ip->isInitPlan || ip->plan_id <= 0 ||
+				ip->plan_id > list_length(stmt->subplans))
+				return false;
+			sub = list_nth(stmt->subplans, ip->plan_id - 1);
+			if (!IsA(sub, Agg))
+				return false;
+			agg = (Agg *) sub;
+			below = agg->plan.lefttree;
+			if (below == NULL || !gp_is_gather(below))
+				return false;
+			if (((Scan *) below)->scanrelid <= 0 ||
+				((Scan *) below)->scanrelid > list_length(stmt->rtable))
+				return false;
+			rte = rt_fetch(((Scan *) below)->scanrelid, stmt->rtable);
+			if (rte->rtekind != RTE_RELATION || rte->relid == 0)
+				return false;
+			relid = rte->relid;
+			foreach(lc3, candidates)
+			{
+				GpInitplanCand *c = lfirst(lc3);
+
+				if (!c->taken && c->relid == relid)
+				{
+					cand = c;
+					break;
+				}
+			}
+			if (cand == NULL || !gp_slice_initplan_pairs(cand, agg, below))
+				return false;
+			cand->taken = true;
+			pair = palloc(sizeof(GpInitplanPair));
+			pair->agg = agg;
+			pair->cand = cand;
+			pairs = lappend(pairs, pair);
+		}
+	}
+
+	/*
+	 * The second pass rewrites every paired init plan in place: the subplan
+	 * aggregate stays in the subplans list, its input becomes the slice of
+	 * the partial columns, and its target list reads them
+	 */
+	foreach(lc, pairs)
+	{
+		GpInitplanPair *pair = lfirst(lc);
+		Agg		   *agg = pair->agg;
+		GpInitplanCand *cand = pair->cand;
+		GpPartialState state;
+		Query	   *remote;
+		Expr	   *final;
+		TargetEntry *ptle;
+		TargetEntry *out;
+		ListCell   *lc4;
+
+		state.ok = true;
+		state.aggs = NIL;
+		state.avgs = NIL;
+		state.keys = NIL;
+		state.allow_avg = true;
+		state.npos = 0;
+		state.nextaggno = 0;
+		state.below = NULL;
+
+		remote = copyObject(cand->query);
+		gp_partial_walker((Node *) remote->targetList, &state);
+		if (!state.ok || (state.avgs == NIL && state.aggs == NIL))
+			return false;
+
+		/*
+		 * The final target of the aggregate is the aggregate of the copy:
+		 * the finish matches the target entries against the aggregates of
+		 * the copy, and the planner has rewritten the original in place
+		 * since the collection
+		 */
+		if (state.avgs != NIL)
+			final = (Expr *) ((GpPartialAvg *) lfirst(list_head(state.avgs)))->aggref;
+		else
+			final = (Expr *) ((GpPartialAgg *) lfirst(list_head(state.aggs)))->aggref;
+		remote->targetList = NIL;
+		foreach(lc4, state.aggs)
+		{
+			GpPartialAgg *partial = lfirst(lc4);
+
+			remote->targetList = lappend(remote->targetList,
+										 makeTargetEntry((Expr *) copyObject(partial->aggref),
+														 partial->pos, NULL,
+														 false));
+		}
+		foreach(lc4, state.avgs)
+		{
+			GpPartialAvg *pa = lfirst(lc4);
+
+			remote->targetList = lappend(remote->targetList,
+										 makeTargetEntry((Expr *) copyObject(pa->sum),
+														 pa->pos_sum, NULL, false));
+			remote->targetList = lappend(remote->targetList,
+										 makeTargetEntry((Expr *) copyObject(pa->count),
+														 pa->pos_count, NULL, false));
+		}
+
+		/*
+		 * The final target of the aggregate is the aggregate of the
+		 * candidate itself: the finish matches it against its copy and
+		 * answers with the columns of the segments
+		 */
+		ptle = linitial_node(TargetEntry, agg->plan.targetlist);
+		out = makeTargetEntry(final, ptle->resno,
+							  ptle->resname, ptle->resjunk);
+		if (!gp_slice_partial_finish(agg, &state, remote, false,
+									 list_make1(out), NIL))
+			return false;
+	}
+	return true;
 }
 
 /* A partitioned join feeds the same partial aggregate as a single table */
