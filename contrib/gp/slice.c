@@ -5126,7 +5126,7 @@ gp_partial_mutator(Node *node, GpPartialState *state)
 				if (final == NULL)
 				{
 					state->ok = false;
-					return copyObject(aggref);
+					return (Node *) copyObject(aggref);
 				}
 				return (Node *) final;
 			}
