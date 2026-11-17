@@ -62,8 +62,10 @@ like(plan_for('SELECT a % 2, min(c) FROM t GROUP BY a % 2 HAVING min(c) > 100'),
 	qr/GpSlice/, 'HAVING stays on the coordinator and does not stop the answer');
 unlike(plan_for('SELECT a % 2, count(*) FROM t GROUP BY a % 2'), qr/GpSlice/,
 	'count counts the partial columns, so it stays on the coordinator');
-unlike(plan_for('SELECT avg(c) FROM t'), qr/GpSlice/,
-	'the average divides, so it stays on the coordinator');
+like(plan_for('SELECT avg(c) FROM t'), qr/GpSlice/,
+	'the average answers a partial sum and a partial count on the segments');
+like(plan_for('SELECT a % 2, avg(c) FROM t GROUP BY a % 2'), qr/GpSlice/,
+	'a grouped average is answered partly on the segments');
 unlike(plan_for('SELECT a % 2, sum(c), count(*) FROM t GROUP BY a % 2'),
 	qr/GpSlice/, 'a mix with count stays on the coordinator');
 
@@ -79,6 +81,10 @@ my @queries = (
 	'SELECT sum(c) FROM t WHERE c > 100 AND c < 1000',
 	'SELECT a % 2, count(*), avg(c) FROM t GROUP BY a % 2 ORDER BY 1',
 	'SELECT b, sum(c) FROM t GROUP BY b ORDER BY b LIMIT 5',
+	'SELECT avg(c) FROM t',
+	'SELECT avg(a) FROM t',
+	'SELECT a % 2, avg(c) FROM t GROUP BY a % 2 ORDER BY 1',
+	'SELECT avg(c) FROM t WHERE c > 100 AND c < 100000',
 );
 foreach my $query (@queries)
 {

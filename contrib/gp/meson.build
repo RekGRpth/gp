@@ -101,6 +101,7 @@ tests += {
       't/042_correlated_locus.pl',
       't/043_multiway_broadcast.pl',
       't/044_tpch.pl',
+      't/045_initplan_locus.pl',
     ],
   },
 }
