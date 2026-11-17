@@ -583,10 +583,18 @@ gp_ic_serve(pgsocket fd, const char *token)
 	if (db == NULL || user == NULL ||
 		!gp_ic_read_i32(fd, &requester) ||
 		!gp_ic_read_snapshots(fd, &snapshots))
+	{
+		ereport(LOG,
+				errmsg("the interconnect client went away in the middle of its request"));
 		return false;
+	}
 	sql = gp_ic_read_string(fd);
 	if (sql == NULL)
+	{
+		ereport(LOG,
+				errmsg("the interconnect client went away in the middle of its request"));
 		return false;
+	}
 
 	PG_TRY();
 	{
@@ -1250,10 +1258,20 @@ gp_interconnect_request_main(Datum main_arg)
 	CHECK_FOR_INTERRUPTS();
 	fd = accept(listener, NULL, NULL);
 	closesocket(listener);
-	if (fd == PGINVALID_SOCKET || !pg_set_block(fd))
+	if (fd == PGINVALID_SOCKET)
 	{
-		if (fd != PGINVALID_SOCKET)
-			closesocket(fd);
+		ereport(LOG,
+				errmsg("interconnect worker of slot %d failed to accept a connection",
+					   slot_id));
+		gp_ic_slot_publish(slot, generation, GP_IC_SLOT_FREE);
+		proc_exit(1);
+	}
+	if (!pg_set_block(fd))
+	{
+		closesocket(fd);
+		ereport(LOG,
+				errmsg("interconnect worker of slot %d could not block its connection",
+					   slot_id));
 		gp_ic_slot_publish(slot, generation, GP_IC_SLOT_FREE);
 		proc_exit(1);
 	}
