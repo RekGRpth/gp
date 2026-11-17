@@ -89,7 +89,15 @@ foreach my $query (@queries)
 	$local =~ s/\bl\b/ll/g;
 	$local =~ s/\bs\b/ls/g;
 	$local =~ s/\bn\b/ln/g;
-	is(run($query), run($local), "the same answer as on the coordinator: $query");
+
+	# The distributed answer is checked several times: an answer of a
+	# multiway slice was once seen with a group counted twice and another
+	# one missing, and a single check misses such a race
+	for my $attempt (1 .. 5)
+	{
+		is(run($query), run($local),
+			"the same answer as on the coordinator (attempt $attempt): $query");
+	}
 }
 
 $_->stop foreach (@segments, $coordinator);
