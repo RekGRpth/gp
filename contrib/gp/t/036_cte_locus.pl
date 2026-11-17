@@ -128,6 +128,26 @@ like(plan_for('WITH s AS MATERIALIZED (SELECT b, count(DISTINCT a) AS c FROM t G
 like(plan_for('WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t FROM s FULL JOIN t ON s.b = t.b'),
 	qr/CTE Scan/, 'a full join of the CTE keeps the scan of the CTE');
 
+# The join of an aggregate CTE with the answer of its own aggregate above
+# (an InitPlan) runs on the segments: the filter of the InitPlan carries
+# onto the replacement, whose share of the CTE knows nothing of the whole
+like(plan_for("WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b)
+	SELECT s.b, s.t FROM s, t WHERE s.b = t.b AND s.t = (SELECT max(t) FROM s)"),
+	qr/GpSlice/, 'the join with the aggregate of the CTE runs on the segments');
+unlike(plan_for("WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b)
+	SELECT s.b, s.t FROM s, t WHERE s.b = t.b AND s.t = (SELECT max(t) FROM s)"),
+	qr/Join/, 'the join with the aggregate of the CTE needs no join above');
+like(plan_for("WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b)
+	SELECT s.b, s.t, u.n FROM s LEFT JOIN u ON s.b = u.b WHERE s.t = (SELECT max(t) FROM s)"),
+	qr/GpSlice/, 'the join with the aggregate keeps the table keyed by the grouping');
+like(plan_for("WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b)
+	SELECT s.b, s.t, t.a FROM s JOIN t ON s.b = t.b AND s.t = (SELECT max(t) FROM s)"),
+	qr/Join/, 'a sublink in the condition of the join keeps the join above');
+like(plan_for("WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b)
+	SELECT s.b, s.t, u.n FROM s LEFT JOIN u ON s.b = u.b
+	  AND s.t = (SELECT max(t) FROM s)"),
+	qr/Join/, 'a sublink in the condition of an outer join keeps the join above');
+
 my @queries = (
 	'WITH s AS MATERIALIZED (SELECT a, b, v FROM t) SELECT a, b, v FROM s ORDER BY a, b',
 	'WITH s AS MATERIALIZED (SELECT a FROM t) SELECT a FROM s WHERE a > 1 ORDER BY a',
@@ -151,6 +171,11 @@ my @queries = (
 	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, u.n FROM s LEFT JOIN u ON s.b = u.b ORDER BY 1',
 	'WITH s AS MATERIALIZED (SELECT b, count(DISTINCT a) AS c FROM t GROUP BY b) SELECT s.b, s.c FROM s, t WHERE s.b = t.b ORDER BY 1',
 	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t FROM s FULL JOIN t ON s.b = t.b ORDER BY 1',
+	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t FROM s, t WHERE s.b = t.b AND s.t = (SELECT max(t) FROM s) ORDER BY 1',
+	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, t.a FROM s, t WHERE s.b = t.b AND s.t > (SELECT min(t) FROM s) ORDER BY 1, 3',
+	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, u.n FROM s LEFT JOIN u ON s.b = u.b WHERE s.t = (SELECT max(t) FROM s) ORDER BY 1',
+	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, t.a FROM s JOIN t ON s.b = t.b AND s.t = (SELECT max(t) FROM s) ORDER BY 1',
+	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, u.n FROM s LEFT JOIN u ON s.b = u.b AND s.t = (SELECT max(t) FROM s) ORDER BY 1',
 );
 foreach my $query (@queries)
 {

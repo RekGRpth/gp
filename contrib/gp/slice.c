@@ -547,6 +547,11 @@ typedef struct GpJoinTable GpJoinTable;
 static bool gp_slice_join_rows(Query *parse, GpJoinTable *table, double *rows);
 static bool gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
 							   bool *replicated, bool *motion, GpLocus *locus);
+static bool gp_slice_cte_agg_replace(Query *ctequery, PlannedStmt *stmt,
+									 int cteplanid, Plan *parent, Agg *agg,
+									 bool replicated, bool motion);
+static bool gp_slice_base_column(Plan *plan, TargetEntry *tle, Index *rti,
+								 AttrNumber *attno);
 static bool gp_slice_join_partial(Query *original, PlannedStmt *stmt,
 								  Plan *plan, Plan *parent, bool sort_above,
 								  bool motion);
@@ -1175,15 +1180,10 @@ gp_slice_cte_agg_plan(Query *original, PlannedStmt *stmt)
 	Plan	   *plan;
 	Plan	   *below;
 	Agg		   *agg;
-	ListCell   *cell;
-	ListCell   *lc;
-	Index		varno;
 	int			cteplanid = 0;
-	bool		found = false;
 	bool		replicated = false;
 	bool		motion = false;
 	GpLocus		locus;
-	CustomScan *cscan;
 
 	/* Every CteScan of the statement must name the one subplan of the CTE */
 	if (!gp_slice_cte_agg_scan(stmt->planTree, &cteplanid))
@@ -1243,13 +1243,32 @@ gp_slice_cte_agg_plan(Query *original, PlannedStmt *stmt)
 	else
 		replicated = locus.kind == GP_LOCUS_ONE_SEGMENT;
 
+	/* The segments answer the whole CTE: one table, one aggregate */
+	return gp_slice_cte_agg_replace(original, stmt, cteplanid, parent, agg,
+									replicated, motion);
+}
+
+/*
+ * Replace the aggregate of the CTE, in the subplan with the given number,
+ * with a scan that runs it on the segments.  The query of the CTE carries
+ * the pulls of its motion already: the caller has rewritten its table
+ */
+static bool
+gp_slice_cte_agg_replace(Query *ctequery, PlannedStmt *stmt, int cteplanid,
+						 Plan *parent, Agg *agg, bool replicated, bool motion)
+{
+	ListCell   *lc;
+	Index		varno;
+	bool		found = false;
+	CustomScan *cscan;
+
 	/* The columns the segments return are the target list of the CTE */
 	if (list_length(agg->plan.targetlist) !=
-		list_length(original->targetList))
+		list_length(ctequery->targetList))
 		return false;
 
-	cscan = gp_slice_make(&agg->plan, original, replicated, motion,
-						  original->sortClause);
+	cscan = gp_slice_make(&agg->plan, ctequery, replicated, motion,
+						  ctequery->sortClause);
 
 	/*
 	 * gp_slice_make keeps the target list of the query as the descriptor of
@@ -1283,10 +1302,7 @@ gp_slice_cte_agg_plan(Query *original, PlannedStmt *stmt)
 	}
 
 	if (parent == NULL)
-	{
-		cell = list_nth_cell(stmt->subplans, cteplanid - 1);
-		lfirst(cell) = &cscan->scan.plan;
-	}
+		lfirst(list_nth_cell(stmt->subplans, cteplanid - 1)) = &cscan->scan.plan;
 	else
 		parent->lefttree = &cscan->scan.plan;
 
@@ -2721,6 +2737,318 @@ gp_slice_hashable(Oid typid)
 	return OidIsValid(proc);
 }
 
+/* Whether the tree contains a SubLink, descending into queries */
+static bool
+gp_slice_cte_join_has_sublink(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, SubLink))
+		return true;
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, gp_slice_cte_join_has_sublink,
+								 context, 0);
+	return expression_tree_walker(node, gp_slice_cte_join_has_sublink, context);
+}
+
+/* The number of the SubLinks of the tree */
+static bool
+gp_slice_cte_join_sublink_count(Node *node, void *context)
+{
+	int		   *count = context;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, SubLink))
+	{
+		(*count)++;
+		return true;
+	}
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, gp_slice_cte_join_sublink_count,
+								 context, 0);
+	return expression_tree_walker(node, gp_slice_cte_join_sublink_count, context);
+}
+
+/* The subselect of a sublink is an aggregate over the CTE of the query alone */
+static bool
+gp_slice_cte_join_sublink_ok(SubLink *sub, Query *parse)
+{
+	Query	   *q;
+	RangeTblEntry *rte;
+	CommonTableExpr *cte;
+
+	if (sub->subLinkType != EXPR_SUBLINK || sub->testexpr != NULL ||
+		!IsA(sub->subselect, Query))
+		return false;
+	q = (Query *) sub->subselect;
+	if (q->commandType != CMD_SELECT || !q->hasAggs ||
+		q->hasWindowFuncs || q->hasSubLinks || q->hasTargetSRFs ||
+		q->hasRowSecurity || q->setOperations != NULL ||
+		q->cteList != NIL || q->groupClause != NIL || q->groupingSets != NIL ||
+		q->distinctClause != NIL || q->rowMarks != NIL ||
+		q->sortClause != NIL || q->limitCount != NULL || q->limitOffset != NULL ||
+		q->havingQual != NULL)
+		return false;
+	if (!IsA(q->jointree, FromExpr) ||
+		list_length(((FromExpr *) q->jointree)->fromlist) != 1 ||
+		!IsA(linitial(((FromExpr *) q->jointree)->fromlist), RangeTblRef) ||
+		q->jointree->quals != NULL)
+		return false;
+	rte = rt_fetch(linitial_node(RangeTblRef,
+								 ((FromExpr *) q->jointree)->fromlist)->rtindex,
+				   q->rtable);
+	if (rte->rtekind != RTE_CTE || list_length(parse->cteList) != 1)
+		return false;
+	cte = linitial_node(CommonTableExpr, parse->cteList);
+	if (strcmp(rte->ctename, cte->ctename) != 0)
+		return false;
+	foreach_node(TargetEntry, tle, q->targetList)
+		if (!tle->resjunk && !IsA(tle->expr, Aggref))
+			return false;
+	return true;
+}
+
+/*
+ * Whether a branch of the quals keeps the join whole: either it has no
+ * sublink at all, or it equates a column of the CTE with a plain
+ * aggregate over the CTE alone
+ */
+static bool
+gp_slice_cte_join_branch_ok(Node *node, Query *parse, Index cterti)
+{
+	ListCell   *lc;
+
+	if (node == NULL)
+		return true;
+	if (IsA(node, BoolExpr) && ((BoolExpr *) node)->boolop == AND_EXPR)
+	{
+		foreach(lc, ((BoolExpr *) node)->args)
+			if (!gp_slice_cte_join_branch_ok(lfirst(lc), parse, cterti))
+				return false;
+		return true;
+	}
+	if (!IsA(node, OpExpr))
+		return !gp_slice_cte_join_has_sublink(node, NULL);
+	if (!gp_slice_cte_join_has_sublink(node, NULL))
+		return true;
+	if (list_length(((OpExpr *) node)->args) != 2)
+		return false;
+	{
+		SubLink   *sub = NULL;
+		int			nvars = 0;
+
+		foreach(lc, ((OpExpr *) node)->args)
+		{
+			Node	   *arg = lfirst(lc);
+
+			if (IsA(arg, SubLink))
+			{
+				if (sub != NULL)
+					return false;
+				sub = (SubLink *) arg;
+			}
+			else if (IsA(arg, Var) && ((Var *) arg)->varno == cterti &&
+					 ((Var *) arg)->varlevelsup == 0)
+			{
+				if (nvars > 0)
+					return false;
+				nvars++;
+			}
+			else
+				return false;
+		}
+		return sub != NULL && gp_slice_cte_join_sublink_ok(sub, parse);
+	}
+}
+
+/*
+ * Every sublink of the query sits in the quals of the join tree alone, as
+ * a comparison with an aggregate over the CTE: such a sublink becomes an
+ * InitPlan, whose answer the query above keeps in a Param
+ */
+static bool
+gp_slice_cte_join_sublinks_ok(Query *parse, Index cterti)
+{
+	FromExpr   *from;
+	ListCell   *lc;
+	int			nall = 0;
+	int			nquals = 0;
+
+	if (!parse->hasSubLinks)
+		return true;
+	if (!IsA(parse->jointree, FromExpr))
+		return false;
+	from = (FromExpr *) parse->jointree;
+	if (from->quals == NULL ||
+		!gp_slice_cte_join_branch_ok(from->quals, parse, cterti))
+		return false;
+	foreach(lc, from->fromlist)
+		if (IsA(lfirst(lc), JoinExpr) &&
+			((JoinExpr *) lfirst(lc))->quals != NULL &&
+			gp_slice_cte_join_has_sublink(((JoinExpr *) lfirst(lc))->quals,
+										  NULL))
+			return false;
+	(void) gp_slice_cte_join_sublink_count((Node *) parse, &nall);
+	(void) gp_slice_cte_join_sublink_count(from->quals, &nquals);
+	return nall == nquals;
+}
+
+/* Drop the sublink branches of the quals: the answer above replaces them */
+static Node *
+gp_slice_cte_join_strip(Node *quals)
+{
+	List	   *args = NIL;
+	ListCell   *lc;
+
+	if (quals == NULL)
+		return NULL;
+	if (IsA(quals, BoolExpr) && ((BoolExpr *) quals)->boolop == AND_EXPR)
+	{
+		bool		changed = false;
+
+		foreach(lc, ((BoolExpr *) quals)->args)
+		{
+			Node	   *arg = lfirst(lc);
+
+			if (gp_slice_cte_join_has_sublink(arg, NULL))
+				changed = true;
+			else
+				args = lappend(args, arg);
+		}
+		if (!changed)
+			return quals;
+		if (args == NIL)
+			return NULL;
+		if (list_length(args) == 1)
+			return linitial(args);
+		return (Node *) makeBoolExpr(AND_EXPR, args, -1);
+	}
+	if (gp_slice_cte_join_has_sublink(quals, NULL))
+		return NULL;
+	return quals;
+}
+
+/* The number of the Params of an expression tree */
+static bool
+gp_slice_cte_join_param_count_exprs(Node *node, void *context)
+{
+	int		   *count = context;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param))
+		(*count)++;
+	return expression_tree_walker(node, gp_slice_cte_join_param_count_exprs,
+								  context);
+}
+
+/* The number of the Params of the expressions of a plan tree */
+static void
+gp_slice_cte_join_param_count(Plan *plan, int *count)
+{
+	if (plan == NULL)
+		return;
+	(void) gp_slice_cte_join_param_count_exprs((Node *) plan->targetlist, count);
+	(void) gp_slice_cte_join_param_count_exprs((Node *) plan->qual, count);
+	gp_slice_cte_join_param_count(plan->lefttree, count);
+	gp_slice_cte_join_param_count(plan->righttree, count);
+	if (IsA(plan, SubqueryScan))
+		gp_slice_cte_join_param_count(((SubqueryScan *) plan)->subplan, count);
+	if (IsA(plan, Append))
+	{
+		foreach_ptr(Plan, child, ((Append *) plan)->appendplans)
+			gp_slice_cte_join_param_count(child, count);
+	}
+	if (IsA(plan, MergeAppend))
+	{
+		foreach_ptr(Plan, child, ((MergeAppend *) plan)->mergeplans)
+			gp_slice_cte_join_param_count(child, count);
+	}
+}
+
+/* Whether an expression tree keeps a SubPlan: a correlated sublink */
+static bool
+gp_slice_cte_join_has_subplan_exprs(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, SubPlan))
+		return true;
+	return expression_tree_walker(node, gp_slice_cte_join_has_subplan_exprs,
+								  context);
+}
+
+/* Whether the plan tree keeps a correlated subplan */
+static bool
+gp_slice_cte_join_has_subplan(Plan *plan)
+{
+	if (plan == NULL)
+		return false;
+	if (gp_slice_cte_join_has_subplan_exprs((Node *) plan->targetlist, NULL) ||
+		gp_slice_cte_join_has_subplan_exprs((Node *) plan->qual, NULL))
+		return true;
+	if (gp_slice_cte_join_has_subplan(plan->lefttree) ||
+		gp_slice_cte_join_has_subplan(plan->righttree))
+		return true;
+	if (IsA(plan, SubqueryScan) &&
+		gp_slice_cte_join_has_subplan(((SubqueryScan *) plan)->subplan))
+		return true;
+	if (IsA(plan, Append))
+	{
+		foreach_ptr(Plan, child, ((Append *) plan)->appendplans)
+			if (gp_slice_cte_join_has_subplan(child))
+				return true;
+	}
+	if (IsA(plan, MergeAppend))
+	{
+		foreach_ptr(Plan, child, ((MergeAppend *) plan)->mergeplans)
+			if (gp_slice_cte_join_has_subplan(child))
+				return true;
+	}
+	return false;
+}
+
+/* The variables of the scan of the CTE name the columns of the slice */
+typedef struct GpCteJoinQual
+{
+	Plan	   *join;			/* the plan of the join, for the search */
+	Index		cterti;			/* the number of the CTE in the statement */
+	bool		ok;
+} GpCteJoinQual;
+
+static Node *
+gp_slice_cte_join_qual_var(Node *node, void *context)
+{
+	GpCteJoinQual *ctx = context;
+
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+		ListCell   *lc;
+
+		if (var->varno != ctx->cterti || var->varlevelsup != 0)
+			return node;
+		foreach(lc, ctx->join->targetlist)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+			Index		rti;
+			AttrNumber	attno;
+
+			if (gp_slice_base_column(ctx->join, tle, &rti, &attno) &&
+				rti == var->varno && attno == var->varattno)
+				return (Node *) makeVar(INDEX_VAR, tle->resno,
+										var->vartype, var->vartypmod,
+										var->varcollid, 0);
+		}
+		ctx->ok = false;
+		return node;
+	}
+	return expression_tree_mutator(node, gp_slice_cte_join_qual_var, context);
+}
+
 /* The two leaves of the FROM of a join of one CTE and one table */
 typedef struct GpCteJoinSides
 {
@@ -3001,7 +3329,7 @@ gp_slice_cte_join_query(Query *parse)
 
 	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
 		list_length(parse->cteList) != 1 ||
-		parse->hasSubLinks || parse->hasWindowFuncs || parse->hasAggs ||
+		parse->hasWindowFuncs || parse->hasAggs ||
 		parse->hasTargetSRFs || parse->hasRowSecurity ||
 		parse->setOperations != NULL || parse->groupingSets != NIL ||
 		parse->distinctClause != NIL || parse->rowMarks != NIL)
@@ -3064,6 +3392,8 @@ gp_slice_cte_join_query(Query *parse)
 									ctequery, &pairs);
 	if (!gp_slice_cte_join_keys(ctequery, pairs, NULL, NULL))
 		return NULL;
+	if (!gp_slice_cte_join_sublinks_ok(parse, sides.cterti))
+		return NULL;
 	if (gp_dispatch_in_xact())
 		return NULL;
 	return gp_slice_query_copy(parse);
@@ -3094,7 +3424,14 @@ gp_slice_cte_join_plan(Query *original, PlannedStmt *stmt)
 	CommonTableExpr *cte;
 	GpCteJoinSides sides;
 	Index		planrti;
+	Index		cteglobal = 0;
 	int			nentries;
+	int			cteplanid;
+	int			nparams = 0;
+	int			nqual = 0;
+	List	   *ctequal;
+	List	   *ctequalm = NIL;
+	GpCteJoinQual ctx;
 	GpJoinTable	ctetable = {0};
 	GpJoinTable	jointable = {0};
 	GpPolicy	ctepolicy;
@@ -3116,15 +3453,15 @@ gp_slice_cte_join_plan(Query *original, PlannedStmt *stmt)
 	}
 	if (plan == NULL || (!IsA(plan, NestLoop) && !IsA(plan, HashJoin) &&
 						 !IsA(plan, MergeJoin)))
-		return false;
+	return false;
 	join = (Join *) plan;
 	if (join->jointype != JOIN_INNER && join->jointype != JOIN_LEFT &&
 		join->jointype != JOIN_RIGHT)
-		return false;
+	return false;
 
 	/* Non-aggregate plans without a final Sort keep their ordering here */
 	if (original->sortClause != NIL && !sort_above)
-		return false;
+	return false;
 
 	/*
 	 * One side is the scan of the CTE, the other is the gather of the
@@ -3151,7 +3488,7 @@ gp_slice_cte_join_plan(Query *original, PlannedStmt *stmt)
 			cte_kept = join->jointype == JOIN_RIGHT;
 		}
 		else
-			return false;
+		return false;
 	}
 
 	/* The gather scans the table of the query, not another relation */
@@ -3168,45 +3505,59 @@ gp_slice_cte_join_plan(Query *original, PlannedStmt *stmt)
 		}
 	}
 	if (planrti == 0)
-		return false;
+	return false;
 
 	/* The subplan of the CTE is the aggregate over the gather, as before */
-	if (((CteScan *) ctescan)->ctePlanId <= 0 ||
-		((CteScan *) ctescan)->ctePlanId > list_length(stmt->subplans))
-		return false;
-	subplan = list_nth(stmt->subplans, ((CteScan *) ctescan)->ctePlanId - 1);
+	cteplanid = ((CteScan *) ctescan)->ctePlanId;
+	if (cteplanid <= 0 || cteplanid > list_length(stmt->subplans))
+	return false;
+	subplan = list_nth(stmt->subplans, cteplanid - 1);
 	plan = subplan;
 	while (plan != NULL && !IsA(plan, Agg))
 	{
 		if (plan->righttree != NULL)
-			return false;
+		return false;
 		plan = plan->lefttree;
 	}
 	if (plan == NULL)
-		return false;
+	return false;
 	agg = (Agg *) plan;
 	below = agg->plan.lefttree;
 	while (below != NULL && (IsA(below, Sort) || IsA(below, IncrementalSort)))
 		below = below->lefttree;
 	if (below == NULL || !gp_is_gather(below))
+	return false;
+
+	/*
+	 * The quals of the scan of the CTE hold the Params of the init plans,
+	 * and their columns are the columns of the answer of the CTE
+	 */
+	ctequal = ((CteScan *) ctescan)->scan.plan.qual;
+	if (ctequal != NIL)
+	{
+		TargetEntry *tle = linitial(((CteScan *) ctescan)->scan.plan.targetlist);
+
+		if (tle == NULL || !IsA(tle->expr, Var))
 		return false;
+		cteglobal = ((Var *) tle->expr)->varno;
+	}
 
 	/* The analysis of the query, the same the eligibility went through */
 	cte = linitial_node(CommonTableExpr, original->cteList);
 	ctequery = castNode(Query, cte->ctequery);
 	if (!gp_slice_cte_join_leaves(original, &sides))
-		return false;
+	return false;
 	if (sides.tableti != planrti)
-		return false;
+	return false;
 	rte = rt_fetch(sides.tableti, original->rtable);
 	if (!gp_policy_get(rte->relid, &policy))
-		return false;
+	return false;
 	ctetable.rti = linitial_node(RangeTblRef,
 								 ((FromExpr *) ctequery->jointree)->fromlist)->rtindex;
 	rte = rt_fetch(ctetable.rti, ctequery->rtable);
 	if (rte->rtekind != RTE_RELATION ||
 		!gp_policy_get(rte->relid, &ctepolicy))
-		return false;
+	return false;
 	ctetable.query = ctequery;
 	ctetable.policy = ctepolicy;
 	jointable.rti = sides.tableti;
@@ -3220,7 +3571,7 @@ gp_slice_cte_join_plan(Query *original, PlannedStmt *stmt)
 			gp_slice_cte_join_pairs(((JoinExpr *) lfirst(lc))->quals, &sides,
 									ctequery, &pairs);
 	if (!gp_slice_cte_join_keys(ctequery, pairs, &tablekeys, &groupkeys))
-		return false;
+	return false;
 	nkeys = list_length(ctequery->groupClause);
 
 	/*
@@ -3233,12 +3584,64 @@ gp_slice_cte_join_plan(Query *original, PlannedStmt *stmt)
 		Var		   *var;
 
 		if (!IsA(tle->expr, Var) || ((Var *) tle->expr)->varattno <= 0)
-			return false;
+		return false;
 		var = (Var *) tle->expr;
 
 		/* The plan groups by the same column the analysis found */
 		if (var->varattno != groupkeys[i])
-			return false;
+		return false;
+	}
+
+	/*
+	 * Every sublink of the query became an InitPlan above the scan of the
+	 * CTE.  The Params of the init plans sit in the quals of that scan
+	 * alone, and their filter moves onto the replacement: the share of the
+	 * CTE that the segments answer knows nothing of the whole
+	 */
+	if (original->hasSubLinks)
+	{
+		if (gp_slice_cte_join_has_subplan(stmt->planTree))
+		return false;
+		foreach_node(SubPlan, ip, stmt->planTree->initPlan)
+		{
+			Plan	   *sub;
+
+			/*
+			 * The list keeps a record of the CTE itself: its subplan is
+			 * materialized at the start, and the answer of the segments
+			 * replaces it below
+			 */
+			if (ip->plan_id == cteplanid)
+				continue;
+			if (ip->plan_id <= 0 || ip->plan_id > list_length(stmt->subplans))
+				return false;
+			sub = list_nth(stmt->subplans, ip->plan_id - 1);
+			if (!IsA(sub, Agg))
+				return false;
+			if (((Agg *) sub)->plan.lefttree == NULL ||
+				!IsA(((Agg *) sub)->plan.lefttree, CteScan) ||
+				((CteScan *) ((Agg *) sub)->plan.lefttree)->ctePlanId != cteplanid)
+				return false;
+		}
+		gp_slice_cte_join_param_count(stmt->planTree, &nparams);
+		gp_slice_cte_join_param_count_exprs((Node *) ctequal, &nqual);
+		if (nqual == 0 || nparams != nqual)
+		return false;
+
+		/* The columns the filter names must come out of the join */
+		ctx.join = &join->plan;
+		ctx.cterti = cteglobal;
+		ctx.ok = true;
+		ctequalm = (List *) gp_slice_cte_join_qual_var((Node *) copyObject(ctequal),
+													   &ctx);
+		if (!ctx.ok)
+		return false;
+
+		/* The segments answer the join without the sublinks of the query */
+		original->jointree->quals = gp_slice_cte_join_strip(
+			original->jointree->quals);
+		if (gp_slice_cte_join_has_sublink((Node *) original, NULL))
+		return false;
 	}
 
 	/*
@@ -3252,7 +3655,7 @@ gp_slice_cte_join_plan(Query *original, PlannedStmt *stmt)
 		if (!gp_slice_redistribute_rte_keys(original, &ctetable, &ctetable,
 											false, nkeys, groupkeys,
 											NULL, false))
-			return false;
+		return false;
 		if (join->jointype == JOIN_INNER)
 		{
 			/*
@@ -3262,7 +3665,7 @@ gp_slice_cte_join_plan(Query *original, PlannedStmt *stmt)
 			if (!gp_slice_redistribute_rte_keys(original, &ctetable, &jointable,
 												false, nkeys, tablekeys,
 												NULL, false))
-				return false;
+			return false;
 		}
 		else
 		{
@@ -3273,7 +3676,7 @@ gp_slice_cte_join_plan(Query *original, PlannedStmt *stmt)
 			if (!gp_slice_redistribute_rte_keys(original, &ctetable, &jointable,
 												true, policy.nkeys, policy.keys,
 												NULL, false))
-				return false;
+			return false;
 		}
 	}
 	else
@@ -3295,24 +3698,24 @@ gp_slice_cte_join_plan(Query *original, PlannedStmt *stmt)
 			if (!gp_slice_redistribute_rte_keys(original, &jointable, &ctetable,
 												false, nkeys, groupkeys,
 												NULL, false))
-				return false;
+			return false;
 		}
 		else
 		{
 			if (!gp_slice_redistribute_rte_keys(original, &ctetable, &ctetable,
 												false, nkeys, groupkeys,
 												NULL, false))
-				return false;
+			return false;
 			if (!gp_slice_redistribute_rte_keys(original, &ctetable, &jointable,
 												false, nkeys, tablekeys,
 												NULL, false))
-				return false;
+			return false;
 		}
 	}
 
 	/* The columns the segments return are the target list of the join */
 	if (list_length(join->plan.targetlist) != list_length(original->targetList))
-		return false;
+	return false;
 
 	{
 		CustomScan *cscan = gp_slice_make(&join->plan, original, false, true,
@@ -3325,11 +3728,35 @@ gp_slice_cte_join_plan(Query *original, PlannedStmt *stmt)
 		if (gp_slice_cte_join_rls(ctequery, original))
 			lfourth(cscan->custom_private) = makeBoolean(false);
 
+		/*
+		 * The filter of the init plans carries onto the replacement: the
+		 * answer of the join holds every pair, and the query above keeps
+		 * only the pairs of the whole answer of the CTE
+		 */
+		if (ctequalm != NIL)
+			cscan->scan.plan.qual = ctequalm;
+
+		/*
+		 * The init plans hang on the node of the join: carry them onto
+		 * the replacement, whose filter reads their answers
+		 */
+		cscan->scan.plan.initPlan = join->plan.initPlan;
+		join->plan.initPlan = NIL;
+
 		if (parent == NULL)
 			stmt->planTree = &cscan->scan.plan;
 		else
 			parent->lefttree = &cscan->scan.plan;
 	}
+
+	/*
+	 * The scan of the CTE reads the subplan: answer it from the segments
+	 * as well, whose query of the CTE carries the pull already
+	 */
+	if (original->hasSubLinks &&
+		!gp_slice_cte_agg_replace(ctequery, stmt, cteplanid, NULL, agg,
+								  false, true))
+	return false;
 
 	stmt->parallelModeNeeded = false;
 	return true;
