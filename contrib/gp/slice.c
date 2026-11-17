@@ -37,7 +37,12 @@
 #include "access/xact.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_class.h"
+#include "parser/parse_func.h"
+#include "parser/parse_oper.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_proc.h"
 #include "executor/executor.h"
@@ -4816,10 +4821,22 @@ typedef struct GpPartialKey
 } GpPartialKey;
 
 /* What is collected from a query on the way to its partial form */
+/* An average, answered by a partial sum and a partial count */
+typedef struct GpPartialAvg
+{
+	Aggref	   *aggref;			/* the average of the query */
+	Expr	   *sum;			/* partial sum over its argument */
+	Expr	   *count;			/* partial count over its argument */
+	int			pos_sum;
+	int			pos_count;
+} GpPartialAvg;
+
 typedef struct GpPartialState
 {
 	List	   *aggs;			/* GpPartialAgg */
+	List	   *avgs;			/* GpPartialAvg */
 	List	   *keys;			/* GpPartialKey */
+	bool		allow_avg;		/* the segments may answer an average */
 	Index		npos;			/* columns of the answer so far */
 	int			nextaggno;		/* aggno for the next combining aggregate */
 	Plan	   *below;			/* old input, for resolving planned join Vars */
@@ -4868,12 +4885,107 @@ gp_partial_splittable(Aggref *aggref)
 	procform = (Form_pg_proc) GETSTRUCT(proc_tup);
 	name = NameStr(procform->proname);
 	ok = (strcmp(name, "min") == 0 || strcmp(name, "max") == 0 ||
-		  strcmp(name, "sum") == 0);
+		  strcmp(name, "sum") == 0 || strcmp(name, "avg") == 0);
 	ReleaseSysCache(proc_tup);
-	return ok;
+	if (!ok)
+		return false;
+
+	/*
+	 * An average moves through a partial sum and a partial count, so its
+	 * result type may differ from the type of its argument
+	 */
+	return strcmp(name, "avg") == 0 ||
+		linitial_oid(aggref->aggargtypes) == aggref->aggtype;
 }
 
 /* Collect the aggregates of an expression tree, in the order they appear */
+/* The OID of a pg_catalog function of one argument, or InvalidOid */
+static Oid
+gp_partial_func(const char *name, Oid argtype)
+{
+	Oid			funcoid;
+
+	funcoid = LookupFuncName(list_make2(makeString((char *) "pg_catalog"),
+										makeString((char *) name)),
+							 1, &argtype, true);
+	return funcoid;
+}
+
+/* The partial column of an average: its sum, or the count of its argument */
+static Expr *
+gp_partial_avg_column(Aggref *avgref, Oid funcoid, Oid resulttype)
+{
+	Aggref	   *agg = copyObject(avgref);
+
+	agg->aggfnoid = funcoid;
+	agg->aggtype = resulttype;
+	return (Expr *) agg;
+}
+
+/*
+ * The final answer of an average: the sum of the partial sums divided by
+ * the sum of the partial counts, NULL when no row had a value
+ */
+static Expr *
+gp_partial_avg_final(GpPartialAvg *avg)
+{
+	Aggref	   *sum;
+	Aggref	   *count;
+	FuncExpr   *nullif;
+	FuncExpr   *divide;
+	Var		   *var;
+	Oid			sumoid = gp_partial_func("sum",
+							  exprType((Node *) avg->sum));
+	Oid			cntsumoid = gp_partial_func("sum",
+							  exprType((Node *) avg->count));
+	Oid			opno;
+
+	if (!OidIsValid(sumoid) || !OidIsValid(cntsumoid))
+		return NULL;
+
+	var = makeVar(OUTER_VAR, avg->pos_sum, exprType((Node *) avg->sum),
+				  -1, 0, 0);
+	sum = makeNode(Aggref);
+	sum->aggfnoid = sumoid;
+	sum->aggtype = get_func_rettype(sumoid);
+	sum->args = list_make1(makeTargetEntry((Expr *) var, 1, NULL, false));
+	sum->aggargtypes = list_make1_oid(exprType((Node *) var));
+	sum->aggsplit = AGGSPLIT_SIMPLE;
+
+	var = makeVar(OUTER_VAR, avg->pos_count, exprType((Node *) avg->count),
+				  -1, 0, 0);
+	count = makeNode(Aggref);
+	count->aggfnoid = cntsumoid;
+	count->aggtype = get_func_rettype(cntsumoid);
+	count->args = list_make1(makeTargetEntry((Expr *) var, 1, NULL, false));
+	count->aggargtypes = list_make1_oid(exprType((Node *) var));
+	count->aggsplit = AGGSPLIT_SIMPLE;
+
+	{
+		Const	   *zero = makeConst(INT8OID, -1, InvalidOid, 8,
+									 Int64GetDatum(0), false, true);
+
+		opno = LookupOperName(NULL, list_make1(makeString((char *) "/")),
+							  sum->aggtype, INT8OID, true, -1);
+		if (!OidIsValid(opno))
+			return NULL;
+		nullif = makeNode(FuncExpr);
+		nullif->funcid = LookupFuncName(list_make2(makeString((char *) "pg_catalog"),
+												   makeString((char *) "nullif")),
+										2, (Oid[]) {sum->aggtype, INT8OID},
+										true);
+		if (!OidIsValid(nullif->funcid))
+			return NULL;
+		nullif->funcresulttype = sum->aggtype;
+		nullif->args = list_make2(count, zero);
+	}
+	divide = makeNode(FuncExpr);
+	divide->funcid = get_opcode(opno);
+	divide->funcresulttype = sum->aggtype;
+	divide->args = list_make2(sum, nullif);
+	return (Expr *) divide;
+}
+
 static bool
 gp_partial_walker(Node *node, GpPartialState *state)
 {
@@ -4896,6 +5008,53 @@ gp_partial_walker(Node *node, GpPartialState *state)
 			partial = lfirst(lc);
 			if (equal(partial->aggref, aggref))
 				return false;
+		}
+		foreach(lc, state->avgs)
+		{
+			GpPartialAvg *pa = lfirst(lc);
+
+			if (equal(pa->aggref, aggref))
+				return false;
+		}
+		{
+			HeapTuple	tup = SearchSysCache1(PROCOID,
+											  ObjectIdGetDatum(aggref->aggfnoid));
+			bool		isavg;
+
+			if (!HeapTupleIsValid(tup))
+			{
+				state->ok = false;
+				return true;
+			}
+			isavg = strcmp(NameStr(((Form_pg_proc) GETSTRUCT(tup))->proname),
+						   "avg") == 0;
+			ReleaseSysCache(tup);
+			if (isavg && !state->allow_avg)
+			{
+				state->ok = false;
+				return true;
+			}
+			if (isavg)
+			{
+				GpPartialAvg *pa = palloc0(sizeof(GpPartialAvg));
+				Oid			sumoid = gp_partial_func("sum",
+									 linitial_oid(aggref->aggargtypes));
+				Oid			cntoid = gp_partial_func("count", ANYOID);
+				if (!OidIsValid(sumoid) || !OidIsValid(cntoid))
+				{
+					state->ok = false;
+					return true;
+				}
+				pa->aggref = aggref;
+				pa->sum = gp_partial_avg_column(aggref, sumoid,
+												get_func_rettype(sumoid));
+				pa->count = gp_partial_avg_column(aggref, cntoid,
+												  get_func_rettype(cntoid));
+				pa->pos_sum = ++state->npos;
+				pa->pos_count = ++state->npos;
+				state->avgs = lappend(state->avgs, pa);
+				return false;
+			}
 		}
 		partial = palloc0(sizeof(GpPartialAgg));
 		partial->aggref = aggref;
@@ -4956,6 +5115,22 @@ gp_partial_mutator(Node *node, GpPartialState *state)
 		Aggref	   *combine;
 		Var		   *var;
 
+		foreach(lc, state->avgs)
+		{
+			GpPartialAvg *pa = lfirst(lc);
+
+			if (equal(pa->aggref, aggref))
+			{
+				Expr	   *final = gp_partial_avg_final(pa);
+
+				if (final == NULL)
+				{
+					state->ok = false;
+					return copyObject(aggref);
+				}
+				return (Node *) final;
+			}
+		}
 		foreach(lc, state->aggs)
 		{
 			GpPartialAgg *partial = lfirst(lc);
@@ -5121,7 +5296,7 @@ void
 gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 {
 	Plan	   *plan = stmt->planTree;
-	RangeTblEntry *rte;
+	RangeTblEntry *rte_base;
 	GpPolicy	policy;
 	GpPartialState state;
 	RangeTblRef *ref;
@@ -5144,14 +5319,16 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 		!IsA(linitial(parse->jointree->fromlist), RangeTblRef))
 		return;
 	ref = linitial_node(RangeTblRef, parse->jointree->fromlist);
-	rte = rt_fetch(ref->rtindex, parse->rtable);
-	if (rte->rtekind != RTE_RELATION ||
-		!gp_policy_get(rte->relid, &policy) || policy.replicated)
+	rte_base = rt_fetch(ref->rtindex, parse->rtable);
+	if (rte_base->rtekind != RTE_RELATION ||
+		!gp_policy_get(rte_base->relid, &policy) || policy.replicated)
 		return;
 
 	/* The grouping columns lead the answer of the segments */
 	state.aggs = NIL;
+	state.avgs = NIL;
 	state.keys = NIL;
+	state.allow_avg = true;
 	state.npos = 0;
 	state.nextaggno = 0;
 	state.below = NULL;
@@ -5173,7 +5350,7 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 	gp_partial_walker((Node *) parse->targetList, &state);
 	if (state.ok)
 		gp_partial_walker((Node *) parse->havingQual, &state);
-	if (!state.ok || state.aggs == NIL)
+	if (!state.ok || (state.aggs == NIL && state.avgs == NIL))
 	return;
 
 	/* Find the aggregate of the plan, below the sort and the limit of it */
@@ -5217,10 +5394,69 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 
 		remote->targetList = lappend(remote->targetList, tle);
 	}
+	foreach(lc, state.avgs)
+	{
+		GpPartialAvg *pa = lfirst(lc);
+
+		remote->targetList = lappend(remote->targetList,
+									 makeTargetEntry((Expr *) copyObject(pa->sum),
+													 pa->pos_sum, NULL, false));
+		remote->targetList = lappend(remote->targetList,
+									 makeTargetEntry((Expr *) copyObject(pa->count),
+													 pa->pos_count, NULL, false));
+	}
 	remote->havingQual = NULL;
 	remote->sortClause = NIL;
 	remote->limitCount = NULL;
 	remote->limitOffset = NULL;
+
+	{
+		ListCell   *l1;
+		int			i = 0;
+		bool		unresolved = false;
+
+		foreach(l1, remote->rtable)
+		{
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, l1);
+			ListCell   *l2;
+			int			j = 0;
+
+			i++;
+			if (rte->rtekind != RTE_SUBQUERY || rte->subquery != NULL)
+				continue;
+			foreach(l2, remote->rtable)
+			{
+				RangeTblEntry *rte2 = lfirst_node(RangeTblEntry, l2);
+				bool		same = true;
+				ListCell   *n1;
+				ListCell   *n2;
+				j++;
+				if (j == i || rte2->rtekind != RTE_RELATION ||
+					list_length(rte2->eref->colnames) !=
+					list_length(rte->eref->colnames))
+					continue;
+				forboth(n1, rte2->eref->colnames, n2, rte->eref->colnames)
+				{
+					if (strcmp(strVal(lfirst(n1)), strVal(lfirst(n2))) != 0)
+					{
+						same = false;
+						break;
+					}
+				}
+				if (!same)
+					continue;
+				rte->rtekind = RTE_RELATION;
+				rte->relid = rte2->relid;
+				rte->relkind = rte2->relkind;
+				rte->rellockmode = rte2->rellockmode;
+				break;
+			}
+			if (rte->rtekind == RTE_SUBQUERY)
+				unresolved = true;
+		}
+		if (unresolved)
+			return;
+	}
 
 	(void) gp_slice_partial_finish(agg, &state, remote, false,
 								  parse->targetList, (List *) parse->havingQual);
@@ -5244,7 +5480,9 @@ gp_slice_join_partial(Query *original, PlannedStmt *stmt, Plan *plan,
 		return false;
 
 	state.aggs = NIL;
+	state.avgs = NIL;
 	state.keys = NIL;
+	state.allow_avg = false;
 	state.npos = 0;
 	state.nextaggno = 0;
 	state.below = NULL;
@@ -5272,7 +5510,7 @@ gp_slice_join_partial(Query *original, PlannedStmt *stmt, Plan *plan,
 	gp_partial_walker((Node *) original->targetList, &state);
 	if (state.ok)
 		gp_partial_walker((Node *) original->havingQual, &state);
-	if (!state.ok || state.aggs == NIL)
+	if (!state.ok || (state.aggs == NIL && state.avgs == NIL))
 		return false;
 
 	remote = copyObject(original);
@@ -5302,6 +5540,7 @@ gp_slice_join_partial(Query *original, PlannedStmt *stmt, Plan *plan,
 	/* Remote SQL needs original Vars; the final Agg needs planned Aggrefs */
 	finalstate = state;
 	finalstate.aggs = NIL;
+	state.avgs = NIL;
 	finalstate.npos = list_length(state.keys);
 	finalstate.nextaggno = 0;
 	finalstate.ok = true;
