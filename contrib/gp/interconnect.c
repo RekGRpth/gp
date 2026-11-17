@@ -662,6 +662,14 @@ gp_ic_serve(pgsocket fd, const char *token)
 			PopActiveSnapshot();
 			SPI_finish();
 			CommitTransactionCommand();
+
+			/*
+			 * Give the client its end of the answer before the socket of
+			 * this worker is closed and the worker is gone: on Windows a
+			 * close that races the queued answer resets the connection of
+			 * the reader instead of ending it
+			 */
+			gp_ic_shutdown_write(fd);
 		}
 	}
 	PG_CATCH();
@@ -678,6 +686,7 @@ gp_ic_serve(pgsocket fd, const char *token)
 
 		AbortCurrentTransaction();
 		(void) gp_ic_write_error(fd, edata->message);
+		gp_ic_shutdown_write(fd);
 		FreeErrorData(edata);
 		EmitErrorReport();
 		FlushErrorState();
@@ -1203,9 +1212,16 @@ gp_interconnect_request_main(Datum main_arg)
 	BackgroundWorkerUnblockSignals();
 	if (!gp_ic_slot_start(slot, generation))
 		proc_exit(0);
+	/*
+	 * The port of the slot, unique among the slots of the segment: the
+	 * generation alone is counted by every slot from the same zero, so
+	 * slots of equal generations would otherwise name the same port and
+	 * steal the file and the connections of each other
+	 */
 	if (is_absolute_path(gp_host_address()))
 		snprintf(service, sizeof(service), "%u",
-				 (unsigned) (PostPortNumber + 20000 + (generation % 20000)));
+				 (unsigned) (PostPortNumber + 20000 +
+							 slot_id * 300 + generation % 300));
 	else
 		strlcpy(service, "0", sizeof(service));
 	listener = gp_ic_listen(service);
@@ -1234,7 +1250,8 @@ gp_interconnect_request_main(Datum main_arg)
 	}
 	else
 		gp_ic_slot_set_port(slot, generation,
-							PostPortNumber + 20000 + (generation % 20000));
+							PostPortNumber + 20000 +
+							slot_id * 300 + generation % 300);
 	/*
 	 * Everything that can fail must fail before the slot reads READY:
 	 * the broker hands the port out at that point, and a worker that
