@@ -3430,7 +3430,7 @@ gp_slice_cte_join_plan(Query *original, PlannedStmt *stmt)
 	int			nparams = 0;
 	int			nqual = 0;
 	List	   *ctequal;
-	List	   *ctequalm;
+	List	   *ctequalm = NIL;
 	GpCteJoinQual ctx;
 	GpJoinTable	ctetable = {0};
 	GpJoinTable	jointable = {0};
