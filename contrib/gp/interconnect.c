@@ -662,6 +662,14 @@ gp_ic_serve(pgsocket fd, const char *token)
 			PopActiveSnapshot();
 			SPI_finish();
 			CommitTransactionCommand();
+
+			/*
+			 * Give the client its end of the answer before the socket of
+			 * this worker is closed and the worker is gone: on Windows a
+			 * close that races the queued answer resets the connection of
+			 * the reader instead of ending it
+			 */
+			gp_ic_shutdown_write(fd);
 		}
 	}
 	PG_CATCH();
@@ -678,6 +686,7 @@ gp_ic_serve(pgsocket fd, const char *token)
 
 		AbortCurrentTransaction();
 		(void) gp_ic_write_error(fd, edata->message);
+		gp_ic_shutdown_write(fd);
 		FreeErrorData(edata);
 		EmitErrorReport();
 		FlushErrorState();
