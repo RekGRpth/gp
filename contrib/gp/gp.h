@@ -122,6 +122,8 @@ extern bool gp_slice_agg_plan(Query *original, PlannedStmt *stmt);
 extern Query *gp_slice_join_query(Query *parse);
 extern bool gp_slice_join_plan(Query *original, PlannedStmt *stmt);
 extern void gp_slice_subquery_plans(Query *parse, PlannedStmt *stmt);
+extern List *gp_slice_initplan_query(Query *parse);
+extern bool gp_slice_initplan_plan(List *candidates, PlannedStmt *stmt);
 extern void gp_slice_partial_plan(Query *parse, PlannedStmt *stmt);
 extern bool gp_slice_grouping_plan(Query *parse, PlannedStmt *stmt);
 extern Query *gp_slice_grouping_query(Query *parse);

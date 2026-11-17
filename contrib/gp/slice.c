@@ -5462,6 +5462,219 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 								  parse->targetList, (List *) parse->havingQual);
 }
 
+/*
+ * A sublink of the query is an aggregate over one hashed table that the
+ * segments answer with partial columns: a copy of its query is collected
+ * for the SQL of the segments, keyed by the relid of that table.  Sublinks
+ * of other kinds are skipped: the planner answers them itself
+ */
+typedef struct GpInitplanCand
+{
+	Oid			relid;			/* the table the sublink aggregates over */
+	Query	   *query;			/* copy of the subselect for the segments */
+} GpInitplanCand;
+
+static bool
+gp_slice_initplan_query_walker(Node *node, void *context)
+{
+	List	   *cands = context;
+	ListCell   *lc;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, SubLink))
+	{
+		SubLink   *sub = (SubLink *) node;
+		RangeTblRef *ref;
+		RangeTblEntry *rte;
+		Query	   *candidate;
+		GpInitplanCand *cand;
+
+		if (sub->subLinkType != EXPR_SUBLINK || !IsA(sub->subselect, Query))
+			return false;
+		candidate = gp_slice_agg_query((Query *) sub->subselect);
+		if (candidate == NULL)
+			return false;
+		if (candidate->limitCount != NULL || candidate->limitOffset != NULL)
+			return false;
+		if (!IsA(candidate->jointree, FromExpr) ||
+			list_length(((FromExpr *) candidate->jointree)->fromlist) != 1 ||
+			!IsA(linitial(((FromExpr *) candidate->jointree)->fromlist),
+				 RangeTblRef))
+			return false;
+		ref = linitial_node(RangeTblRef,
+							((FromExpr *) candidate->jointree)->fromlist);
+		rte = rt_fetch(ref->rtindex, candidate->rtable);
+		if (rte->rtekind != RTE_RELATION || rte->relid == 0)
+			return false;
+		foreach(lc, cands)
+		{
+			cand = lfirst(lc);
+
+			if (cand->relid == rte->relid)
+				return false;
+		}
+		cand = palloc(sizeof(GpInitplanCand));
+		cand->relid = rte->relid;
+		cand->query = candidate;
+		cands = lappend(cands, cand);
+		return true;
+	}
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node,
+								 gp_slice_initplan_query_walker, cands, 0);
+	return expression_tree_walker(node, gp_slice_initplan_query_walker, cands);
+}
+
+/* Collect the pushable aggregate sublinks of the query */
+List *
+gp_slice_initplan_query(Query *parse)
+{
+	List	   *cands = NIL;
+
+	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
+		parse->hasWindowFuncs || parse->setOperations != NULL ||
+		parse->groupingSets != NIL || parse->rowMarks != NIL)
+	{
+		elog(NOTICE, "DEBUG ip: bail header");
+		return NIL;
+	}
+
+	gp_slice_initplan_query_walker((Node *) parse, cands);
+	return cands;
+}
+
+/*
+ * Rewrite the init plans of the query: an init plan that aggregates over
+ * the gather of the table named by a collected candidate is answered by
+ * the segments with partial columns, and the final aggregate of the init
+ * plan reads the columns of their answer
+ */
+bool
+gp_slice_initplan_plan(List *candidates, PlannedStmt *stmt)
+{
+	ListCell   *lc;
+
+	if (stmt->planTree == NULL || stmt->planTree->initPlan == NIL)
+		return false;
+	foreach(lc, stmt->planTree->initPlan)
+	{
+		SubPlan    *ip = castNode(SubPlan, lfirst(lc));
+		Plan	   *sub;
+		Agg		   *agg;
+		Plan	   *below;
+		RangeTblEntry *rte;
+		GpInitplanCand *cand = NULL;
+		ListCell   *lc2;
+		Oid			relid;
+
+		if (!ip->isInitPlan || ip->plan_id <= 0 ||
+			ip->plan_id > list_length(stmt->subplans))
+			return false;
+		sub = list_nth(stmt->subplans, ip->plan_id - 1);
+		if (!IsA(sub, Agg))
+			return false;
+		agg = (Agg *) sub;
+		below = agg->plan.lefttree;
+		if (below == NULL || !gp_is_gather(below))
+			return false;
+		if (((Scan *) below)->scanrelid <= 0 ||
+			((Scan *) below)->scanrelid > list_length(stmt->rtable))
+			return false;
+		rte = rt_fetch(((Scan *) below)->scanrelid, stmt->rtable);
+		if (rte->rtekind != RTE_RELATION || rte->relid == 0)
+			return false;
+		relid = rte->relid;
+
+		cand = NULL;
+		foreach(lc2, candidates)
+		{
+			GpInitplanCand *c = lfirst(lc2);
+
+			if (c->relid == relid)
+			{
+				cand = c;
+				break;
+			}
+		}
+		if (cand == NULL)
+			return false;
+		(void) cand;
+	}
+	/*
+	 * A second pass rewrites every matched init plan in place: the subplan
+	 * aggregate stays in the subplans list, its input becomes the slice of
+	 * the partial columns, and its target list reads them
+	 */
+	foreach(lc, stmt->planTree->initPlan)
+	{
+		SubPlan    *ip = castNode(SubPlan, lfirst(lc));
+		Plan	   *sub;
+		Agg		   *agg;
+		Plan	   *below;
+		RangeTblEntry *rte;
+		GpInitplanCand *cand = NULL;
+		GpPartialState state;
+		Query	   *remote;
+		ListCell   *lc2;
+		Oid			relid;
+
+		if (!ip->isInitPlan)
+			continue;
+		sub = list_nth(stmt->subplans, ip->plan_id - 1);
+		agg = (Agg *) sub;
+		below = agg->plan.lefttree;
+		while (below != NULL && (IsA(below, Sort) || IsA(below, IncrementalSort)))
+			below = below->lefttree;
+		rte = rt_fetch(((Scan *) below)->scanrelid, stmt->rtable);
+		relid = rte->relid;
+
+		foreach(lc2, candidates)
+		{
+			GpInitplanCand *c = lfirst(lc2);
+
+			if (c->relid == relid)
+			{
+				cand = c;
+				break;
+			}
+		}
+		if (cand == NULL)
+			return false;
+
+		state.ok = true;
+		state.aggs = NIL;
+		state.avgs = NIL;
+		state.keys = NIL;
+		state.allow_avg = true;
+		state.npos = 0;
+		state.nextaggno = 0;
+		state.below = NULL;
+
+		remote = copyObject(cand->query);
+		gp_partial_walker((Node *) remote->targetList, &state);
+		if (!state.ok || state.avgs == NIL)
+			return false;
+		remote->targetList = NIL;
+		foreach(lc2, state.avgs)
+		{
+			GpPartialAvg *pa = lfirst(lc2);
+
+			remote->targetList = lappend(remote->targetList,
+										 makeTargetEntry((Expr *) copyObject(pa->sum),
+														 pa->pos_sum, NULL, false));
+			remote->targetList = lappend(remote->targetList,
+										 makeTargetEntry((Expr *) copyObject(pa->count),
+														 pa->pos_count, NULL, false));
+		}
+
+		if (!gp_slice_partial_finish(agg, &state, remote, false,
+									 agg->plan.targetlist, NIL))
+			return false;
+	}
+	return true;
+}
+
 /* A partitioned join feeds the same partial aggregate as a single table */
 static bool
 gp_slice_join_partial(Query *original, PlannedStmt *stmt, Plan *plan,
