@@ -870,6 +870,7 @@ gp_ic_slot_invalidate(GpIcSlot *slot)
 	SpinLockAcquire(&slot->lock);
 	slot->generation++;
 	slot->latch = NULL;
+	slot->pid = 0;
 	pg_atomic_write_u32(&slot->state, GP_IC_SLOT_FREE);
 	SpinLockRelease(&slot->lock);
 }
@@ -915,6 +916,18 @@ gp_ic_reap_slots(void)
 		}
 		gp_ic_slot_invalidate(slot);
 	}
+}
+
+/* Whether the slot still names this worker of this generation */
+static bool
+gp_ic_slot_worker_current(GpIcSlot *slot, uint64 generation, pid_t pid)
+{
+	bool		current;
+
+	SpinLockAcquire(&slot->lock);
+	current = slot->generation == generation && slot->pid == pid;
+	SpinLockRelease(&slot->lock);
+	return current;
 }
 
 /*
@@ -963,6 +976,10 @@ gp_ic_cancel_slot(pgsocket fd)
 	else if (GetBackgroundWorkerTypeByPid(pid) == NULL)
 		ereport(LOG,
 				errmsg("the interconnect worker of slot %d is already gone",
+					   slot_id));
+	else if (!gp_ic_slot_worker_current(&gp_ic_slots[slot_id], generation, pid))
+		ereport(LOG,
+				errmsg("the interconnect worker of slot %d was already replaced",
 					   slot_id));
 	else if (kill(pid, SIGINT) != 0)
 		ereport(LOG,
