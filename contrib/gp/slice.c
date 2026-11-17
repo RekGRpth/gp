@@ -552,6 +552,8 @@ static bool gp_slice_cte_agg_replace(Query *ctequery, PlannedStmt *stmt,
 									 bool replicated, bool motion);
 static bool gp_slice_base_column(Plan *plan, TargetEntry *tle, Index *rti,
 								 AttrNumber *attno);
+static bool gp_slice_join_motion_affordable(Query *parse, List *tables,
+											List *conds);
 static bool gp_slice_join_partial(Query *original, PlannedStmt *stmt,
 								  Plan *plan, Plan *parent, bool sort_above,
 								  bool motion);
@@ -4023,6 +4025,54 @@ gp_slice_join_all_inner_from(Query *parse)
 	return true;
 }
 
+/*
+ * Whether the motions of a derived join are worth their launches.  A join
+ * whose tables are all colocated moves nothing, and joins of six tables or
+ * fewer keep the size of their answer from the interconnect launches.  A
+ * bigger join that moves tables launches a worker of every moved table on
+ * every segment, and one launch costs the time of a local join of about a
+ * hundred thousand rows (measured: a tiny eight-table join took 98 seconds
+ * distributed against 0.15 seconds local).  Tables of an unknown size count
+ * as unaffordable, for the fallback always gives a right answer.
+ */
+#define GP_MOTION_LAUNCH_ROWS 100000.0
+
+static bool
+gp_slice_join_motion_affordable(Query *parse, List *tables, List *conds)
+{
+	double		local_rows = 0;
+	double		moved_rows = 0;
+	int			nmoved = 0;
+	int			nsegments;
+	GpSegment  *segments;
+	ListCell   *lc;
+
+	if (list_length(tables) <= 6)
+		return true;
+	if (gp_slice_join_colocated(parse, tables, conds))
+		return true;
+
+	nsegments = gp_segments_get(&segments);
+	pfree(segments);
+	foreach(lc, tables)
+	{
+		GpJoinTable *table = lfirst(lc);
+		double		table_rows;
+
+		if (table->policy.replicated)
+			continue;
+		nmoved++;
+		if (!gp_slice_join_rows(parse, table, &table_rows))
+			return false;
+		local_rows += table_rows;
+		moved_rows += table_rows;
+	}
+	if (nmoved == 0 || nsegments == 0)
+		return true;
+	return local_rows >=
+		(double) nmoved * (double) nsegments * GP_MOTION_LAUNCH_ROWS;
+}
+
 static bool
 gp_slice_join_derived(Query *parse)
 {
@@ -4328,10 +4378,12 @@ gp_slice_join_query(Query *parse)
 	 * answer, unless a full join keeps it whole on one segment alone.
 	 */
 	if (gp_slice_join_derived(parse) &&
-		(!gp_slice_join_all_inner_levels(tables) || list_length(tables) > 6))
+		(!gp_slice_join_all_inner_levels(tables) ||
+		 !gp_slice_join_motion_affordable(parse, tables, conds)))
 	{
 		if (!parse->hasAggs || parse->groupClause == NIL ||
-			list_length(tables) > 6 || gp_slice_join_derived_full(parse))
+			!gp_slice_join_motion_affordable(parse, tables, conds) ||
+			gp_slice_join_derived_full(parse))
 			return NULL;
 	}
 	if (!gp_slice_join_colocated(parse, tables, conds))
