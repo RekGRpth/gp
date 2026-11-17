@@ -1248,6 +1248,11 @@ gp_interconnect_request_main(Datum main_arg)
 	}
 	pg_write_barrier();
 	gp_ic_slot_publish(slot, generation, GP_IC_SLOT_READY);
+	ereport(LOG,
+			errmsg("interconnect worker of slot %d generation " UINT64_FORMAT
+				   " is listening on port %u",
+				   slot_id, generation,
+				   pg_atomic_read_u32(&slot->port)));
 
 	wait_event = WaitEventExtensionNew("GpInterconnectRequest");
 	ResetLatch(MyLatch);
@@ -1279,8 +1284,14 @@ gp_interconnect_request_main(Datum main_arg)
 	token = gp_interconnect_token();
 	if (token != NULL)
 	{
+		ereport(LOG,
+				errmsg("interconnect worker of slot %d starts a request",
+					   slot_id));
 		(void) gp_ic_serve(fd, token);
 		closesocket(fd);
+		ereport(LOG,
+				errmsg("interconnect worker of slot %d finished its request",
+					   slot_id));
 	}
 	gp_ic_slot_publish(slot, generation, GP_IC_SLOT_FREE);
 	proc_exit(0);
