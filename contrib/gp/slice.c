@@ -4041,7 +4041,6 @@ static bool
 gp_slice_join_motion_affordable(Query *parse, List *tables, List *conds)
 {
 	double		local_rows = 0;
-	double		moved_rows = 0;
 	int			nmoved = 0;
 	int			nsegments;
 	GpSegment  *segments;
@@ -4065,7 +4064,6 @@ gp_slice_join_motion_affordable(Query *parse, List *tables, List *conds)
 		if (!gp_slice_join_rows(parse, table, &table_rows))
 			return false;
 		local_rows += table_rows;
-		moved_rows += table_rows;
 	}
 	if (nmoved == 0 || nsegments == 0)
 		return true;
