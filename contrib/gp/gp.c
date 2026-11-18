@@ -27,6 +27,8 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "tcop/tcopprot.h"
+#include "port/atomics.h"
+#include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/snapmgr.h"
@@ -61,16 +63,49 @@ static const struct config_enum_entry gp_default_distribution_options[] = {
 int			gp_role = GP_ROLE_NONE;
 
 /*
- * The number of statements and row streams this session has sent to the
- * segments: a query over the tables that keep their rows on the
- * coordinator leaves it alone
+ * The number of statements and row streams that have gone to the segments
+ * since the start of the coordinator.  The counter lives in the shared
+ * memory, for the backends of one session each carry their own copy of
+ * the globals of the module
  */
-int64		gp_dispatches = 0;
+static pg_atomic_uint64 *gp_dispatches_shmem = NULL;
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+
+static void gp_shmem_request(void);
+
+/*
+ * The shared memory is requested in the hook the server calls before it
+ * makes its own
+ */
+static void
+gp_shmem_request(void)
+{
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+
+	RequestAddinShmemSpace(sizeof(pg_atomic_uint64));
+}
+
+static pg_atomic_uint64 *
+gp_dispatches_object(void)
+{
+	if (gp_dispatches_shmem == NULL)
+	{
+		bool		found;
+
+		gp_dispatches_shmem = ShmemInitStruct("gp dispatches",
+											  sizeof(pg_atomic_uint64),
+											  &found);
+		if (!found)
+			pg_atomic_init_u64(gp_dispatches_shmem, 0);
+	}
+	return gp_dispatches_shmem;
+}
 
 void
 gp_dispatches_bump(void)
 {
-	gp_dispatches++;
+	pg_atomic_fetch_add_u64(gp_dispatches_object(), 1);
 }
 int			gp_segment_id = 0;
 static int	gp_requester_segment = 0;
@@ -92,6 +127,9 @@ _PG_init(void)
 	/* The role is set at server start, so the hooks come only from there */
 	if (!process_shared_preload_libraries_in_progress)
 		return;
+
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = gp_shmem_request;
 
 	DefineCustomEnumVariable("gp.role",
 							 "Role of the server in the cluster.",
@@ -533,5 +571,5 @@ PG_FUNCTION_INFO_V1(gp_dispatches_fn);
 Datum
 gp_dispatches_fn(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT64(gp_dispatches);
+	PG_RETURN_INT64(pg_atomic_read_u64(gp_dispatches_object()));
 }

@@ -85,20 +85,22 @@ is(run("SELECT string_agg(v, ',' ORDER BY k) FROM ref"),
 run('DELETE FROM ref WHERE k = 10');
 is(run('SELECT count(*) FROM ref'), 9, 'a delete reaches the copy');
 
-# A rollback undoes the copy beside the segments
-run('BEGIN');
-run("INSERT INTO ref VALUES (11, 'v11')");
-is(run('SELECT count(*) FROM ref'), 10, 'the row of a transaction is here');
-run('ROLLBACK');
-is(run('SELECT count(*) FROM ref'), 9, 'and a rollback removes it');
+# A rollback undoes the copy beside the segments: the block runs in one
+# session, for every run() of its own is a session of its own
+is(run("BEGIN;
+	INSERT INTO ref VALUES (11, 'v11');
+	SELECT count(*) FROM ref;
+	ROLLBACK;
+	SELECT count(*) FROM ref;"), "10
+9",
+	'a rollback removes the row from the copy and the segments');
 
-# COPY writes the copy beside the segments
-{
-	my $data = "12\tv12\n13\tv13\n";
-
-	$coordinator->safe_psql('postgres', "COPY ref FROM STDIN",
-							stdin => \$data);
-}
+# COPY writes the copy beside the segments: the rows follow the command
+# in the stream that psql reads
+run("COPY ref FROM STDIN;
+"
+    . "12\tv12\n"
+    . "13\tv13\n");
 is(run('SELECT count(*) FROM ref'), 11, 'a copy reaches the rows');
 is(run('SELECT count(*) FROM (SELECT DISTINCT v FROM ref) x'), 11,
 	'and no row is copied twice');
