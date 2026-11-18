@@ -66,12 +66,12 @@ is(run("SELECT string_agg(v, ',' ORDER BY v) FROM ref"),
 		'queries over the tables of the coordinator dispatch nothing');
 }
 
-# A read of a distributed table dispatches
+# A write to a distributed table dispatches
 {
 	my $before = run('SELECT gp.dispatches()');
-	run('SELECT count(*) FROM d');
+	run('INSERT INTO d VALUES (0)');
 	isnt(run('SELECT gp.dispatches()'), $before,
-		'a query over a distributed table dispatches');
+		'a write to a distributed table dispatches');
 }
 
 # INSERT, UPDATE and DELETE keep the copy with the segments

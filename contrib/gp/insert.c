@@ -1100,7 +1100,9 @@ void
 gp_insert_init(void)
 {
 	RegisterCustomScanMethods(&gp_insert_plan_methods);
+	RegisterCustomScanMethods(&gp_route_plan_methods);
 	RegisterCustomScanMethods(&gp_dml_plan_methods);
+	RegisterCustomScanMethods(&gp_dml_local_plan_methods);
 	prev_planner = planner_hook;
 	planner_hook = gp_planner;
 	prev_post_parse_analyze = post_parse_analyze_hook;
