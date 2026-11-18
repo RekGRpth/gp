@@ -131,6 +131,8 @@ gp_copy_from(PlannedStmt *pstmt, const char *queryString, QueryCompletion *qc)
 	EState	   *estate;
 	ExprContext *econtext;
 	GpRoute    *route;
+	ResultRelInfo *localri = NULL;
+	TupleTableSlot *localslot = NULL;
 	Datum	   *values;
 	bool	   *nulls;
 	uint64		processed = 0;
@@ -157,6 +159,20 @@ gp_copy_from(PlannedStmt *pstmt, const char *queryString, QueryCompletion *qc)
 	route = gp_route_begin(rel, &policy, 0);
 
 	estate = CreateExecutorState();
+
+	/*
+	 * A replicated table keeps a copy here: every routed row is inserted
+	 * into it beside its way to the segments, with its constraints, its
+	 * indexes and its row triggers
+	 */
+	if (policy.replicated)
+	{
+		localri = makeNode(ResultRelInfo);
+		InitResultRelInfo(localri, rel, 0, NULL, 0);
+		ExecOpenIndices(localri, false);
+		localslot = MakeSingleTupleTableSlot(RelationGetDescr(rel),
+											 &TTSOpsVirtual);
+	}
 	econtext = GetPerTupleExprContext(estate);
 	values = palloc_array(Datum, natts);
 	nulls = palloc_array(bool, natts);
@@ -182,6 +198,15 @@ gp_copy_from(PlannedStmt *pstmt, const char *queryString, QueryCompletion *qc)
 
 		gp_route_row(route, values, nulls);
 
+		if (localri != NULL)
+		{
+			ExecClearTuple(localslot);
+			memcpy(localslot->tts_values, values, sizeof(Datum) * natts);
+			memcpy(localslot->tts_isnull, nulls, sizeof(bool) * natts);
+			ExecStoreVirtualTuple(localslot);
+			ExecSimpleRelationInsert(localri, estate, localslot);
+		}
+
 		MemoryContextSwitchTo(oldcontext);
 		processed++;
 	}
@@ -189,6 +214,12 @@ gp_copy_from(PlannedStmt *pstmt, const char *queryString, QueryCompletion *qc)
 	error_context_stack = errcallback.previous;
 
 	gp_route_end(route);
+
+	if (localri != NULL)
+	{
+		ExecCloseIndices(localri);
+		ExecDropSingleTupleTableSlot(localslot);
+	}
 
 	EndCopyFrom(cstate);
 	FreeExecutorState(estate);

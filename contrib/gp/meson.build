@@ -103,6 +103,7 @@ tests += {
       't/044_tpch.pl',
       't/045_initplan_locus.pl',
       't/046_sublink_antijoin.pl',
+      't/047_replicated_copy.pl',
     ],
   },
 }

@@ -241,6 +241,14 @@ CREATE FUNCTION gp.segment_id() RETURNS int4
 AS 'MODULE_PATHNAME', 'gp_segment_id_fn'
 LANGUAGE C VOLATILE;
 
+-- The number of statements and row streams of this session that have gone
+-- to the segments.  A query over the tables that keep their rows on the
+-- coordinator leaves it unchanged.
+CREATE FUNCTION gp.dispatches()
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'gp_dispatches_fn'
+LANGUAGE C VOLATILE PARALLEL UNSAFE;
+
 -- Run one pass of the recovery of the transactions the segments keep
 -- prepared
 CREATE FUNCTION gp.recovery_pass_now()

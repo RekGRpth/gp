@@ -58,10 +58,13 @@
 #include "utils/tuplestore.h"
 
 #include "gp.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/nodes.h"
 
 static planner_hook_type prev_planner = NULL;
 static post_parse_analyze_hook_type prev_post_parse_analyze = NULL;
 static const CustomScanMethods gp_dml_plan_methods;
+static const CustomScanMethods gp_dml_local_plan_methods;
 
 static void gp_dml_lock(Oid relid);
 
@@ -81,6 +84,149 @@ static const CustomScanMethods gp_insert_plan_methods = {
 	.CustomName = "GpInsert",
 	.CreateCustomScanState = gp_insert_create_state,
 };
+
+/*
+ * A replicated table keeps a copy on the coordinator: the rows of the
+ * source of an INSERT are sent to every segment on the way through this
+ * node, and each row goes up to the ordinary ModifyTable, which inserts it
+ * here.  The rows are buffered first, for the source may read the segments
+ * itself, on the connections the rows are going to be sent on
+ */
+typedef struct GpRouteState
+{
+	CustomScanState css;
+	Oid			relid;
+	Relation	rel;
+	GpPolicy	policy;
+	GpRoute    *route;
+	Tuplestorestate *buffer;
+	bool		routed;
+	bool		done;
+} GpRouteState;
+
+static Node *gp_route_create_state(CustomScan *cscan);
+
+static const CustomScanMethods gp_route_plan_methods = {
+	.CustomName = "GpRoute",
+	.CreateCustomScanState = gp_route_create_state,
+};
+
+static void
+gp_route_begin_exec(CustomScanState *node, EState *estate, int eflags)
+{
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+
+	node->custom_ps = list_make1(ExecInitNode(linitial(cscan->custom_plans),
+											  estate, eflags));
+}
+
+static TupleTableSlot *
+gp_route_next(ScanState *ss)
+{
+	GpRouteState *state = (GpRouteState *) ss;
+	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
+	ExprContext *econtext = ss->ps.ps_ExprContext;
+	PlanState  *child = linitial(state->css.custom_ps);
+	TupleTableSlot *childslot;
+
+	if (!state->routed)
+	{
+		/* The rows of the source first, for the reason above */
+		state->buffer = tuplestore_begin_heap(false, false, work_mem);
+		for (;;)
+		{
+			TupleTableSlot * pulled = ExecProcNode(child);
+
+			if (TupIsNull(pulled))
+				break;
+			tuplestore_puttupleslot(state->buffer, pulled);
+		}
+		state->rel = table_open(state->relid, RowExclusiveLock);
+		if (!gp_policy_get(state->relid, &state->policy))
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("table \"%s\" is not distributed any more",
+						   RelationGetRelationName(state->rel)),
+					errhint("Plan the statement again."));
+		state->route = gp_route_begin(state->rel, &state->policy, 0);
+		state->routed = true;
+		state->done = false;
+	}
+	if (state->done)
+		return NULL;
+	if (!tuplestore_gettupleslot(state->buffer, true, false, slot))
+	{
+		state->done = true;
+		return NULL;
+	}
+
+	slot_getallattrs(slot);
+
+	ResetExprContext(econtext);
+	{
+		MemoryContext oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+
+		gp_route_row(state->route, slot->tts_values, slot->tts_isnull);
+		MemoryContextSwitchTo(oldcontext);
+	}
+	(void) childslot;
+	return slot;
+}
+
+static bool
+gp_route_recheck(ScanState *ss, TupleTableSlot *slot)
+{
+	return true;
+}
+
+static TupleTableSlot *
+gp_route_exec(CustomScanState *node)
+{
+	return ExecScan(&node->ss, gp_route_next, gp_route_recheck);
+}
+
+static void
+gp_route_end_exec(CustomScanState *node)
+{
+	GpRouteState *state = (GpRouteState *) node;
+
+	ExecEndNode(linitial(node->custom_ps));
+	if (state->route != NULL)
+	{
+		gp_route_end(state->route);
+		state->route = NULL;
+	}
+	if (state->buffer != NULL)
+		tuplestore_end(state->buffer);
+	table_close(state->rel, NoLock);
+}
+
+static void
+gp_route_rescan(CustomScanState *node)
+{
+	elog(ERROR, "GpRoute cannot be rescanned");
+}
+
+static const CustomExecMethods gp_route_exec_methods = {
+	.CustomName = "GpRoute",
+	.BeginCustomScan = gp_route_begin_exec,
+	.ExecCustomScan = gp_route_exec,
+	.EndCustomScan = gp_route_end_exec,
+	.ReScanCustomScan = gp_route_rescan,
+};
+
+static Node *
+gp_route_create_state(CustomScan *cscan)
+{
+	GpRouteState *state = (GpRouteState *) newNode(sizeof(GpRouteState),
+												   T_CustomScanState);
+
+	state->css.methods = &gp_route_exec_methods;
+	/* A tuplestore hands out minimal tuples */
+	state->css.slotOps = &TTSOpsMinimalTuple;
+	state->relid = (Oid) intVal(linitial(cscan->custom_private));
+	return (Node *) state;
+}
 
 static void
 gp_insert_begin(CustomScanState *node, EState *estate, int eflags)
@@ -344,6 +490,49 @@ gp_insert_plan(Query *parse, Query *original, PlannedStmt *stmt)
 				errmsg("row-level security and WITH CHECK OPTION are not supported on a distributed table"));
 
 	source = outerPlan(mt);
+	if (policy.replicated)
+	{
+		/*
+		 * The copy of the table on the coordinator is written by the
+		 * ordinary ModifyTable: the source goes through the router, which
+		 * sends every row to every segment on the way up
+		 */
+		cscan = makeNode(CustomScan);
+		cscan->scan.plan.startup_cost = mt->plan.startup_cost;
+		cscan->scan.plan.total_cost = mt->plan.total_cost;
+		cscan->scan.plan.plan_rows = mt->plan.plan_rows;
+		cscan->scan.plan.plan_width = mt->plan.plan_width;
+		cscan->scan.plan.initPlan = mt->plan.initPlan;
+		cscan->scan.plan.extParam = mt->plan.extParam;
+		cscan->scan.plan.allParam = mt->plan.allParam;
+		cscan->scan.scanrelid = 0;
+		cscan->custom_plans = list_make1(source);
+		cscan->custom_scan_tlist = copyObject(source->targetlist);
+		{
+			List	   *tlist = NIL;
+			int			pos = 0;
+			ListCell   *lsrc;
+
+			foreach(lsrc, source->targetlist)
+			{
+				TargetEntry *tle = lfirst_node(TargetEntry, lsrc);
+				Var		   *var = makeVar(INDEX_VAR, ++pos,
+											  exprType((Node *) tle->expr),
+											  exprTypmod((Node *) tle->expr),
+											  exprCollation((Node *) tle->expr), 0);
+
+				tlist = lappend(tlist,
+								makeTargetEntry((Expr *) var, tle->resno,
+												tle->resname, false));
+			}
+			cscan->scan.plan.targetlist = tlist;
+		}
+		cscan->custom_private = list_make1(makeInteger((int) rte->relid));
+		cscan->methods = &gp_route_plan_methods;
+
+		mt->plan.lefttree = &cscan->scan.plan;
+		return;
+	}
 	if (gp_slice_insert_motion(original, &motion))
 	{
 		cscan = makeNode(CustomScan);
@@ -470,6 +659,96 @@ static const CustomExecMethods gp_dml_exec_methods = {
 };
 
 /*
+ * The UPDATE and DELETE of a replicated table run on the segments, and
+ * the plan of the coordinator runs beside them, over the copy of the
+ * table that the coordinator keeps
+ */
+typedef struct GpDmlLocalState
+{
+	CustomScanState css;
+	char	   *sql;
+	bool		done;
+} GpDmlLocalState;
+
+static Node *gp_dml_local_create_state(CustomScan *cscan);
+
+static const CustomExecMethods gp_dml_local_exec_methods;
+static void gp_dml_local_end(CustomScanState *node);
+
+static const CustomScanMethods gp_dml_local_plan_methods = {
+	.CustomName = "GpDmlLocal",
+	.CreateCustomScanState = gp_dml_local_create_state,
+};
+
+static Node *
+gp_dml_local_create_state(CustomScan *cscan)
+{
+	GpDmlLocalState *state = (GpDmlLocalState *) newNode(sizeof(GpDmlLocalState),
+														 T_CustomScanState);
+
+	state->css.flags = cscan->flags;
+	state->css.methods = &gp_dml_local_exec_methods;
+	return (Node *) state;
+}
+
+static void
+gp_dml_local_begin(CustomScanState *node, EState *estate, int eflags)
+{
+	GpDmlLocalState *state = (GpDmlLocalState *) node;
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+
+	state->sql = strVal(linitial(cscan->custom_private));
+	node->custom_ps = list_make1(ExecInitNode(linitial(cscan->custom_plans),
+											  estate, eflags));
+}
+
+static TupleTableSlot *
+gp_dml_local_exec(CustomScanState *node)
+{
+	GpDmlLocalState *state = (GpDmlLocalState *) node;
+	EState	   *estate = node->ss.ps.state;
+	PlanState  *child = linitial(node->custom_ps);
+	uint64		rows = 0;
+
+	if (!state->done)
+	{
+		state->done = true;
+		gp_dispatch_xact_rows(state->sql, &rows);
+		for (;;)
+		{
+			TupleTableSlot *slot = ExecProcNode(child);
+
+			if (TupIsNull(slot))
+				break;
+		}
+		estate->es_processed += rows;
+	}
+	return NULL;
+}
+
+static void
+gp_dml_local_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	GpDmlLocalState *state = (GpDmlLocalState *) node;
+
+	ExplainPropertyText("Remote SQL", state->sql, es);
+}
+
+static const CustomExecMethods gp_dml_local_exec_methods = {
+	.CustomName = "GpDmlLocal",
+	.BeginCustomScan = gp_dml_local_begin,
+	.ExecCustomScan = gp_dml_local_exec,
+	.EndCustomScan = gp_dml_local_end,
+	.ExplainCustomScan = gp_dml_local_explain,
+};
+
+static void
+gp_dml_local_end(CustomScanState *node)
+{
+	ExecEndNode(linitial(node->custom_ps));
+}
+
+/*
  * Turn the plan of an UPDATE or a DELETE of a distributed table into the
  * custom scan that runs the statement on the segments.  The statement may
  * use its own table only: the segments see their own rows of it, and no
@@ -522,6 +801,34 @@ gp_dml_plan(Query *parse, PlannedStmt *stmt, ParamListInfo boundParams,
 				errdetail("A segment sees its own rows of it, and no rows of the others."));
 		}
 	}
+	if (policy.replicated)
+	{
+		/*
+		 * The copy of the table on the coordinator is written by the plan
+		 * itself: the statement runs here over the copy, and on every
+		 * segment beside, over its own rows.  The writers of the table run
+		 * one at a time
+		 */
+		CustomScan *cscan = makeNode(CustomScan);
+		int			location = stmt->stmt_location;
+		int			len = stmt->stmt_len > 0 ? strlen(queryString) :
+			strlen(queryString);
+		char	   *sql = pnstrdup(queryString + location, len);
+
+		cscan->scan.plan.startup_cost = mt->plan.startup_cost;
+		cscan->scan.plan.total_cost = mt->plan.total_cost;
+		cscan->scan.plan.plan_rows = mt->plan.plan_rows;
+		cscan->scan.plan.plan_width = mt->plan.plan_width;
+		cscan->scan.scanrelid = 0;
+		cscan->custom_plans = list_make1(&mt->plan);
+		cscan->custom_private = list_make2(makeString(sql),
+										   makeBoolean(stmt->canSetTag));
+		cscan->methods = &gp_dml_local_plan_methods;
+		stmt->planTree = &cscan->scan.plan;
+		gp_dml_lock(rte->relid);
+		return;
+	}
+
 	if (parse->commandType == CMD_UPDATE)
 	{
 		ListCell   *lc;
@@ -793,7 +1100,9 @@ void
 gp_insert_init(void)
 {
 	RegisterCustomScanMethods(&gp_insert_plan_methods);
+	RegisterCustomScanMethods(&gp_route_plan_methods);
 	RegisterCustomScanMethods(&gp_dml_plan_methods);
+	RegisterCustomScanMethods(&gp_dml_local_plan_methods);
 	prev_planner = planner_hook;
 	planner_hook = gp_planner;
 	prev_post_parse_analyze = post_parse_analyze_hook;

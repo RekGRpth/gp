@@ -90,8 +90,8 @@ like(plan_for('WITH s AS MATERIALIZED (SELECT b, count(*) AS c FROM t GROUP BY b
 	qr/GpSlice/, 'an aggregate CTE runs on the segments');
 like(plan_for('WITH s AS MATERIALIZED (SELECT a, count(*) AS c FROM t GROUP BY a) SELECT * FROM s'),
 	qr/GpSlice/, 'an aggregate CTE grouped by the key runs on the segments');
-like(plan_for('WITH s AS MATERIALIZED (SELECT a, count(*) AS c FROM r GROUP BY a) SELECT * FROM s'),
-	qr/GpSlice/, 'an aggregate CTE of a replicated table runs on one segment');
+unlike(plan_for('WITH s AS MATERIALIZED (SELECT a, count(*) AS c FROM r GROUP BY a) SELECT * FROM s'),
+	qr/GpSlice/, 'an aggregate CTE of a replicated table reads the copy');
 like(plan_for("WITH s AS MATERIALIZED (SELECT b, sum(v) AS total FROM t GROUP BY b)
 	SELECT s.b, s.total FROM s, t WHERE s.b = t.b
 	  AND s.total = (SELECT max(total) FROM s)"),

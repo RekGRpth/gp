@@ -106,10 +106,10 @@ foreach my $query (@queries)
 	is(run($query), run($local), "the same answer as on the coordinator: $query");
 }
 
-like(plan_for('SELECT a, count(*) FROM r GROUP BY a ORDER BY a'), qr/GpSlice/,
-	'a replicated table is aggregated by one segment');
-like(plan_for('SELECT count(*) FROM r'), qr/GpSlice/,
-	'a global aggregate of a replicated table is pushed');
+unlike(plan_for('SELECT a, count(*) FROM r GROUP BY a ORDER BY a'), qr/GpSlice/,
+	'a replicated table is aggregated on the coordinator, over its copy');
+unlike(plan_for('SELECT count(*) FROM r'), qr/GpSlice/,
+	'a global aggregate of a replicated table reads the copy');
 is(run('SELECT a, count(*) FROM r GROUP BY a ORDER BY a'),
 	"0|10\n1|10\n2|10\n3|10\n4|10", 'the groups of the replicated table');
 is(run('SELECT count(*) FROM r'), 50, 'the global count of the replicated table');
