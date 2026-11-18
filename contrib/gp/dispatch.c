@@ -1768,3 +1768,103 @@ gp_exec_on_all(PG_FUNCTION_ARGS)
 	}
 	return (Datum) 0;
 }
+
+/*
+ * Stop the server of the node the function runs on: the pid of the
+ * postmaster is the first line of its postmaster.pid, and a SIGINT is the
+ * fast stop, the same that pg_ctl -m fast sends.  The superuser alone, for
+ * the function stops the server of every session on the node
+ */
+PG_FUNCTION_INFO_V1(gp_stop_node);
+
+Datum
+gp_stop_node(PG_FUNCTION_ARGS)
+{
+	char	   *pidfile = psprintf("%s/postmaster.pid", DataDir);
+	FILE	   *file;
+	char		line[64];
+	long		pid = 0;
+
+	if (!superuser())
+		ereport(ERROR,
+				errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				errmsg("only a superuser can stop a node"));
+
+	file = AllocateFile(pidfile, "r");
+	if (file == NULL)
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("the node is not running"));
+	if (fgets(line, sizeof(line), file) != NULL)
+		pid = strtol(line, NULL, 10);
+	FreeFile(file);
+	if (pid <= 1)
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("the node is not running"));
+
+	(void) MemoryContextSwitchTo(TopMemoryContext);
+	ereport(LOG,
+			errmsg("the node stops by the request of the session %d",
+				   MyProcPid));
+	kill(pid, SIGINT);
+	PG_RETURN_TEXT_P(cstring_to_text("stopping"));
+}
+
+/*
+ * Stop the server of a segment by its number: the statement that stops the
+ * node is dispatched to it, and the loss of the connection on the way back
+ * is the success, for the node is going away
+ */
+PG_FUNCTION_INFO_V1(gp_stop_segment);
+
+Datum
+gp_stop_segment(PG_FUNCTION_ARGS)
+{
+	int			segment_id = PG_GETARG_INT32(0);
+	GpQuery    *query;
+	PGresult   *res;
+
+	if (!superuser())
+		ereport(ERROR,
+				errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				errmsg("only a superuser can stop a node"));
+	if (segment_id <= 0)
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("the coordinator has no number: stop it as an ordinary server"));
+
+	query = gp_query_start("SELECT gp.stop_node()", segment_id);
+
+	/*
+	 * The answer may come back before the node is down, or the going-away
+	 * node may take its answer and the connection instead: both mean the
+	 * statement was dispatched.  Anything else is an error of its own and
+	 * is thrown again
+	 */
+	PG_TRY();
+	{
+		while ((res = gp_query_next(query)) != NULL)
+		{
+			if (!PQgetisnull(res, 0, 0))
+				elog(NOTICE, "%s", PQgetvalue(res, 0, 0));
+			PQclear(res);
+		}
+	}
+	PG_CATCH();
+	{
+		ErrorData  *err = CopyErrorData();
+
+		if (err->sqlerrcode != ERRCODE_ADMIN_SHUTDOWN &&
+			err->sqlerrcode != ERRCODE_CONNECTION_FAILURE &&
+			err->sqlerrcode != ERRCODE_CONNECTION_DOES_NOT_EXIST)
+		{
+			FlushErrorState();
+			PG_RE_THROW();
+		}
+		FlushErrorState();
+	}
+	PG_END_TRY();
+
+	PG_RETURN_TEXT_P(cstring_to_text("stopping"));
+}
