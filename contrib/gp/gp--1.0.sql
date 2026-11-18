@@ -249,6 +249,25 @@ RETURNS bigint
 AS 'MODULE_PATHNAME', 'gp_dispatches_fn'
 LANGUAGE C VOLATILE PARALLEL UNSAFE;
 
+-- Stop the server of the node the function runs on: the fast stop, the
+-- same that pg_ctl -m fast sends.  The superuser alone, for the stop
+-- takes the sessions of every user with it
+CREATE FUNCTION gp.stop_node()
+RETURNS text
+AS 'MODULE_PATHNAME', 'gp_stop_node'
+LANGUAGE C VOLATILE;
+
+-- Stop the server of a segment by its number: the stop is dispatched to
+-- the segment, whose answer may be lost on the way back, for the node is
+-- going away
+CREATE FUNCTION gp.stop_segment(segment_id int)
+RETURNS text
+AS 'MODULE_PATHNAME', 'gp_stop_segment'
+LANGUAGE C VOLATILE;
+
+REVOKE ALL ON FUNCTION gp.stop_node() FROM PUBLIC;
+REVOKE ALL ON FUNCTION gp.stop_segment(int) FROM PUBLIC;
+
 -- Run one pass of the recovery of the transactions the segments keep
 -- prepared
 CREATE FUNCTION gp.recovery_pass_now()

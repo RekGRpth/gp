@@ -1,0 +1,32 @@
+# A node of the cluster: the instance name is the node name, as
+# gp-cluster.sh makes it (coordinator, segment-1, ...).  The data
+# directory carries the role of the node in its postgresql.conf:
+# shared_preload_libraries = 'gp' and gp.role with gp.segment_id.
+#
+# Install on the host of each node:
+#   cp gp@.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now gp@coordinator gp@segment-1 ...
+
+[Unit]
+Description=gp node %i
+After=network.target
+RequiresMountsFor=%h
+
+[Service]
+Type=notify
+User=gpadmin
+Group=gpadmin
+Environment=PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj
+Environment=PG_OOM_ADJUST_VALUE=0
+ExecStart=/usr/local/pgsql/bin/postgres -D %h/%i
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -INT $MAINPID
+TimeoutStopSec=120
+KillMode=mixed
+Restart=on-failure
+RestartSec=5
+OOMScoreAdjust=-1000
+
+[Install]
+WantedBy=multi-user.target

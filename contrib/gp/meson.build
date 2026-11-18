@@ -105,6 +105,7 @@ tests += {
       't/046_sublink_antijoin.pl',
       't/047_replicated_copy.pl',
       't/048_segment_pinned.pl',
+      't/049_stop_node.pl',
     ],
   },
 }
