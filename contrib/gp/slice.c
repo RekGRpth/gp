@@ -2098,8 +2098,28 @@ gp_slice_join_sublinks(Query *parse, List **tables, List **conds)
 		.depth = 1,
 		.ok = true
 	};
+	ListCell   *lc;
 
 	(void) query_tree_walker(parse, gp_slice_join_sublink_walker, &state, 0);
+
+	/*
+	 * The sublinks of a derived table of the fromlist drive the join of the
+	 * subquery below the way the sublinks of the query drive its own.  The
+	 * walker of the query misses the subqueries of the range table, so each
+	 * of them is walked as the level one below
+	 */
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+		GpJoinSubqueries nested = state;
+
+		if (rte->rtekind != RTE_SUBQUERY || rte->subquery == NULL)
+			continue;
+		nested.depth = state.depth + 1;
+		nested.ancestors = lappend(list_copy(state.ancestors), rte->subquery);
+		(void) query_tree_walker(rte->subquery, gp_slice_join_sublink_walker,
+								 &nested, 0);
+	}
 	return state.ok;
 }
 
@@ -4109,15 +4129,66 @@ gp_slice_join_all_inner_levels(List *tables)
 }
 
 /*
+ * The stationary side of a join the sublinks drive alone: the fromlist
+ * keeps one table of its own, and the sublinks are semi, anti or scalar
+ * over other tables.  The rows of the answer are the rows of that table,
+ * so it partitions the answer and must stay, while every table of a
+ * sublink must be whole on every segment.  A derived table of the fromlist
+ * keeps the table of its own fromlist below
+ */
+static GpJoinTable *
+gp_slice_join_kept_side(Query *original, List *tables)
+{
+	RangeTblRef *ref;
+	RangeTblEntry *rte;
+	ListCell   *lc;
+
+	if (!IsA(original->jointree, FromExpr) ||
+		list_length(original->jointree->fromlist) != 1 ||
+		!IsA(linitial(original->jointree->fromlist), RangeTblRef))
+		return NULL;
+	ref = linitial_node(RangeTblRef, original->jointree->fromlist);
+	rte = rt_fetch(ref->rtindex, original->rtable);
+	while (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL)
+	{
+		Query	   *subquery = rte->subquery;
+
+		if (!IsA(subquery->jointree, FromExpr) ||
+			list_length(subquery->jointree->fromlist) != 1 ||
+			!IsA(linitial(subquery->jointree->fromlist), RangeTblRef))
+			return NULL;
+		ref = linitial_node(RangeTblRef, subquery->jointree->fromlist);
+		rte = rt_fetch(ref->rtindex, subquery->rtable);
+	}
+	if (rte->rtekind != RTE_RELATION)
+		return NULL;
+	foreach(lc, tables)
+	{
+		GpJoinTable *table = lfirst(lc);
+
+		if (table->rti == ref->rtindex && !table->policy.replicated &&
+			table->policy.colocation_id != 0)
+			return table;
+	}
+	return NULL;
+}
+
+/*
  * Move the sides of a join of colocation groups.  An inner join moves every
  * table of another group by the hash of its key under the map of the first.
  * An outer join of two tables broadcasts its null-supplying side instead.  A
  * full join broadcasts both sides and runs on one segment, as either side can
- * have an unmatched row
+ * have an unmatched row.  A join the sublinks drive alone keeps the table of
+ * the fromlist and broadcasts every table of a sublink whole: the rows of
+ * the answer are the rows of the kept table, so they partition the answer,
+ * and a kept side broadcast instead would answer one kept row on every
+ * segment that misses a partner of it locally, and the answer would repeat
+ * the row once per such segment
  */
 static bool
 gp_slice_join_motion(Query *original, List *tables, List *conds,
-					 bool *single_segment, GpJoinTable **agg_stay)
+					 bool *single_segment, GpJoinTable **agg_stay,
+					 bool *kept_rows)
 {
 	GpJoinTable *stay = NULL;
 	GpJoinTable *move = NULL;
@@ -4129,8 +4200,35 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 
 	*single_segment = false;
 	*agg_stay = NULL;
+	*kept_rows = false;
 	if (!gp_slice_join_load_policies(original, tables))
 		return false;
+
+	/*
+	 * A join of a level with an outer join in a sublink or below a derived
+	 * table of the fromlist is not moved at all: a broadcast side joined
+	 * per segment loses the rows of an outer join no segment sees whole
+	 */
+	if ((list_length(tables) != 2 || original->hasSubLinks ||
+		 gp_slice_join_derived(original)) &&
+		!gp_slice_join_all_inner_levels(tables))
+		return false;
+	stay = gp_slice_join_kept_side(original, tables);
+	if (stay != NULL)
+	{
+		*agg_stay = stay;
+		*kept_rows = true;
+		foreach(lc, tables)
+		{
+			move = lfirst(lc);
+
+			if (move == stay || move->policy.replicated)
+				continue;
+			if (!gp_slice_redistribute_rte(original, stay, move, true))
+				return false;
+		}
+		return true;
+	}
 	redistributing = gp_slice_join_redistributable(original, tables, conds,
 												   &stay, &moves);
 	if (!redistributing && list_length(tables) > 2)
@@ -4293,6 +4391,28 @@ gp_slice_join_nullable(Node *node, Index rti, bool nullable)
 }
 
 /*
+ * Whether every column of the expression reads the table of the fromlist:
+ * the rows of the answer of a join the sublinks drive alone are the rows of
+ * that table, so any grouping over its columns keeps every group on one
+ * segment
+ */
+static bool
+gp_slice_join_stay_vars(Node *node, void *context)
+{
+	Index		rti = *((Index *) context);
+
+	if (node == NULL)
+		return true;
+	if (IsA(node, Var))
+		return ((Var *) node)->varlevelsup == 0 &&
+			((Var *) node)->varno == rti &&
+			((Var *) node)->varattno > 0;
+	if (IsA(node, Query))
+		return false;
+	return expression_tree_walker(node, gp_slice_join_stay_vars, context);
+}
+
+/*
  * Whether the grouping of the aggregate covers the distribution key of
  * some hashed table of the join, so that every group is on one segment.
  * All hashed tables are colocated by their keys, so grouping by the whole
@@ -4371,8 +4491,7 @@ gp_slice_join_query(Query *parse)
 		return NULL;
 	if (!gp_slice_join_from(parse, &tables, &conds))
 		return NULL;
-	if (parse->hasSubLinks &&
-		!gp_slice_join_sublinks(parse, &tables, &conds))
+	if (!gp_slice_join_sublinks(parse, &tables, &conds))
 		return NULL;
 	if (list_length(tables) < 2)
 		return NULL;
@@ -4422,6 +4541,7 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	bool		replicated = true;
 	bool		single_segment = false;
 	bool		motion = false;
+	bool		kept_rows = false;
 	GpJoinTable *agg_stay = NULL;
 	GpLocus	locus;
 	List	   *tables = NIL;
@@ -4446,8 +4566,7 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
 	if (!gp_slice_join_from(original, &tables, &conds))
 		return false;
-	if (original->hasSubLinks &&
-		!gp_slice_join_sublinks(original, &tables, &conds))
+	if (!gp_slice_join_sublinks(original, &tables, &conds))
 		return false;
 	if (!gp_slice_join_load_policies(original, tables))
 		return false;
@@ -4458,7 +4577,8 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	{
 		{
 			bool		motion_ok = gp_slice_join_motion(original, tables, conds,
-													 &single_segment, &agg_stay);
+													 &single_segment, &agg_stay,
+													 &kept_rows);
 
 			if (!motion_ok)
 				return false;
@@ -4472,7 +4592,7 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 		if (original->hasSubLinks)
 			return false;
 		if (!gp_slice_join_motion(original, tables, conds, &single_segment,
-								  &agg_stay))
+								  &agg_stay, &kept_rows))
 			return false;
 		motion = true;
 	}
@@ -4503,15 +4623,61 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 		if (original->groupClause == NIL)
 			return false;
 
-		while (agg != NULL && !IsA(agg, Agg))
+		if (kept_rows)
 		{
-			if (agg->righttree != NULL)
+			RangeTblRef *ref = linitial_node(RangeTblRef,
+											 original->jointree->fromlist);
+			RangeTblEntry *rte = rt_fetch(ref->rtindex, original->rtable);
+			Index		rti = ref->rtindex;
+			ListCell   *lgroup;
+			Plan	   *join = plan;
+
+			if (rte->rtekind != RTE_SUBQUERY || rte->subquery == NULL)
 				return false;
-			agg = agg->lefttree;
+			foreach(lgroup, original->groupClause)
+			{
+				SortGroupClause *sc = lfirst_node(SortGroupClause, lgroup);
+				TargetEntry *tle = get_sortgroupclause_tle(sc,
+														   original->targetList);
+
+				if (!gp_slice_join_stay_vars((Node *) tle->expr, &rti))
+					return false;
+			}
+
+			/*
+			 * The rows of the answer are the rows of the subquery: the
+			 * aggregate keeps its place above, and its input, the join
+			 * below, becomes the slice of the segments.  The order of the
+			 * groups stays with the aggregate and the sort above the join
+			 */
+			while (join != NULL && (IsA(join, Agg) || IsA(join, Sort) ||
+									IsA(join, IncrementalSort) ||
+									IsA(join, Limit)))
+			{
+				parent = join;
+				join = join->lefttree;
+			}
+			if (join == NULL)
+				return false;
+			cscan = gp_slice_make(join, rte->subquery, replicated, motion,
+								  NIL);
+			parent->lefttree = &cscan->scan.plan;
+			return true;
 		}
-		if (agg == NULL ||
-			!gp_slice_join_agg_keys((Agg *) agg, tables, original, agg_stay))
-			return false;
+		else
+		{
+			if (original->groupClause == NIL)
+				return false;
+			while (agg != NULL && !IsA(agg, Agg))
+			{
+				if (agg->righttree != NULL)
+					return false;
+				agg = agg->lefttree;
+			}
+			if (agg == NULL ||
+				!gp_slice_join_agg_keys((Agg *) agg, tables, original, agg_stay))
+				return false;
+		}
 	}
 
 	/* A failed partial aggregate must keep the original ordering here */
@@ -4558,8 +4724,7 @@ gp_slice_subquery_replicated(Query *subquery, bool is_join)
 
 		if (!gp_slice_join_from(subquery, &tables, &conds))
 			return false;
-		if (subquery->hasSubLinks &&
-			!gp_slice_join_sublinks(subquery, &tables, &conds))
+		if (!gp_slice_join_sublinks(subquery, &tables, &conds))
 			return false;
 		if (!gp_slice_join_colocated(subquery, tables, conds))
 		{
@@ -4740,6 +4905,7 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 		List	   *tables = NIL;
 		List	   *conds = NIL;
 		bool		single_segment = false;
+		bool		kept_rows = false;
 		GpJoinTable *agg_stay = NULL;
 
 		locus = gp_locus_plan(plan, candidate->rtable, NULL);
@@ -4757,7 +4923,7 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 			if (candidate->hasSubLinks && candidate->hasAggs)
 				return gp_locus_make(GP_LOCUS_COORDINATOR);
 			if (!gp_slice_join_motion(candidate, tables, conds, &single_segment,
-									  &agg_stay))
+									  &agg_stay, &kept_rows))
 				return gp_locus_make(GP_LOCUS_COORDINATOR);
 			motion = true;
 		}
@@ -4766,7 +4932,7 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 		{
 			/* A full join that is not colocated still broadcasts both sides */
 			if (!gp_slice_join_motion(candidate, tables, conds, &single_segment,
-									  &agg_stay))
+									  &agg_stay, &kept_rows))
 				return gp_locus_make(GP_LOCUS_COORDINATOR);
 			motion = true;
 		}
