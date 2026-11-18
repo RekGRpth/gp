@@ -728,7 +728,7 @@ All are set at server start unless noted.
 | `gp.cluster_segments()` | Segments as the coordinator knows them, with the port of each interconnect broker, from any database |
 | `gp.exec_on_all(sql)` | Run a command on all segments, return the status of each |
 | `gp.recorded_oids()` | OIDs of the new catalog rows of the transaction on the coordinator |
-| `gp.distribute(table, key, colocate_with)` | Distribute an empty table by hash of `key`, or replicate it |
+| `gp.distribute(table, key, colocate_with, segment)` | Distribute an empty table by hash of `key`, or replicate it, or pin it to a segment |
 | `gp.bucket(nbuckets, VARIADIC key)` | Bucket of a key |
 | `gp.bucket_segment(colocation_id, bucket)` | Segment of a bucket of a colocation group |
 | `gp.policy_changed(relation)` | Make every session read the policy of a table again; `gp.distribute()` calls it |

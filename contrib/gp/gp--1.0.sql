@@ -271,9 +271,12 @@ LANGUAGE C VOLATILE;
 -- all segments if key is NULL.  A table distributed by hash joins the
 -- colocation group of colocate_with, or else the first group with its key
 -- types and number of buckets; a new group spreads its buckets over the
--- segments in turn.
+-- segments in turn.  With segment set, the table is pinned to that one
+-- segment instead: every bucket of its own new group points there, so
+-- all of its rows live on that segment alone.
 CREATE FUNCTION gp.distribute(relation regclass, key name[],
-							  colocate_with regclass DEFAULT NULL)
+							  colocate_with regclass DEFAULT NULL,
+							  segment int DEFAULT NULL)
 RETURNS void
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
@@ -327,11 +330,15 @@ BEGIN
 		IF colocate_with IS NOT NULL THEN
 			RAISE EXCEPTION 'a replicated table has no colocation group';
 		END IF;
+		IF segment IS NOT NULL THEN
+			RAISE EXCEPTION 'a table without a key of distribution cannot be pinned to a segment';
+		END IF;
 		INSERT INTO gp.distribution_policy (relid, kind)
 		VALUES (relation, 'replicated');
 		PERFORM gp.policy_changed(relation);
 		RETURN;
 	END IF;
+
 
 
 	IF cardinality(key) = 0 THEN
@@ -353,6 +360,27 @@ BEGIN
 		RAISE EXCEPTION 'a key has a column more than once';
 	END IF;
 	PERFORM gp.check_distribution_key(relation, attnums);
+
+	IF segment IS NOT NULL THEN
+		IF colocate_with IS NOT NULL THEN
+			RAISE EXCEPTION 'a table pinned to a segment joins no colocation group of another';
+		END IF;
+		IF NOT EXISTS (SELECT FROM gp.cluster_segments() s
+					   WHERE s.segment_id = segment) THEN
+			RAISE EXCEPTION 'segment % is not registered', segment;
+		END IF;
+
+		-- Every bucket of the own new group points to the segment, so all
+		-- the rows of the table live there alone
+		LOCK TABLE gp.colocation_groups IN SHARE ROW EXCLUSIVE MODE;
+		INSERT INTO gp.colocation_groups (key_types, nbuckets, map)
+		SELECT types, buckets, array_fill(segment, ARRAY[buckets])
+		RETURNING colocation_id INTO group_id;
+		INSERT INTO gp.distribution_policy (relid, kind, key_columns, colocation_id)
+		VALUES (relation, 'hash', attnums, group_id);
+		PERFORM gp.policy_changed(relation);
+		RETURN;
+	END IF;
 
 	-- Groups are made one at a time, so the search below holds
 	LOCK TABLE gp.colocation_groups IN SHARE ROW EXCLUSIVE MODE;
@@ -394,7 +422,7 @@ BEGIN
 END
 $$;
 
-REVOKE ALL ON FUNCTION gp.distribute(regclass, name[], regclass) FROM PUBLIC;
+REVOKE ALL ON FUNCTION gp.distribute(regclass, name[], regclass, int) FROM PUBLIC;
 
 -- A dropped table loses its policy, lest a new table get its OID and the
 -- policy with it.  Defined as SECURITY DEFINER: a user that drops a table

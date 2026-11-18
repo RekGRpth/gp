@@ -76,6 +76,7 @@ typedef struct GpGatherState
 	CustomScanState css;
 	char	   *sql;
 	bool		replicated;
+	int			only;			/* the segment all the rows live on, 0 if not */
 	bool		inherit;
 	Tuplestorestate *store;		/* all rows, once read */
 } GpGatherState;
@@ -143,6 +144,8 @@ gp_gather_load_interconnect(GpGatherState *state)
 					errmsg("the cluster has no segments"));
 		only = segments[MyProcPid % nsegments].segment_id;
 	}
+	else if (state->only != 0)
+		only = state->only;
 
 	/* A segment whose broker has not reported its port is not ready yet */
 	for (int i = 0; i < nsegments; i++)
@@ -221,6 +224,10 @@ gp_gather_load_libpq(GpGatherState *state)
 					errmsg("the cluster has no segments"));
 		only = segments[MyProcPid % n].segment_id;
 	}
+	else if (state->only != 0)
+	{
+		only = state->only;
+	}
 
 	query = gp_query_start(state->sql, only);
 	while ((res = gp_query_next(query)) != NULL)
@@ -290,6 +297,7 @@ gp_gather_begin(CustomScanState *node, EState *estate, int eflags)
 	state->sql = strVal(linitial(cscan->custom_private));
 	state->replicated = boolVal(lsecond(cscan->custom_private));
 	state->inherit = boolVal(lthird(cscan->custom_private));
+	state->only = intVal(lfourth(cscan->custom_private));
 }
 
 static TupleTableSlot *
@@ -513,9 +521,28 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	cpath->path.pathkeys = NIL;
 	cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cpath->custom_paths = NIL;
-	cpath->custom_private = list_make3(makeString(gp_gather_sql(rte)),
-									   makeBoolean(policy.replicated),
-									   makeBoolean(rte->inh));
+	{
+		int			only = 0;
+
+		/*
+		 * A table pinned to a segment keeps every row on it: the gather
+		 * reads that segment alone
+		 */
+		if (!policy.replicated && policy.nbuckets > 0)
+		{
+			int			b = 1;
+
+			while (b < policy.nbuckets &&
+				   policy.map[b] == policy.map[0])
+				b++;
+			if (b == policy.nbuckets)
+				only = policy.map[0];
+		}
+		cpath->custom_private = list_make4(makeString(gp_gather_sql(rte)),
+										   makeBoolean(policy.replicated),
+										   makeBoolean(rte->inh),
+										   makeInteger(only));
+	}
 	cpath->methods = &gp_gather_path_methods;
 
 	add_path(rel, &cpath->path);
