@@ -141,6 +141,6 @@ HINT:  A distribution key needs types with hash functions.
 CREATE TABLE t (a int);
 SELECT gp.distribute('t', '{a}');
 ERROR:  tables are distributed on the coordinator only
-CONTEXT:  PL/pgSQL function gp.distribute(regclass,name[],regclass) line 12 at RAISE
+CONTEXT:  PL/pgSQL function gp.distribute(regclass,name[],regclass,integer) line 12 at RAISE
 DROP TABLE t;
 DROP EXTENSION gp;
