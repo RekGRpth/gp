@@ -234,7 +234,9 @@ for planning.
 
 `gp.distribute(table, key, colocate_with)` distributes an empty table by
 hash of its key columns, or replicates it to all segments if the key is
-`NULL`.  A row goes to a bucket by `gp.bucket()`, the extended hash
+`NULL`.  A replicated table keeps a copy on the coordinator as well:
+writes reach every segment and the copy beside, and a query that reads
+such a table reads the copy alone, without dispatching anything.  A row goes to a bucket by `gp.bucket()`, the extended hash
 functions of the key types combined as hash partitioning does, with a seed
 of its own; the bucket goes to a segment by a map.
 
@@ -263,13 +265,17 @@ parameters is refused.
 
 ### COPY into distributed tables (`copy.c`)
 
-The table on the coordinator holds no rows, so `COPY ... FROM` into a
-distributed table does not run there as usual.  The hook reads and parses
+The table on the coordinator holds no rows of a hash-distributed table,
+so `COPY ... FROM` into one does not run there as usual.  A replicated
+table keeps a copy on the coordinator: its rows go to every segment and
+into the copy beside, through the constraints and the row triggers of
+the table.  The hook reads and parses
 the input with the code of `COPY` itself (files, programs, `STDIN`, every
 format), evaluates the defaults of columns the input lacks, finds the
 segment of each row by its bucket, and sends the rows to the segments as
 `COPY ... FROM STDIN (FORMAT binary)`, which takes every type as it is.  A
-row of a replicated table goes to all segments.  The segments run the
+row of a replicated table goes to all segments and into the copy of the
+coordinator.  The segments run the
 `COPY` in the transactions that follow the transaction of the coordinator,
 so the two-phase commit covers it; they check the constraints and compute
 the generated columns themselves.  The command tag counts the rows of the
@@ -337,7 +343,8 @@ statement to the segments on the first call, and answers with the sum of
 their counts of rows.  The coordinator takes an exclusive lock on the table
 for the whole statement, which runs the writers one at a time and spares
 the segments a deadlock of their own.  A replicated table takes its UPDATE
-on every segment, over every copy.
+on every segment, over every copy, and on the coordinator, over its own
+copy.
 
 What is refused: a change of the distribution key, which would move rows
 between segments; `RETURNING`; row-level security; parameters, subqueries,
@@ -482,8 +489,8 @@ coordinator, only the finished groups of every segment.  Such an
 aggregate is replaced after the planner by a custom scan, `GpSlice`,
 which runs the aggregate of the query on the segments and reads their
 rows; the sort and the limit of the query stay on the coordinator.  A
-replicated table is aggregated by one segment as a whole, even without a
-grouping.  When the grouping consists of plain columns with extended hash
+replicated table reads the copy of the coordinator, so its aggregate
+runs there as an ordinary one.  When the grouping consists of plain columns with extended hash
 functions but does not cover the distribution key, the rows move by those
 grouping columns under the table's bucket map.  Every group lands on one segment again, so the whole
 aggregate runs there, including `count`, `avg`, distinct and mixed
@@ -726,6 +733,7 @@ All are set at server start unless noted.
 | `gp.bucket_segment(colocation_id, bucket)` | Segment of a bucket of a colocation group |
 | `gp.policy_changed(relation)` | Make every session read the policy of a table again; `gp.distribute()` calls it |
 | `gp.segment_id()` | The segment this server is: 0 on the coordinator, and its number on a segment.  A row of a distributed table keeps its segment, but no query tells it yet: that comes with the pushdown of the MPP planner |
+| `gp.dispatches()` | How many statements and row streams of this session have gone to the segments.  A query over the tables that keep their rows on the coordinator leaves it unchanged |
 
 `gp.register_segment()`, `gp.exec_on_all()` and `gp.distribute()` are for
 superusers only.

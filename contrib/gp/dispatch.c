@@ -1286,12 +1286,16 @@ gp_dispatch_xact_rows_impl(const char *sql, uint64 *rows, bool user_dml)
 {
 	GpSegment  *segments;
 	GpConnection **entries;
-	int			nsegments = gp_connections_ready(&segments, &entries, 0);
-	char	  **commands = palloc_array(char *, nsegments);
+	int			nsegments;
+	char	  **commands;
 	PGresult  **results;
 
+	gp_dispatches_bump();
 	if (user_dml)
 		gp_dtx_require_xact_snapshot();
+	nsegments = gp_connections_ready(&segments, &entries, 0);
+	commands = palloc_array(char *, nsegments);
+	results = palloc0_array(PGresult *, nsegments);
 	for (int i = 0; i < nsegments; i++)
 	{
 		commands[i] = entries[i]->in_xact ? (char *) sql :
@@ -1321,11 +1325,15 @@ int
 gp_copy_open(const char *sql, int only, GpSegment **segments)
 {
 	GpConnection **entries;
-	int			nsegments = gp_connections_ready(segments, &entries, only);
-	char	  **commands = palloc_array(char *, nsegments);
+	int			nsegments;
+	char	  **commands;
 	PGresult  **results;
 
+	gp_dispatches_bump();
 	gp_dtx_require_xact_snapshot();
+	nsegments = gp_connections_ready(segments, &entries, only);
+	commands = palloc_array(char *, nsegments);
+	results = palloc0_array(PGresult *, nsegments);
 	for (int i = 0; i < nsegments; i++)
 	{
 		commands[i] = entries[i]->in_xact ? NULL : (char *) gp_xact_begin();
@@ -1336,7 +1344,6 @@ gp_copy_open(const char *sql, int only, GpSegment **segments)
 	for (int i = 0; i < nsegments; i++)
 		PQclear(results[i]);
 
-	results = palloc0_array(PGresult *, nsegments);
 	for (int i = 0; i < nsegments; i++)
 	{
 		commands[i] = (char *) sql;
@@ -1447,6 +1454,7 @@ gp_query_start(const char *sql, int only)
 	GpQuery    *query = palloc0_object(GpQuery);
 	GpConnection **entries;
 
+	gp_dispatches_bump();
 	gp_dtx_require_xact_snapshot();
 	query->nsegments = gp_connections_ready(&query->segments, &entries, only);
 	query->first = palloc0_array(PGresult *, query->nsegments);

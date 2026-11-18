@@ -85,8 +85,8 @@ like(plan_for('SELECT a, count(*) FROM t GROUP BY GROUPING SETS ((a), (a))'),
 	qr/GpSlice/, 'duplicate grouping sets remain local');
 like(plan_for('SELECT a, count(*) FROM t GROUP BY GROUPING SETS ((a)) ORDER BY a LIMIT 1'),
 	qr/GpSlice/, 'sort and limit stay above grouping sets');
-like(plan_for('SELECT a, count(*) FROM r GROUP BY GROUPING SETS ((a))'),
-	qr/GpSlice/, 'a replicated grouping set uses one segment');
+unlike(plan_for('SELECT a, count(*) FROM r GROUP BY GROUPING SETS ((a))'),
+	qr/GpSlice/, 'a replicated grouping set reads the copy of the coordinator');
 
 my @queries = (
 	'SELECT a, count(*) FROM t GROUP BY GROUPING SETS ((a)) ORDER BY a',

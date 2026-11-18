@@ -434,7 +434,9 @@ gp_gather_sql(RangeTblEntry *rte)
 }
 
 /*
- * The only path to a distributed table is GpGather
+ * The only path to a distributed table is GpGather.  A replicated table
+ * keeps a copy on the coordinator as well, so it is read from it alone,
+ * without a word to the segments
  */
 static void
 gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
@@ -453,6 +455,10 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		 rte->relkind != RELKIND_PARTITIONED_TABLE))
 		return;
 	if (!gp_policy_get(rte->relid, &policy))
+		return;
+
+	/* The copy of a replicated table is here, and the paths are the usual */
+	if (policy.replicated)
 		return;
 
 	/*

@@ -59,6 +59,19 @@ static const struct config_enum_entry gp_default_distribution_options[] = {
 
 /* GUC Variables */
 int			gp_role = GP_ROLE_NONE;
+
+/*
+ * The number of statements and row streams this session has sent to the
+ * segments: a query over the tables that keep their rows on the
+ * coordinator leaves it alone
+ */
+int64		gp_dispatches = 0;
+
+void
+gp_dispatches_bump(void)
+{
+	gp_dispatches++;
+}
 int			gp_segment_id = 0;
 static int	gp_requester_segment = 0;
 char	   *gp_database = NULL;
@@ -513,4 +526,12 @@ Datum
 gp_segment_id_fn(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT32(gp_segment_id);
+}
+
+PG_FUNCTION_INFO_V1(gp_dispatches_fn);
+
+Datum
+gp_dispatches_fn(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(gp_dispatches);
 }
