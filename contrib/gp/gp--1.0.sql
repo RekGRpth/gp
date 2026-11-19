@@ -278,6 +278,15 @@ REVOKE ALL ON FUNCTION gp.log_tail(int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION gp.stop_node() FROM PUBLIC;
 REVOKE ALL ON FUNCTION gp.stop_segment(int) FROM PUBLIC;
 
+-- The state of the nodes of the cluster, as the coordinator sees it: a
+-- short connection of its own tells a live node from a dead one.  Open to
+-- anyone: the state of the cluster is no secret
+CREATE FUNCTION gp.node_state(OUT segment_id int, OUT host text, OUT port int,
+OUT up boolean, OUT in_recovery boolean, OUT error text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'gp_node_state'
+LANGUAGE C VOLATILE;
+
 -- Run one pass of the recovery of the transactions the segments keep
 -- prepared
 CREATE FUNCTION gp.recovery_pass_now()
