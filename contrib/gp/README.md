@@ -830,22 +830,23 @@ by the patch and `contrib/gp`.
    distributed snapshots; `UPDATE` and `DELETE` on the segments; unique
    indexes made to include the key of the distribution; and the recovery
    worker that resolves the transactions lost segments keep prepared.
-5. **MPP planner without interconnect** — in progress: aggregates whose
-   grouping covers the key of the distribution, and joins whose partners
-   are on the same segment run on the segments, with aggregates over
-   colocated joins of any number of tables, junk columns of the target
-   list allowed, the same computation inside a subquery in FROM, and
-   aggregates by other columns answered partly on the segments; the first
-   locus propagation keeps projections, conditions, sorts and limits above
-   a distributed subquery and carries the types, collations and positions of
-   hash keys through direct projections; binary joins prove colocation from
-   both hashed inputs and drive top-level `GpSlice` join and aggregate plans;
-   `INSERT ... SELECT` skips Motion when source and target are already
-   colocated; `UNION ALL`, `UNION DISTINCT`, `INTERSECT` and `EXCEPT` keep
-   compatible hashed loci; window partitions by the whole distribution key are
-   local; nonrecursive CTEs inherit that locus through their subplans; and
-   `DISTINCT` is local when its whole key is in the output; next is the locus
-   model for the rest.
+5. **MPP planner** — in progress: the locus model and the rules on top of
+   it.  Aggregates whose grouping covers the key of the distribution run on
+   the segments, colocated joins of any number of tables too, and other
+   groupings are answered partly on the segments; projections, conditions,
+   sorts and limits keep a distributed locus through derived tables in FROM;
+   binary joins prove colocation from both hashed inputs, and joins whose
+   tables are not colocated move them by Motion (item 6); window partitions
+   by the whole distribution key are local; `UNION ALL`, `UNION DISTINCT`,
+   `INTERSECT` and `EXCEPT` keep compatible hashed loci; nonrecursive CTEs
+   inherit that locus through their subplans, above joins and through init
+   plans; aggregates of CTEs over joins run on the segments; joins the
+   sublinks drive keep the table of the fromlist; `DISTINCT` is local when
+   its whole key is in the output; `INSERT ... SELECT` skips Motion when
+   source and target are already colocated.  What stays on the coordinator:
+   joins whose graph is not connected by keys, mixed outer and inner levels
+   of one fromlist, and queries the rules cannot prove safe — the fallback
+   always gives a right answer.
 6. **Interconnect** — in progress: a `GpMotion` custom scan moves tables by
    redistribution or broadcast over a serialized-plan transport with binary
    tuples; clean
@@ -854,7 +855,10 @@ by the patch and `contrib/gp`.
    connections; the broker of a segment reports its port to the coordinator,
    so no client computes the address by a rule; multiple slices of one statement
    on a segment are READ ONLY readers of one exported snapshot, and cancellation
-   follows the whole reader tree.
+   follows the whole reader tree; an outer join broadcasts the null-supplying
+   side — in chains of one kind of an outer join as well: a chain of left
+   joins keeps its first table on the segments and broadcasts the rest, and
+   a chain of full joins broadcasts every table to one segment.
 7. **Statistics** — implemented for manual `ANALYZE`: relation sizes are
    summed over the segments, attribute statistics are sampled from the first
    segment, and the planner uses the imported cluster sizes.
