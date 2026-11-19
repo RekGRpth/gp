@@ -10,6 +10,7 @@ gp_sources = files(
   'gp.c',
   'insert.c',
   'interconnect.c',
+  'logs.c',
   'motion.c',
   'oids.c',
   'recovery.c',
@@ -106,6 +107,7 @@ tests += {
       't/047_replicated_copy.pl',
       't/048_segment_pinned.pl',
       't/049_stop_node.pl',
+      't/050_log_tail.pl',
     ],
   },
 }

@@ -265,6 +265,16 @@ RETURNS text
 AS 'MODULE_PATHNAME', 'gp_stop_segment'
 LANGUAGE C VOLATILE;
 
+-- The tail of the log of this node: the newest file of the logging
+-- collector, of as many lines as asked.  The superuser alone, for the
+-- log carries the texts of other users' statements
+CREATE FUNCTION gp.log_tail(lines int DEFAULT 50)
+RETURNS SETOF text
+AS 'MODULE_PATHNAME', 'gp_log_tail'
+LANGUAGE C VOLATILE STRICT;
+
+REVOKE ALL ON FUNCTION gp.log_tail(int) FROM PUBLIC;
+
 REVOKE ALL ON FUNCTION gp.stop_node() FROM PUBLIC;
 REVOKE ALL ON FUNCTION gp.stop_segment(int) FROM PUBLIC;
 
