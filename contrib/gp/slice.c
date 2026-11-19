@@ -4054,6 +4054,26 @@ gp_slice_join_all_inner_from(Query *parse)
 }
 
 /*
+ * Whether every join of the fromlist tree has the jointype: the level is
+ * a chain of one kind of an outer join, so one side of its rule decides
+ * the motions of the whole level
+ */
+static bool
+gp_slice_join_all_same_type(Node *node, JoinType *type)
+{
+	JoinExpr   *join;
+
+	if (IsA(node, RangeTblRef))
+		return true;
+	if (!IsA(node, JoinExpr))
+		return false;
+	join = (JoinExpr *) node;
+	return join->jointype == *type &&
+		gp_slice_join_all_same_type(join->larg, type) &&
+		gp_slice_join_all_same_type(join->rarg, type);
+}
+
+/*
  * Whether the motions of a derived join are worth their launches.  A join
  * whose tables are all colocated moves nothing, and joins of six tables or
  * fewer keep the size of their answer from the interconnect launches.  A
@@ -4198,6 +4218,7 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 	JoinType	jointype;
 	bool		redistributing;
 	bool		multiway = false;
+	bool		outer_same = false;
 
 	*single_segment = false;
 	*agg_stay = NULL;
@@ -4205,13 +4226,25 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 	if (!gp_slice_join_load_policies(original, tables))
 		return false;
 
+	jointype = gp_slice_join_type_of(original);
+
 	/*
-	 * A join of a level with an outer join in a sublink or below a derived
-	 * table of the fromlist is not moved at all: a broadcast side joined
-	 * per segment loses the rows of an outer join no segment sees whole
+	 * An outer join of a level with a sublink or below a derived table of
+	 * the fromlist is not moved at all: a broadcast side joined per segment
+	 * loses the rows of an outer join no segment sees whole.  A chain of
+	 * base tables joined by one kind of an outer join moves instead: the
+	 * kept side of every join of the chain is the same table, so one rule
+	 * of the two-way join decides the motions of the whole level
 	 */
+	outer_same = list_length(tables) > 2 && !original->hasSubLinks &&
+		!gp_slice_join_derived(original) &&
+		(jointype == JOIN_LEFT || jointype == JOIN_FULL) &&
+		list_length(original->jointree->fromlist) == 1 &&
+		gp_slice_join_all_same_type(linitial(original->jointree->fromlist),
+									&jointype);
 	if ((list_length(tables) != 2 || original->hasSubLinks ||
 		 gp_slice_join_derived(original)) &&
+		!outer_same &&
 		!gp_slice_join_all_inner_levels(tables))
 		return false;
 	stay = gp_slice_join_kept_side(original, tables);
@@ -4230,18 +4263,22 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 		}
 		return true;
 	}
-	redistributing = gp_slice_join_redistributable(original, tables, conds,
-												   &stay, &moves);
-	if (!redistributing && list_length(tables) > 2)
-		multiway = gp_slice_join_broadcast_component(original, tables, conds,
-													&stay, &moves);
-	else if (!redistributing && !gp_slice_join_broadcastable(tables))
-		return false;
-	if (!redistributing && list_length(tables) > 2 && !multiway)
-		return false;
-	jointype = gp_slice_join_type_of(original);
+	redistributing = false;
+	if (!outer_same)
+	{
+		redistributing = gp_slice_join_redistributable(original, tables, conds,
+													   &stay, &moves);
+		if (!redistributing && list_length(tables) > 2)
+			multiway = gp_slice_join_broadcast_component(original, tables, conds,
+														&stay, &moves);
+		else if (!redistributing && !gp_slice_join_broadcastable(tables))
+			return false;
+		if (!redistributing && list_length(tables) > 2 && !multiway)
+			return false;
+	}
 	if ((list_length(tables) != 2 || original->hasSubLinks ||
 		 gp_slice_join_derived(original)) &&
+		!outer_same &&
 		!gp_slice_join_all_inner_levels(tables))
 		return false;
 	if (redistributing)
@@ -4316,7 +4353,19 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 				return false;
 			break;
 		case JOIN_LEFT:
-			if (!gp_slice_redistribute_rte(original, stay, move, true))
+			if (list_length(tables) > 2)
+			{
+				foreach(lc, tables)
+				{
+					move = lfirst(lc);
+
+					if (move == stay || move->policy.replicated)
+						continue;
+					if (!gp_slice_redistribute_rte(original, stay, move, true))
+						return false;
+				}
+			}
+			else if (!gp_slice_redistribute_rte(original, stay, move, true))
 				return false;
 			break;
 		case JOIN_RIGHT:
@@ -4324,8 +4373,24 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 				return false;
 			break;
 		case JOIN_FULL:
-			if (!gp_slice_redistribute_rte(original, stay, move, true) ||
-				!gp_slice_redistribute_rte(original, move, stay, true))
+			if (list_length(tables) > 2)
+			{
+				/*
+				 * The slice runs on one segment, so every table, the
+				 * first included, must be whole there
+				 */
+				foreach(lc, tables)
+				{
+					move = lfirst(lc);
+
+					if (move->policy.replicated)
+						continue;
+					if (!gp_slice_redistribute_rte(original, stay, move, true))
+						return false;
+				}
+			}
+			else if (!gp_slice_redistribute_rte(original, stay, move, true) ||
+					 !gp_slice_redistribute_rte(original, move, stay, true))
 				return false;
 			*single_segment = true;
 			break;

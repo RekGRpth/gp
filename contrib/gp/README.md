@@ -801,6 +801,7 @@ start their own clusters:
 | `050_log_tail.pl` | The log of any node of the cluster is read through SQL: the tail of the newest log file of the logging collector, of as many lines as asked; a node without the collector refuses with a hint, the segment answers from its own log, and the read is for the superuser alone |
 | `051_node_state.pl` | The state of the nodes through SQL: every segment answers `up`, a stopped one answers `down` with the reason and comes back live with its own start, the addresses are the ones the cluster knows, and an ordinary role reads the state |
 | `052_alter_system.pl` | A parameter of the whole cluster through SQL: `gp.alter_system()` reaches every node and `gp.reload_conf()` makes it served, a quoted value survives the trip, an unknown parameter changes nothing, the functions are for the superuser alone, and a segment refuses them |
+| `053_multiway_outer.pl` | A chain of base tables joined by one kind of an outer join keeps the rows its every join keeps: a left join chain stays on the segments with the first table and broadcasts the rest, a full join chain broadcasts everything to one segment, null keys keep their rows, mixed levels and aggregates of null-supplying columns stay on the coordinator, and the answers match the coordinator |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
