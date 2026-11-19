@@ -730,6 +730,9 @@ All are set at server start unless noted.
 | `gp.stop_node()` | Stop the server of the node the function runs on, the way `pg_ctl -m fast` does; the node is expected back with its own start |
 | `gp.stop_segment(segment_id)` | The stop of `gp.stop_node()`, dispatched to a segment from the coordinator |
 | `gp.log_tail(lines)` | The tail of the newest log file of the logging collector of this node; a node without the collector refuses with a hint of what to turn on |
+| `gp.alter_system(name, value)` | Write a parameter into `postgresql.auto.conf` of every node, the way `ALTER SYSTEM` writes one node; takes effect with `gp.reload_conf()` |
+| `gp.reset_system(name)` | Undo `gp.alter_system()` on every node |
+| `gp.reload_conf()` | Reread the configuration files of every node, so a written parameter takes effect without a restart |
 | `gp.exec_on_all(sql)` | Run a command on all segments, return the status of each |
 | `gp.recorded_oids()` | OIDs of the new catalog rows of the transaction on the coordinator |
 | `gp.distribute(table, key, colocate_with, segment)` | Distribute an empty table by hash of `key`, or replicate it, or pin it to a segment |
@@ -740,7 +743,8 @@ All are set at server start unless noted.
 | `gp.dispatches()` | How many statements and row streams of this session have gone to the segments.  A query over the tables that keep their rows on the coordinator leaves it unchanged |
 
 `gp.register_segment()`, `gp.exec_on_all()`, `gp.distribute()`, `gp.stop_node()`,
-`gp.stop_segment()` and `gp.log_tail()` are for superusers only.
+`gp.stop_segment()`, `gp.log_tail()`, `gp.alter_system()`, `gp.reset_system()`
+and `gp.reload_conf()` are for superusers only.
 
 ## Tests
 
@@ -796,6 +800,7 @@ start their own clusters:
 | `049_stop_node.pl` | A node stops without ssh: the superuser asks the coordinator, which dispatches the stop to the segment, and the segment sends the fast shutdown to its own server; the segment comes back with its own start and registers again, the coordinator refuses to stop itself this way, and the functions are for the superuser alone |
 | `050_log_tail.pl` | The log of any node of the cluster is read through SQL: the tail of the newest log file of the logging collector, of as many lines as asked; a node without the collector refuses with a hint, the segment answers from its own log, and the read is for the superuser alone |
 | `051_node_state.pl` | The state of the nodes through SQL: every segment answers `up`, a stopped one answers `down` with the reason and comes back live with its own start, the addresses are the ones the cluster knows, and an ordinary role reads the state |
+| `052_alter_system.pl` | A parameter of the whole cluster through SQL: `gp.alter_system()` reaches every node and `gp.reload_conf()` makes it served, a quoted value survives the trip, an unknown parameter changes nothing, the functions are for the superuser alone, and a segment refuses them |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
@@ -854,8 +859,9 @@ by the patch and `contrib/gp`.
    segment, and the planner uses the imported cluster sizes.
 8. **More kinds of distribution** — replicated with the coordinator, on the
    coordinator only, on one segment.
-9. **Management without ssh** — systemd units, cluster state views,
-   settings on all servers.
+9. **Management without ssh** — done: systemd units, the state of the
+   nodes, the stop of a node, the tail of a log, and settings on all
+   servers.
 
 Later: mirrors, growing and shrinking the cluster by moving buckets,
 two-stage aggregates, range and list distribution.

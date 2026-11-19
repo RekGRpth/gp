@@ -2,6 +2,7 @@
 # Licensed under the PostgreSQL License, see LICENSE
 
 gp_sources = files(
+  'config.c',
   'copy.c',
   'ddl.c',
   'dispatch.c',
@@ -110,6 +111,7 @@ tests += {
       't/049_stop_node.pl',
       't/050_log_tail.pl',
       't/051_node_state.pl',
+      't/052_alter_system.pl',
     ],
   },
 }

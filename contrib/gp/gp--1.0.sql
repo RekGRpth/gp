@@ -287,6 +287,29 @@ RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'gp_node_state'
 LANGUAGE C VOLATILE;
 
+-- A parameter of all the nodes of the cluster, written the way ALTER
+-- SYSTEM writes one node, without ssh.  The superuser alone
+CREATE FUNCTION gp.alter_system(name text, value text)
+RETURNS void
+AS 'MODULE_PATHNAME', 'gp_alter_system'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION gp.reset_system(name text)
+RETURNS void
+AS 'MODULE_PATHNAME', 'gp_reset_system'
+LANGUAGE C VOLATILE STRICT;
+
+-- Reread the configuration files of every node, so a parameter written by
+-- gp.alter_system() takes effect without a restart.  The superuser alone
+CREATE FUNCTION gp.reload_conf()
+RETURNS void
+AS 'MODULE_PATHNAME', 'gp_reload_conf'
+LANGUAGE C VOLATILE;
+
+REVOKE ALL ON FUNCTION gp.alter_system(text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION gp.reset_system(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION gp.reload_conf() FROM PUBLIC;
+
 -- Run one pass of the recovery of the transactions the segments keep
 -- prepared
 CREATE FUNCTION gp.recovery_pass_now()
