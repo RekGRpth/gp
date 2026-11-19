@@ -726,6 +726,7 @@ All are set at server start unless noted.
 |---|---|
 | `gp.register_segment(segment_id, host, port)` | Register a segment; called by the segment itself |
 | `gp.cluster_segments()` | Segments as the coordinator knows them, with the port of each interconnect broker, from any database |
+| `gp.node_state()` | The state of the nodes of the cluster: a short connection of the coordinator tells a live segment from a dead one, with the reason; open to anyone |
 | `gp.exec_on_all(sql)` | Run a command on all segments, return the status of each |
 | `gp.recorded_oids()` | OIDs of the new catalog rows of the transaction on the coordinator |
 | `gp.distribute(table, key, colocate_with, segment)` | Distribute an empty table by hash of `key`, or replicate it, or pin it to a segment |
@@ -784,6 +785,7 @@ start their own clusters:
 | `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by expressions and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole on this path |
 | `042_correlated_locus.pl` | Correlated and nested subqueries: exact ancestor ownership, colocated and replicated inputs, two-way and multiway Motion in the owning query level, uncorrelated hashed scalar broadcast, partial, stationary-key and redistributed aggregates, independent sibling broadcast, differential answers, and the outer-join fallback |
 | `044_tpch.pl` | All 22 TPC-H queries on a small deterministic data set: every answer matches ordinary `local_*` tables, and the expected set of distributed-slice plans is fixed. Query texts come from DuckDB 1.5.4 `extension/tpch/dbgen/queries`; this is a correctness and plan regression, not a dbgen or performance benchmark |
+| `051_node_state.pl` | The state of the nodes through SQL: every segment answers `up`, a stopped one answers `down` with the reason and comes back live with its own start, the addresses are the ones the cluster knows, and an ordinary role reads the state |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show

@@ -17,6 +17,7 @@ gp_sources = files(
   'route.c',
   'segments.c',
   'slice.c',
+  'state.c',
   'stats.c',
 )
 
@@ -108,6 +109,7 @@ tests += {
       't/048_segment_pinned.pl',
       't/049_stop_node.pl',
       't/050_log_tail.pl',
+      't/051_node_state.pl',
     ],
   },
 }

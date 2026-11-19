@@ -18,6 +18,7 @@ OBJS = \
 	route.o \
 	segments.o \
 	slice.o \
+	state.o \
 	stats.o
 
 EXTENSION = gp
