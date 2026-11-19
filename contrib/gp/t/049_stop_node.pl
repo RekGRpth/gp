@@ -73,7 +73,16 @@ is(on_segments('SELECT count(*) FROM p'), '5 0 0',
 # gp.stop_node on a segment stops that server alone; it comes back and
 # registers again
 {
-	is($segments[2]->safe_psql('postgres', 'SELECT gp.stop_node()'), 'stopping',
+	# The answer races the shutdown of the node: the node reports the
+	# stop, or the fast shutdown takes its own session's connection
+	# first.  Both mean the stop began; the pid file below tells it
+	# completed
+	my ($ret, $stdout, $stderr);
+	$ret = $segments[2]->psql('postgres', 'SELECT gp.stop_node()',
+		stdout => \$stdout, stderr => \$stderr,
+		on_error_stop => 0, on_error_die => 0);
+	ok($stdout eq 'stopping' ||
+	   $stderr =~ /terminating connection due to administrator command|server closed the connection/,
 		'the node reports the stop');
 	for (my $i = 0; -e $segments[2]->data_dir . '/postmaster.pid' && $i < 30; $i++)
 	{
