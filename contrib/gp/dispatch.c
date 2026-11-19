@@ -1824,6 +1824,7 @@ gp_stop_segment(PG_FUNCTION_ARGS)
 	int			segment_id = PG_GETARG_INT32(0);
 	GpQuery    *query;
 	PGresult   *res;
+	MemoryContext oldcontext;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -1842,6 +1843,8 @@ gp_stop_segment(PG_FUNCTION_ARGS)
 	 * statement was dispatched.  Anything else is an error of its own and
 	 * is thrown again
 	 */
+	oldcontext = CurrentMemoryContext;
+
 	PG_TRY();
 	{
 		while ((res = gp_query_next(query)) != NULL)
@@ -1853,7 +1856,11 @@ gp_stop_segment(PG_FUNCTION_ARGS)
 	}
 	PG_CATCH();
 	{
-		ErrorData  *err = CopyErrorData();
+		ErrorData  *err;
+
+		/* A catch block runs in ErrorContext, which CopyErrorData refuses */
+		MemoryContextSwitchTo(oldcontext);
+		err = CopyErrorData();
 
 		if (err->sqlerrcode != ERRCODE_ADMIN_SHUTDOWN &&
 			err->sqlerrcode != ERRCODE_CONNECTION_FAILURE &&
