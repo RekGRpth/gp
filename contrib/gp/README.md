@@ -727,6 +727,9 @@ All are set at server start unless noted.
 | `gp.register_segment(segment_id, host, port)` | Register a segment; called by the segment itself |
 | `gp.cluster_segments()` | Segments as the coordinator knows them, with the port of each interconnect broker, from any database |
 | `gp.node_state()` | The state of the nodes of the cluster: a short connection of the coordinator tells a live segment from a dead one, with the reason; open to anyone |
+| `gp.stop_node()` | Stop the server of the node the function runs on, the way `pg_ctl -m fast` does; the node is expected back with its own start |
+| `gp.stop_segment(segment_id)` | The stop of `gp.stop_node()`, dispatched to a segment from the coordinator |
+| `gp.log_tail(lines)` | The tail of the newest log file of the logging collector of this node; a node without the collector refuses with a hint of what to turn on |
 | `gp.exec_on_all(sql)` | Run a command on all segments, return the status of each |
 | `gp.recorded_oids()` | OIDs of the new catalog rows of the transaction on the coordinator |
 | `gp.distribute(table, key, colocate_with, segment)` | Distribute an empty table by hash of `key`, or replicate it, or pin it to a segment |
@@ -736,8 +739,8 @@ All are set at server start unless noted.
 | `gp.segment_id()` | The segment this server is: 0 on the coordinator, and its number on a segment.  A row of a distributed table keeps its segment, but no query tells it yet: that comes with the pushdown of the MPP planner |
 | `gp.dispatches()` | How many statements and row streams of this session have gone to the segments.  A query over the tables that keep their rows on the coordinator leaves it unchanged |
 
-`gp.register_segment()`, `gp.exec_on_all()` and `gp.distribute()` are for
-superusers only.
+`gp.register_segment()`, `gp.exec_on_all()`, `gp.distribute()`, `gp.stop_node()`,
+`gp.stop_segment()` and `gp.log_tail()` are for superusers only.
 
 ## Tests
 
@@ -784,7 +787,14 @@ start their own clusters:
 | `037_distinct_locus.pl` | `DISTINCT` and `DISTINCT ON`: the whole distribution key in the output, compound keys and their prefixes, replicated inputs, and `Unique` kept above the distributed scan to preserve ordering |
 | `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by expressions and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole on this path |
 | `042_correlated_locus.pl` | Correlated and nested subqueries: exact ancestor ownership, colocated and replicated inputs, two-way and multiway Motion in the owning query level, uncorrelated hashed scalar broadcast, partial, stationary-key and redistributed aggregates, independent sibling broadcast, differential answers, and the outer-join fallback |
+| `043_multiway_broadcast.pl` | A multiway join keeps a colocated component and broadcasts the other hashed tables to every segment; replicated inputs need no Motion, and the answer is checked against the coordinator over and over, for a multiway slice was once seen racing |
 | `044_tpch.pl` | All 22 TPC-H queries on a small deterministic data set: every answer matches ordinary `local_*` tables, and the expected set of distributed-slice plans is fixed. Query texts come from DuckDB 1.5.4 `extension/tpch/dbgen/queries`; this is a correctness and plan regression, not a dbgen or performance benchmark |
+| `045_initplan_locus.pl` | An init plan that aggregates over the gather of one distributed table is answered by the segments with partial columns: every segment answers a partial sum and a partial count of the average, and the final aggregate of the init plan reads them |
+| `046_sublink_antijoin.pl` | A join the sublinks drive alone — a semi, anti or scalar sublink over other tables — keeps the table of the fromlist and broadcasts every table of a sublink whole: the rows of the answer are the rows of the kept table, so a customer with an order on another segment is not kept |
+| `047_replicated_copy.pl` | A replicated table keeps a copy on the coordinator: every write reaches the segments and the copy beside, and every read of such a table takes the copy alone, without a word to the segments, which `gp.dispatches()` proves |
+| `048_segment_pinned.pl` | A table pinned to a segment keeps every row on that segment alone: the buckets of its own colocation group all point there, the reads gather from it alone, and the writes reach it by the ordinary routing; the pin is refused without a registered segment, without a key, and with a table that is not empty |
+| `049_stop_node.pl` | A node stops without ssh: the superuser asks the coordinator, which dispatches the stop to the segment, and the segment sends the fast shutdown to its own server; the segment comes back with its own start and registers again, the coordinator refuses to stop itself this way, and the functions are for the superuser alone |
+| `050_log_tail.pl` | The log of any node of the cluster is read through SQL: the tail of the newest log file of the logging collector, of as many lines as asked; a node without the collector refuses with a hint, the segment answers from its own log, and the read is for the superuser alone |
 | `051_node_state.pl` | The state of the nodes through SQL: every segment answers `up`, a stopped one answers `down` with the reason and comes back live with its own start, the addresses are the ones the cluster knows, and an ordinary role reads the state |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
