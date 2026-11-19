@@ -112,6 +112,7 @@ tests += {
       't/050_log_tail.pl',
       't/051_node_state.pl',
       't/052_alter_system.pl',
+      't/053_multiway_outer.pl',
     ],
   },
 }
