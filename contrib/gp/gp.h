@@ -153,12 +153,12 @@ extern char *gp_interconnect_plan(const char *sql);
 extern GpSnapshots *gp_interconnect_snapshots(void);
 extern void gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
 								  const char *db, const char *user, const char *sql,
-								  const char *host, int port, int requester,
-								  GpSnapshots *snapshots);
+								  const char *host, int port, int segment_id,
+								  int requester, GpSnapshots *snapshots);
 extern bool gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 								  const char *db, const char *user, const char *sql,
-								  const char *host, int port, int requester,
-								  GpSnapshots *snapshots);
+								  const char *host, int port, int segment_id,
+								  int requester, GpSnapshots *snapshots);
 
 /* recovery.c */
 extern void gp_recovery_init(void);

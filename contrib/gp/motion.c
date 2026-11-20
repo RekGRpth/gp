@@ -192,7 +192,7 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 						   segment_id));
 		gp_interconnect_query(store, tupdesc, db,
 							  GetUserNameFromId(GetUserId(), false), serialized,
-							  host, broker, requester, snapshots);
+							  host, broker, segment_id, requester, snapshots);
 	}
 
 	PQclear(segments);
