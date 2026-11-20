@@ -425,20 +425,29 @@ STARTING, READY, ASSIGNED and BUSY back to FREE, and the broker reaps stopped
 workers.  Nested Motion to the same segment therefore gets another worker
 instead of waiting for a busy single listener.
 
-All autonomous readers of one statement share one snapshot per segment.
-Before the first of them starts, and under the statement's distributed
-commit-exclusion lock, the coordinator opens a separate READ ONLY REPEATABLE
-READ connection to every segment and exports a snapshot there.  The request
-carries the whole segment-to-export mapping, for a root worker must pass it to
-its nested motions.  Each worker makes its transaction READ ONLY, imports the
-export of its own segment before its first snapshot, and forwards the mapping
-to its children.  No MVCC snapshot crosses a server boundary: transaction IDs
-of different servers have no meaning for one another.  The holder connections
-do not join the dispatched transaction or change its write state, and close at
-the end of the statement, its abort and its cancellation.  Thus a root and all
-its sibling and self-motion readers on one segment see exactly the same rows;
-the existing lock keeps distributed commits from appearing between the exports
-of different segments.
+All readers of one statement share one snapshot per segment.  Before the
+first of them starts, and under the statement's distributed commit-exclusion
+lock, the coordinator opens a separate READ ONLY REPEATABLE READ connection
+to every segment and exports a snapshot there.  No MVCC snapshot crosses a
+server boundary: transaction IDs of different servers have no meaning for one
+another.  The holder connections do not join the dispatched transaction or
+change its write state, and close at the end of the statement, its abort and
+its cancellation.  The existing lock keeps distributed commits from appearing
+between the exports of different segments.
+
+An autonomous worker makes its transaction READ ONLY, imports the export of
+its own segment before its first snapshot, and forwards the mapping to its
+children; the request carries the whole segment-to-export mapping, for a root
+worker must pass it to its nested motions.  A fragment on the libpq path
+receives the mapping in its transaction instead: the dispatcher attaches it
+with `gp.attach_statement_snapshots()` before the fragment, importing the
+export of the segment unless the transaction has read already (a transaction
+snapshot of the coordinator has fixed the state anyway), and a fragment with
+a local transaction of its own commits it at the end.  The mapping lives in
+the backend until the end of the transaction, so a stale export is never
+read.  DML fragments that move rows attach the mapping the same way, in the
+same batch as their `INSERT`.  Thus a root, its sibling and self-motion
+readers, and the scans of a dispatched fragment see exactly the same rows.
 
 A cancelled query takes its fragments with it.  A client reads and writes
 its socket over waits on its latch, for no signal handler of `pqsignal`
@@ -802,6 +811,7 @@ start their own clusters:
 | `051_node_state.pl` | The state of the nodes through SQL: every segment answers `up`, a stopped one answers `down` with the reason and comes back live with its own start, the addresses are the ones the cluster knows, and an ordinary role reads the state |
 | `052_alter_system.pl` | A parameter of the whole cluster through SQL: `gp.alter_system()` reaches every node and `gp.reload_conf()` makes it served, a quoted value survives the trip, an unknown parameter changes nothing, the functions are for the superuser alone, and a segment refuses them |
 | `053_multiway_outer.pl` | A chain of base tables joined by one kind of an outer join keeps the rows its every join keeps: a left join chain stays on the segments with the first table and broadcasts the rest, a full join chain broadcasts everything to one segment, null keys keep their rows, mixed levels and aggregates of null-supplying columns stay on the coordinator, and the answers match the coordinator |
+| `054_fragment_snapshots.pl` | A fragment of a slice with motions attaches the exported snapshots of its statement: pull workers parked through a segment-local commit answer from the state before it, never a mix of both, and the next statement sees the commit |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show

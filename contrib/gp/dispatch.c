@@ -432,6 +432,25 @@ gp_snapshots_free(GpSnapshots *snapshots)
 }
 
 /*
+ * The snapshot map as "segment:name" pairs separated by semicolons, for
+ * gp.attach_statement_snapshots().  Names hold hexadecimal characters and
+ * hyphens only, so the result needs no quoting beyond the caller's.
+ */
+char *
+gp_snapshots_serialize(GpSnapshots *snapshots)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	for (int i = 0; i < snapshots->count; i++)
+		appendStringInfo(&buf, "%s%d:%s",
+						 i == 0 ? "" : ";",
+						 snapshots->entries[i].segment_id,
+						 snapshots->entries[i].name);
+	return buf.data;
+}
+
+/*
  * Export one snapshot on every segment before any reader starts.  A dedicated
  * READ ONLY holder keeps each export alive without joining the transaction of
  * the dispatched connections.  The commit-exclusion lock is already held by
@@ -1245,7 +1264,8 @@ gp_connections_ready(GpSegment **segments, GpConnection ***entries, int only)
 }
 
 static void gp_dispatch_xact_rows_impl(const char *sql, uint64 *rows,
-									 bool user_dml);
+									 bool user_dml,
+									 const char *snapshots);
 
 /*
  * Run a command on all segments in the transactions that follow the
@@ -1254,14 +1274,26 @@ static void gp_dispatch_xact_rows_impl(const char *sql, uint64 *rows,
 void
 gp_dispatch_xact(const char *sql)
 {
-	gp_dispatch_xact_rows_impl(sql, NULL, false);
+	gp_dispatch_xact_rows_impl(sql, NULL, false, NULL);
 }
 
 /* User DML, unlike maintenance DDL, needs a transaction-wide snapshot */
 void
 gp_dispatch_xact_rows(const char *sql, uint64 *rows)
 {
-	gp_dispatch_xact_rows_impl(sql, rows, true);
+	gp_dispatch_xact_rows_impl(sql, rows, true, NULL);
+}
+
+/*
+ * User DML whose fragments move rows between the segments: attach the
+ * statement snapshots to every fragment, so its motions read the same
+ * state as its own scans
+ */
+void
+gp_dispatch_xact_rows_snapshots(const char *sql, uint64 *rows,
+								const char *snapshots)
+{
+	gp_dispatch_xact_rows_impl(sql, rows, true, snapshots);
 }
 
 /*
@@ -1282,7 +1314,8 @@ gp_xact_begin(void)
  * of the rows the segments changed, as the command tags of them say
  */
 static void
-gp_dispatch_xact_rows_impl(const char *sql, uint64 *rows, bool user_dml)
+gp_dispatch_xact_rows_impl(const char *sql, uint64 *rows, bool user_dml,
+						   const char *snapshots)
 {
 	GpSegment  *segments;
 	GpConnection **entries;
@@ -1298,8 +1331,14 @@ gp_dispatch_xact_rows_impl(const char *sql, uint64 *rows, bool user_dml)
 	results = palloc0_array(PGresult *, nsegments);
 	for (int i = 0; i < nsegments; i++)
 	{
-		commands[i] = entries[i]->in_xact ? (char *) sql :
-			psprintf("%s; %s", gp_xact_begin(), sql);
+		if (snapshots != NULL)
+			commands[i] = psprintf(
+				"%sSELECT gp.attach_statement_snapshots('%s'); %s",
+				entries[i]->in_xact ? "" : "BEGIN; ",
+				snapshots, sql);
+		else
+			commands[i] = entries[i]->in_xact ? (char *) sql :
+				psprintf("%s; %s", gp_xact_begin(), sql);
 		entries[i]->in_xact = true;
 	}
 	ndispatched++;
@@ -1437,6 +1476,9 @@ struct GpQuery
 	PGresult  **first;			/* the first result of each segment, which
 								 * gp_query_start() took under the lock of the
 								 * distributed snapshot */
+	bool		attached;		/* the statement snapshots were attached */
+	bool	   *local;			/* per segment: a transaction the query began
+								 * itself and must commit */
 };
 
 /*
@@ -1449,7 +1491,7 @@ struct GpQuery
  * transaction has written.
  */
 GpQuery *
-gp_query_start(const char *sql, int only)
+gp_query_start(const char *sql, int only, GpSnapshots *snapshots)
 {
 	GpQuery    *query = palloc0_object(GpQuery);
 	GpConnection **entries;
@@ -1458,6 +1500,10 @@ gp_query_start(const char *sql, int only)
 	gp_dtx_require_xact_snapshot();
 	query->nsegments = gp_connections_ready(&query->segments, &entries, only);
 	query->first = palloc0_array(PGresult *, query->nsegments);
+	query->local = palloc0_array(bool, query->nsegments);
+
+	PG_TRY();
+	{
 
 	/* A transaction snapshot must be the same on every later statement */
 	if (IsolationUsesXactSnapshot())
@@ -1487,6 +1533,52 @@ gp_query_start(const char *sql, int only)
 		}
 	}
 
+	/* A fragment with motions reads through interconnect workers, which
+	 * import the statement snapshots.  Attach the map to the fragment
+	 * itself, in its transaction, so its own scans see the same state:
+	 * either inside the transaction of the coordinator, or in a local
+	 * transaction the query begins and commits itself. */
+	if (snapshots != NULL)
+	{
+		char	   *attach = psprintf(
+			"SELECT gp.attach_statement_snapshots('%s')",
+			gp_snapshots_serialize(snapshots));
+
+		query->attached = true;
+		for (int i = 0; i < query->nsegments; i++)
+		{
+			PGconn	   *conn = entries[i]->conn;
+			const char *command = attach;
+			PGresult   *res;
+
+			if (!entries[i]->in_xact)
+			{
+				command = psprintf("BEGIN; %s", attach);
+				query->local[i] = true;
+			}
+			if (!PQsendQuery(conn, command))
+				ereport(ERROR,
+						errcode(ERRCODE_CONNECTION_FAILURE),
+						errmsg("lost the connection to segment %d at %s:%d",
+							   query->segments[i].segment_id,
+							   query->segments[i].host,
+							   query->segments[i].port),
+						errdetail_internal("%s", pchomp(PQerrorMessage(conn))));
+			while ((res = libpqsrv_get_result(conn, wait_event_result)) != NULL)
+			{
+				if (PQresultStatus(res) != PGRES_COMMAND_OK &&
+					PQresultStatus(res) != PGRES_TUPLES_OK)
+					ereport(ERROR,
+							errcode(ERRCODE_CONNECTION_FAILURE),
+							errmsg("could not attach the statement snapshots on segment %d",
+								   query->segments[i].segment_id),
+							errdetail_internal("%s",
+											   pchomp(PQresultErrorMessage(res))));
+				PQclear(res);
+			}
+		}
+	}
+
 	for (int i = 0; i < query->nsegments; i++)
 	{
 		PGconn	   *conn = entries[i]->conn;
@@ -1511,7 +1603,7 @@ gp_query_start(const char *sql, int only)
 	if (query->nsegments > 0)
 	{
 		LWLockAcquire(&dtx_shared->lock, LW_SHARED);
-		PG_TRY();
+		PG_TRY(dtqx);
 		{
 			for (int i = 0; i < query->nsegments; i++)
 			{
@@ -1523,13 +1615,61 @@ gp_query_start(const char *sql, int only)
 													  wait_event_result);
 			}
 		}
-		PG_FINALLY();
+		PG_FINALLY(dtqx);
 		{
 			LWLockRelease(&dtx_shared->lock);
 		}
-		PG_END_TRY();
+		PG_END_TRY(dtqx);
 	}
+	}
+	PG_CATCH();
+	{
+		gp_query_end(query);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	return query;
+}
+
+/*
+ * End the local transactions that gp_query_start() began for the statement
+ * snapshots, draining whatever they still hold.  Safe on the success path
+ * (gp_query_next() already committed each finished segment) and required on
+ * the error path, where an unfinished query would otherwise leave its
+ * segments in a transaction the pool does not know about.
+ */
+void
+gp_query_end(GpQuery *query)
+{
+	if (query == NULL || !query->attached)
+		return;
+
+	PG_TRY();
+	{
+		for (int i = 0; i < query->nsegments; i++)
+		{
+			GpConnection *entry;
+			PGresult   *res;
+
+			if (!query->local[i])
+				continue;
+			query->local[i] = false;
+			entry = hash_search(connections, &query->segments[i].segment_id,
+								HASH_FIND, NULL);
+			if (entry == NULL)
+				continue;
+			if (PQsendQuery(entry->conn, "COMMIT"))
+				while ((res = libpqsrv_get_result(entry->conn,
+												  wait_event_result)) != NULL)
+					PQclear(res);
+			entry->busy = false;
+		}
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -1835,7 +1975,7 @@ gp_stop_segment(PG_FUNCTION_ARGS)
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				errmsg("the coordinator has no number: stop it as an ordinary server"));
 
-	query = gp_query_start("SELECT gp.stop_node()", segment_id);
+	query = gp_query_start("SELECT gp.stop_node()", segment_id, NULL);
 
 	/*
 	 * The answer may come back before the node is down, or the going-away

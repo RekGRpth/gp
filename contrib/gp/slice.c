@@ -725,7 +725,14 @@ gp_slice_load_libpq(GpSliceState *state)
 		only = segments[MyProcPid % n].segment_id;
 	}
 
-	query = gp_query_start(state->sql, only);
+	/* A fragment with motions reads its peers through interconnect workers
+	 * that import the statement snapshots; attach the map to the fragment
+	 * itself, so its own scans see the same distributed state */
+	query = gp_query_start(state->sql, only,
+						   state->motion ?
+						   gp_dtx_statement_snapshots(ss->ps.state) : NULL);
+	PG_TRY();
+	{
 	while ((res = gp_query_next(query)) != NULL)
 	{
 		MemoryContext oldcontext;
@@ -766,6 +773,12 @@ gp_slice_load_libpq(GpSliceState *state)
 
 	ExecDropSingleTupleTableSlot(loadslot);
 	MemoryContextDelete(rowcxt);
+	}
+	PG_FINALLY();
+	{
+		gp_query_end(query);
+	}
+	PG_END_TRY();
 }
 
 /* Run a clean immutable fragment in autonomous interconnect workers */

@@ -217,7 +217,7 @@ gp_stats_relation(Oid relid, bool replicated)
 	query = gp_query_start(psprintf(
 		"SELECT relpages::text, reltuples::text, "
 		"relallvisible::text, relallfrozen::text "
-		"FROM pg_catalog.pg_class WHERE oid = %u", relid), 0);
+		"FROM pg_catalog.pg_class WHERE oid = %u", relid), 0, NULL);
 	while ((res = gp_query_next(query)) != NULL)
 	{
 		if (PQnfields(res) != 4 || PQntuples(res) != 1)
@@ -271,7 +271,7 @@ gp_stats_attributes(Oid relid, int only)
 		"FROM pg_catalog.pg_stats s "
 		"JOIN pg_catalog.pg_attribute a "
 		"ON a.attrelid = s.tableid AND a.attname = s.attname "
-		"WHERE s.tableid = %u ORDER BY a.attnum, s.inherited", relid), only);
+		"WHERE s.tableid = %u ORDER BY a.attnum, s.inherited", relid), only, NULL);
 	while ((res = gp_query_next(query)) != NULL)
 	{
 		StringInfoData sql;

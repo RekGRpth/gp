@@ -229,7 +229,7 @@ gp_gather_load_libpq(GpGatherState *state)
 		only = state->only;
 	}
 
-	query = gp_query_start(state->sql, only);
+	query = gp_query_start(state->sql, only, NULL);
 	while ((res = gp_query_next(query)) != NULL)
 	{
 		MemoryContext oldcontext;

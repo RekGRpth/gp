@@ -113,6 +113,7 @@ tests += {
       't/051_node_state.pl',
       't/052_alter_system.pl',
       't/053_multiway_outer.pl',
+      't/054_fragment_snapshots.pl',
     ],
   },
 }
