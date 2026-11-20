@@ -65,7 +65,7 @@
 
 #include "gp.h"
 
-#define GP_IC_MAGIC "GPIC0003"
+#define GP_IC_MAGIC "GPIC0004"
 #define GP_IC_MAGIC_LEN 8
 #define GP_IC_MAX_STRING (16 * 1024 * 1024)
 #define GP_IC_MAX_FIELD (1024 * 1024 * 1024)
@@ -790,9 +790,21 @@ gp_ic_serve(pgsocket fd, const char *token, int slot_id, uint64 *request_id)
 			gp_ic_shutdown_write(fd);
 			restart = true;
 		}
-		/* No executor or snapshot runs before the client confirms GO */
-		if (!restart && gp_ic_write_message(fd, GP_IC_READY, NULL, 0) &&
-			gp_ic_read(fd, &go, 1) && go == GP_IC_GO)
+		/* No executor or snapshot runs before the client confirms GO.
+		 * READY names the segment of the worker: a motion that asked
+		 * one segment and hears another crossed on its way to the
+		 * address of the cluster map and must not read the rows of a
+		 * wrong answer silently */
+		if (!restart)
+		{
+			int32		net_segment = htonl(gp_segment_id);
+
+			restart = !(gp_ic_write_message(fd, GP_IC_READY,
+											 &net_segment,
+											 sizeof(net_segment)) &&
+						gp_ic_read(fd, &go, 1) && go == GP_IC_GO);
+		}
+		if (!restart)
 		{
 			snprintf(set, sizeof(set), "SET gp.requester_segment = %d", requester);
 			/* Tests stop a fragment here to see its cancellation */
@@ -2045,8 +2057,20 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 					retry = true;
 				else if (type == GP_IC_RETRY && len == 0)
 					retry = true;
-				else if (type == GP_IC_READY && len == 0)
+				else if (type == GP_IC_READY && len == sizeof(int32))
 				{
+					int32		net_segment;
+					int			answered;
+
+					memcpy(&net_segment, data, sizeof(net_segment));
+					answered = (int) ntohl(net_segment);
+					if (answered != segment_id)
+						ereport(ERROR,
+								(errcode(ERRCODE_DATA_CORRUPTED),
+								 errmsg("interconnect request %llu asked segment %d at %s:%d and heard segment %d",
+										(unsigned long long) request_id,
+										segment_id, host, port, answered),
+								 errdetail("The address of the cluster map crossed to another segment.")));
 					if (!gp_ic_write_latched(fd, wes, &go, 1))
 						ereport(ERROR,
 								errcode(ERRCODE_CONNECTION_FAILURE),
