@@ -758,7 +758,11 @@ and `gp.reload_conf()` are for superusers only.
 ## Tests
 
 `sql/gp.sql` runs on a single server with `gp` preloaded.  TAP tests in `t/`
-start their own clusters.  `GpTest::same_answers()` compares the answer of a
+start their own clusters: a segment is a node named `segment-N-PORT`, the
+name it gets as cluster_name, so the processes and the logs of a run name
+their port, as do the directories of the demo cluster of
+`tools/gp-cluster.sh`.  `GpTest::start_cluster()` starts a coordinator and
+the segments with these settings, and `GpTest::same_answers()` compares the answer of a
 distributed query with the answer of its local copy and, on a mismatch, leaves
 the facts in the log before the cluster goes away: the two answers, a fresh
 repeat, the answer of every segment over its own rows, the state of the nodes

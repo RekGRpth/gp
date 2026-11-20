@@ -21,8 +21,8 @@
 #   PGBIN           directory of initdb, pg_ctl and psql of a server built
 #                   with contrib/gp; taken from pg_config in PATH by default
 #
-# A segment is named segment-N, its directory in the cluster directory
-# and its cluster_name, which carries the port of the node, alike.  The other commands take the nodes from the
+# A segment is named segment-N, and its directory and its cluster_name
+# carry the port of the node alike, as in the TAP tests.  The other commands take the nodes from the
 # file "nodes", which init writes to the cluster directory.
 #
 # Copyright (c) 2026, Georgy Shelkovy
@@ -61,9 +61,16 @@ psql_coordinator()
 		-d postgres "$@"
 }
 
+# The data directory of a node: its name carries the port, as in the TAP
+# tests, so a glance at the cluster directory tells the port of every node
+node_dir()
+{
+	echo "$dir/$1-$(awk -v n="$1" '$1 == n {print $2; exit}' "$nodes")"
+}
+
 running()
 {
-	"$PGBIN/pg_ctl" status -D "$dir/$1" >/dev/null 2>&1
+	"$PGBIN/pg_ctl" status -D "$(node_dir "$1")" >/dev/null 2>&1
 }
 
 cmd_init()
@@ -95,15 +102,15 @@ cmd_init()
 		# the plans that some of them print come out only after one.  The
 		# suite can run faster than autovacuum wakes up at its default, so
 		# the nodes wake it up more often.
-		"$PGBIN/initdb" --pgdata "$dir/$name" --auth trust --no-instructions \
+		"$PGBIN/initdb" --pgdata "$dir/$name-$nport" --auth trust --no-instructions \
 			-c shared_preload_libraries=gp \
 			-c "gp.role=$role" \
 			"$@" \
 			-c "port=$nport" \
-			-c "cluster_name=$name $nport" \
+			-c "cluster_name=$name-$nport" \
 			-c autovacuum_naptime=5s \
-			>"$dir/$name.initdb.log" 2>&1 ||
-			die "initdb $name failed, see $dir/$name.initdb.log"
+			>"$dir/$name-$nport.initdb.log" 2>&1 ||
+			die "initdb $name failed, see $dir/$name-$nport.initdb.log"
 	done <"$nodes.new"
 	mv "$nodes.new" "$nodes"
 }
@@ -114,8 +121,9 @@ cmd_start()
 		if running "$name"; then
 			echo "$name is already running"
 		else
-			"$PGBIN/pg_ctl" start --silent --wait -D "$dir/$name" \
-				-l "$dir/$name.log" || die "start $name failed, see $dir/$name.log"
+			"$PGBIN/pg_ctl" start --silent --wait -D "$(node_dir "$name")" \
+				-l "$(node_dir "$name").log" ||
+				die "start $name failed, see $(node_dir "$name").log"
 			echo "$name started on port $port"
 		fi
 	done
@@ -132,11 +140,11 @@ cmd_start()
 		while :; do
 			exists=$("$PGBIN/psql" -X -A -t -q -h localhost -p "$port" -d postgres \
 				-c "SELECT count(*) FROM pg_extension WHERE extname = 'gp'" \
-				2>>"$dir/$name.log" || true)
+				2>>"$(node_dir "$name").log" || true)
 			[ "$exists" = 1 ] && break
 			i=$((i + 1))
 			[ "$i" -le 60 ] ||
-				die "extension gp did not appear on $name, see $dir/$name.log"
+				die "extension gp did not appear on $name, see $(node_dir "$name").log"
 			sleep 1
 		done
 	done
@@ -158,7 +166,7 @@ cmd_stop()
 	# Reverse order: the coordinator first
 	list | sed '1!G;h;$!d' | while read -r name port role; do
 		if running "$name"; then
-			"$PGBIN/pg_ctl" stop --silent --wait -D "$dir/$name" -m fast
+			"$PGBIN/pg_ctl" stop --silent --wait -D "$(node_dir "$name")" -m fast
 			echo "$name stopped"
 		fi
 	done

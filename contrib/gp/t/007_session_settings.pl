@@ -9,30 +9,12 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $coordinator = PostgreSQL::Test::Cluster->new('coordinator');
-$coordinator->init;
-$coordinator->append_conf('postgresql.conf',
-	"shared_preload_libraries = 'gp'\ngp.role = 'coordinator'\n");
-$coordinator->start;
-$coordinator->safe_psql('postgres', 'CREATE EXTENSION gp');
+use GpTest qw(start_cluster);
 
-my $segment = PostgreSQL::Test::Cluster->new('seg1');
-$segment->init;
-$segment->append_conf(
-	'postgresql.conf', "shared_preload_libraries = 'gp'
-gp.role = 'segment'
-gp.segment_id = 1
-gp.coordinator = 'host=${\$coordinator->host} port=${\$coordinator->port}'
-gp.host = '${\$segment->host}'
-gp.register_retry_interval = 1
-gp.allow_local_ddl = on
-max_prepared_transactions = 10
-log_statement = 'all'
-");
-$segment->start;
-$coordinator->poll_query_until('postgres',
-	'SELECT count(*) = 1 FROM gp.cluster_segments()')
-  or die 'the segment did not register';
+my ($coordinator, @segments) = start_cluster(
+	segments => 1,
+	segment_conf => "gp.allow_local_ddl = on\nlog_statement = 'all'\n");
+my $segment = $segments[0];
 
 # Schemas for the tests, and one where anybody may leave what it sees
 $segment->safe_psql('postgres',

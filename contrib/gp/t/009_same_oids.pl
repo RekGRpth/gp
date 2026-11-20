@@ -10,24 +10,11 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $coordinator = PostgreSQL::Test::Cluster->new('coordinator');
-$coordinator->init;
-$coordinator->append_conf('postgresql.conf',
-	"shared_preload_libraries = 'gp'\ngp.role = 'coordinator'\ngp.dispatch_ddl = off\n");
-$coordinator->start;
-$coordinator->safe_psql('postgres', 'CREATE EXTENSION gp');
+use GpTest qw(start_cluster);
 
-my $segment = PostgreSQL::Test::Cluster->new('seg1');
-$segment->init;
-$segment->append_conf(
-	'postgresql.conf', "shared_preload_libraries = 'gp'
-gp.role = 'segment'
-gp.segment_id = 1
-gp.coordinator = 'host=${\$coordinator->host} port=${\$coordinator->port}'
-gp.host = '${\$segment->host}'
-gp.register_retry_interval = 1
-");
-$segment->start;
+my ($coordinator, @segments) = start_cluster(
+	segments => 1, coordinator_conf => "gp.dispatch_ddl = off\n");
+my $segment = $segments[0];
 $coordinator->poll_query_until('postgres',
 	'SELECT count(*) = 1 FROM gp.cluster_segments()')
   or die 'the segment did not register';

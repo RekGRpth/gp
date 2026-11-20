@@ -11,7 +11,69 @@ use warnings FATAL => 'all';
 use Exporter 'import';
 use Test::More;
 
-our @EXPORT_OK = qw(same_answers);
+use PostgreSQL::Test::Cluster;
+
+our @EXPORT_OK = qw(same_answers start_cluster);
+
+# Start a coordinator and the given number of segments (three by default),
+# with the standard settings of the gp tests.  A segment is a node named
+# segment-N-PORT, the name it gets as cluster_name.  Extra configuration
+# of the coordinator and of every segment joins the standard one; the
+# segment extra may use $segment_id, which the helper substitutes, or be
+# a code reference it calls with the number of the segment.  Returns the
+# coordinator and the segments.
+sub start_cluster
+{
+	my (%opts) = @_;
+	my $nsegments = $opts{segments} // 3;
+	my $coordinator_conf = $opts{coordinator_conf} // '';
+	my $segment_conf = $opts{segment_conf} // '';
+
+	my $coordinator = PostgreSQL::Test::Cluster->new('coordinator');
+	$coordinator->init;
+	$coordinator->append_conf(
+		'postgresql.conf',
+		"shared_preload_libraries = 'gp'
+gp.role = 'coordinator'
+" . $coordinator_conf);
+	$coordinator->start;
+	$coordinator->safe_psql('postgres', 'CREATE EXTENSION gp');
+
+	my @segments;
+	foreach my $segment_id (1 .. $nsegments)
+	{
+		my $port = PostgreSQL::Test::Cluster::get_free_port();
+		my $node = PostgreSQL::Test::Cluster->new(
+			"segment-$segment_id-$port", port => $port);
+		my $extra = $opts{segment_conf} // '';
+		if (ref $extra eq 'CODE')
+		{
+			$extra = $extra->($segment_id);
+		}
+		else
+		{
+			$extra =~ s/\$segment_id/$segment_id/g;
+		}
+
+		$node->init;
+		$node->append_conf(
+			'postgresql.conf', "shared_preload_libraries = 'gp'
+gp.role = 'segment'
+gp.segment_id = $segment_id
+gp.coordinator = 'host=" . $coordinator->host . ' port=' .
+			  $coordinator->port . "'
+gp.host = '" . $node->host . "'
+gp.register_retry_interval = 1
+max_prepared_transactions = 10
+" . $extra);
+		$node->start;
+		push @segments, $node;
+	}
+	$coordinator->poll_query_until('postgres',
+		"SELECT count(*) = $nsegments FROM gp.cluster_segments() WHERE interconnect_port IS NOT NULL"
+	  ) or die 'the segments did not report their interconnect ports';
+	return ($coordinator, @segments);
+}
 
 # Compare the answer of a distributed query with the answer of its local
 # copy.  On a mismatch the facts go into the log before the cluster of the

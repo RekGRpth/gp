@@ -36,7 +36,9 @@ $coordinator->start;
 $coordinator->safe_psql('postgres', 'CREATE EXTENSION gp');
 
 # The brokers listen on TCP, where the port of the server says nothing
-my $seg1 = PostgreSQL::Test::Cluster->new('seg1');
+my $seg1_node_port = PostgreSQL::Test::Cluster::get_free_port();
+my $seg1 = PostgreSQL::Test::Cluster->new("segment-1-$seg1_node_port",
+	port => $seg1_node_port);
 $seg1->init;
 $seg1->append_conf('postgresql.conf', "listen_addresses = '127.0.0.1'
 shared_preload_libraries = 'gp'
@@ -51,7 +53,9 @@ $seg1->start;
 
 # Another server sits on the port of segment 2 plus 10000, the address a
 # rule would compute: nothing of the cluster may ever go there
-my $seg2 = PostgreSQL::Test::Cluster->new('seg2');
+my $seg2_node_port = PostgreSQL::Test::Cluster::get_free_port();
+my $seg2 = PostgreSQL::Test::Cluster->new("segment-2-$seg2_node_port",
+	port => $seg2_node_port);
 my $holder = PostgreSQL::Test::Cluster->new('holder',
 	port => $seg2->port + 10000);
 $holder->init;

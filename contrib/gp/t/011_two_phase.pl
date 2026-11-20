@@ -9,35 +9,16 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $coordinator = PostgreSQL::Test::Cluster->new('coordinator');
-$coordinator->init;
-$coordinator->append_conf('postgresql.conf',
-	"shared_preload_libraries = 'gp'\ngp.role = 'coordinator'\n");
-$coordinator->start;
-$coordinator->safe_psql('postgres', 'CREATE EXTENSION gp');
+use GpTest qw(start_cluster);
 
 # Segment 2 cannot prepare transactions at first
-my @segments;
-foreach my $segment_id (1 .. 2)
-{
-	my $node = PostgreSQL::Test::Cluster->new("seg$segment_id");
-	$node->init;
-	$node->append_conf(
-		'postgresql.conf', "shared_preload_libraries = 'gp'
-gp.role = 'segment'
-gp.segment_id = $segment_id
-gp.coordinator = 'host=${\$coordinator->host} port=${\$coordinator->port}'
-gp.host = '${\$node->host}'
-gp.register_retry_interval = 1
-max_prepared_transactions = ${\($segment_id == 1 ? 10 : 0)}
-");
-	$node->start;
-	push @segments, $node;
-}
+my ($coordinator, @segments) = start_cluster(
+	segments => 2,
+	segment_conf => sub {
+		return "max_prepared_transactions = " .
+		  ($_[0] == 1 ? 10 : 0) . "\n";
+	});
 my ($seg1, $seg2) = @segments;
-$coordinator->poll_query_until('postgres',
-	'SELECT count(*) = 2 FROM gp.cluster_segments()')
-  or die 'segments did not register';
 
 sub where
 {
