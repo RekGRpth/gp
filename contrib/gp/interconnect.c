@@ -935,6 +935,21 @@ gp_ic_listen(const char *port)
 		listener = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 		if (listener == PGINVALID_SOCKET)
 			continue;
+#ifdef WIN32
+		/*
+		 * Two postmasters of one host may be handed the same port, and
+		 * Windows serves some of their clients to the other listener; the
+		 * segment of the worker in READY turns the cross into an error,
+		 * and an exclusive bind turns it into a bind failure, which the
+		 * request answers with a retry on a fresh port.
+		 */
+		{
+			int			on = 1;
+
+			(void) setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+							  (const char *) &on, sizeof(on));
+		}
+#endif
 #ifdef IPV6_V6ONLY
 		/*
 		 * One listener serves both families, for a client may name either
