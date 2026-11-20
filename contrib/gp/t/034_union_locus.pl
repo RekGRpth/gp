@@ -11,33 +11,9 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $coordinator = PostgreSQL::Test::Cluster->new('coordinator');
-$coordinator->init;
-$coordinator->append_conf('postgresql.conf',
-	"shared_preload_libraries = 'gp'\ngp.role = 'coordinator'\n");
-$coordinator->start;
-$coordinator->safe_psql('postgres', 'CREATE EXTENSION gp');
+use GpTest qw(start_cluster);
 
-my @segments;
-foreach my $segment_id (1 .. 3)
-{
-	my $node = PostgreSQL::Test::Cluster->new("seg$segment_id");
-	$node->init;
-	$node->append_conf(
-		'postgresql.conf', "shared_preload_libraries = 'gp'
-gp.role = 'segment'
-gp.segment_id = $segment_id
-gp.coordinator = 'host=${\$coordinator->host} port=${\$coordinator->port}'
-gp.host = '${\$node->host}'
-gp.register_retry_interval = 1
-max_prepared_transactions = 10
-");
-	$node->start;
-	push @segments, $node;
-}
-$coordinator->poll_query_until('postgres',
-	'SELECT count(*) = 3 FROM gp.cluster_segments() WHERE interconnect_port IS NOT NULL')
-  or die 'the segments did not report their interconnect ports';
+my ($coordinator, @segments) = start_cluster();
 
 sub run { return $coordinator->safe_psql('postgres', shift); }
 sub plan_for { return $coordinator->safe_psql('postgres', "EXPLAIN (COSTS OFF) $_[0]"); }

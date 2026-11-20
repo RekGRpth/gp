@@ -17,8 +17,10 @@ $coordinator->append_conf('postgresql.conf',
 
 sub new_segment
 {
-	my ($name, $segment_id) = @_;
-	my $node = PostgreSQL::Test::Cluster->new($name);
+	my ($segment_id) = @_;
+	my $port = PostgreSQL::Test::Cluster::get_free_port();
+	my $node = PostgreSQL::Test::Cluster->new("segment-$segment_id-$port",
+		port => $port);
 
 	$node->init;
 	$node->append_conf(
@@ -39,7 +41,7 @@ sub segments
 }
 
 # Segments start before the coordinator
-my @segments = (new_segment('seg1', 1), new_segment('seg2', 2));
+my @segments = (new_segment(1), new_segment(2));
 $_->start foreach @segments;
 my ($seg1, $seg2) = @segments;
 
@@ -84,7 +86,7 @@ pass('a restarted segment registers again');
 # segment that would have no SQL functions with matching OIDs
 my $oidfile = $coordinator->data_dir . '/gp_extension_oids';
 rename $oidfile, "$oidfile.bak";
-my $seg4 = new_segment('seg4', 4);
+my $seg4 = new_segment(4);
 $seg4->start;
 $seg4->wait_for_log(qr/could not read extension OIDs on the coordinator/);
 is( segments(),
@@ -96,7 +98,7 @@ $seg4->stop;
 rename "$oidfile.bak", $oidfile;
 
 # A segment with the number of another one does not take its place
-my $seg3 = new_segment('seg3', 1);
+my $seg3 = new_segment(1);
 $seg3->start;
 $seg3->wait_for_log(
 	qr/could not register as segment 1 on the coordinator: .*segment 1 is already registered at/
