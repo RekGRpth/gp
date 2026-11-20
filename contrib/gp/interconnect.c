@@ -1423,7 +1423,8 @@ gp_interconnect_request_main(Datum main_arg)
 	GpIcSlot   *slot = &gp_ic_slots[slot_id];
 	pgsocket	listener;
 	pgsocket	fd;
-	char		service[12];
+	char		service[16];
+	uint32		listen_port = 0;
 	char	   *token;
 	uint32		wait_event;
 
@@ -1434,15 +1435,20 @@ gp_interconnect_request_main(Datum main_arg)
 	if (!gp_ic_slot_start(slot, generation))
 		proc_exit(0);
 	/*
-	 * The port of the slot, unique among the slots of the segment: the
-	 * generation alone is counted by every slot from the same zero, so
-	 * slots of equal generations would otherwise name the same port and
-	 * steal the file and the connections of each other
+	 * A Unix socket lives in the directory of the host, which the nodes
+	 * of a demo cluster share; unlink before bind would else let a slot
+	 * of another segment with an equal name steal the file and take the
+	 * connections.  The name carries the port of the postmaster, which
+	 * is the one thing unique to every node of a host, and the slot and
+	 * its generation.  Over TCP the number must be a real port, so there
+	 * the operating system picks one.
 	 */
 	if (is_absolute_path(gp_host_address()))
-		snprintf(service, sizeof(service), "%u",
-				 (unsigned) (PostPortNumber + 20000 +
-							 slot_id * 300 + generation % 300));
+	{
+		listen_port = PostPortNumber * 1024u + slot_id * 16u +
+			(unsigned) (generation % 16);
+		snprintf(service, sizeof(service), "%u", listen_port);
+	}
 	else
 		strlcpy(service, "0", sizeof(service));
 	listener = gp_ic_listen(service);
@@ -1470,9 +1476,7 @@ gp_interconnect_request_main(Datum main_arg)
 								ntohs(((struct sockaddr_in6 *) &addr)->sin6_port));
 	}
 	else
-		gp_ic_slot_set_port(slot, generation,
-							PostPortNumber + 20000 +
-							slot_id * 300 + generation % 300);
+		gp_ic_slot_set_port(slot, generation, listen_port);
 	/*
 	 * Everything that can fail must fail before the slot reads READY:
 	 * the broker hands the port out at that point, and a worker that
