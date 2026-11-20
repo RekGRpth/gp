@@ -630,7 +630,22 @@ gp_dml_exec(CustomScanState *node)
 					errmsg("a motion query cannot see writes made earlier in the same transaction"),
 					errhint("Run the query before writing, or prepare it after the write."));
 		state->done = true;
-		gp_dispatch_xact_rows(state->sql, &rows);
+		if (state->motion)
+		{
+			/* The fragment moves rows between the segments: its workers
+			 * import the statement snapshots, so attach the map to the
+			 * fragment itself and keep its own scans on the same state */
+			GpSnapshots *snapshots;
+
+			gp_dtx_statement_start(node->ss.ps.state);
+			snapshots = gp_dtx_statement_snapshots(node->ss.ps.state);
+			gp_dispatch_xact_rows_snapshots(
+				state->sql, &rows,
+				snapshots == NULL ? NULL :
+				gp_snapshots_serialize(snapshots));
+		}
+		else
+			gp_dispatch_xact_rows(state->sql, &rows);
 		node->ss.ps.state->es_processed = rows;
 	}
 	return NULL;

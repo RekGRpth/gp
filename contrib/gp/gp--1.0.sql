@@ -328,6 +328,16 @@ RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'gp_peer_query'
 LANGUAGE C VOLATILE;
 
+-- Attach the exported snapshots of a distributed statement to this backend,
+-- so a fragment dispatched over libpq reads the same state as its nested
+-- motions.  The coordinator's dispatcher calls this on the segments in the
+-- transaction of the fragment; a name is an unguessable secret of the
+-- exporting transaction, as in SET TRANSACTION SNAPSHOT
+CREATE FUNCTION gp.attach_statement_snapshots(map text)
+RETURNS void
+AS 'MODULE_PATHNAME', 'gp_attach_statement_snapshots'
+LANGUAGE C STRICT;
+
 -- Distribute an empty table by hash of the key columns, or replicate it to
 -- all segments if key is NULL.  A table distributed by hash joins the
 -- colocation group of colocate_with, or else the first group with its key

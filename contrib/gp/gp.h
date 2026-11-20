@@ -173,18 +173,23 @@ extern void gp_dtx_read_unlock(void);
 extern void gp_dtx_statement_start(EState *estate);
 extern GpSnapshots *gp_dtx_statement_snapshots(EState *estate);
 extern void gp_snapshots_free(GpSnapshots *snapshots);
+extern char *gp_snapshots_serialize(GpSnapshots *snapshots);
 extern void gp_dtx_xact_snapshot(void);
 extern PGconn *gp_connection_get(const GpSegment *segment);
 extern void gp_dispatch_xact(const char *sql);
 extern void gp_dispatches_bump(void);
 extern int64 gp_dispatches;
 extern void gp_dispatch_xact_rows(const char *sql, uint64 *rows);
+extern void gp_dispatch_xact_rows_snapshots(const char *sql, uint64 *rows,
+											const char *snapshots);
 extern int	gp_copy_open(const char *sql, int only, GpSegment **segments);
 extern void gp_copy_send(int segment_id, const char *data, int len);
 extern void gp_copy_close(void);
 typedef struct GpQuery GpQuery;
-extern GpQuery *gp_query_start(const char *sql, int only);
+extern GpQuery *gp_query_start(const char *sql, int only,
+							   GpSnapshots *snapshots);
 extern PGresult *gp_query_next(GpQuery *query);
+extern void gp_query_end(GpQuery *query);
 
 /* Segments may create objects of their own for a command out of a transaction */
 #define GP_NONXACT_LOCAL_DDL 0x01
