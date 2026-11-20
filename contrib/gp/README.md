@@ -758,7 +758,14 @@ and `gp.reload_conf()` are for superusers only.
 ## Tests
 
 `sql/gp.sql` runs on a single server with `gp` preloaded.  TAP tests in `t/`
-start their own clusters:
+start their own clusters.  `GpTest::same_answers()` compares the answer of a
+distributed query with the answer of its local copy and, on a mismatch, leaves
+the facts in the log before the cluster goes away: the two answers, a fresh
+repeat, the answer of every segment over its own rows, the state of the nodes
+and the dispatch counters.  Every interconnect request carries the number of
+its backend, so the client and worker logs of one request correlate, which a
+sieve in CI (`gp-flake-sieve.yml`, four rounds of the suite on a small
+runner) turns into the evidence of a racing slice.
 
 | Test | What it checks |
 |---|---|

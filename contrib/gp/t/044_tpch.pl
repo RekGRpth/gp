@@ -12,6 +12,8 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
+use GpTest qw(same_answers);
+
 my $coordinator = PostgreSQL::Test::Cluster->new('coordinator');
 $coordinator->init;
 $coordinator->append_conf('postgresql.conf',
@@ -78,8 +80,10 @@ foreach my $number (1 .. 22)
 	{
 		unlike($plan, qr/GpSlice/, "$name keeps the coordinator fallback");
 	}
-	is(run($sql), run(local_sql($sql)),
-		"$name returns the same answer as on local tables");
+	same_answers($coordinator, \@segments, $sql, local_sql($sql),
+		"$name returns the same answer as on local tables",
+		'SET search_path = tpch; SET enable_mergejoin = off; ' .
+		'SET statement_timeout = 120000; ');
 }
 
 $_->stop foreach (@segments, $coordinator);
