@@ -612,6 +612,7 @@ typedef struct GpFragmentDest
 	DestReceiver pub;
 	pgsocket	fd;
 	uint32		row_number;
+	bool		failed;
 } GpFragmentDest;
 
 /* One tuple of the executor, as a row of the protocol */
@@ -655,6 +656,8 @@ gp_ic_receive_tuple(TupleTableSlot *slot, DestReceiver *self)
 	{
 		bool		ok = gp_ic_write_message(dest->fd, GP_IC_ROW, message.data, message.len);
 
+		if (!ok)
+			dest->failed = true;
 		pfree(message.data);
 		return ok;
 	}
@@ -672,7 +675,7 @@ gp_ic_receive_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 
 /* Deserialize and execute one fragment, streaming its tuples */
 static void
-gp_ic_execute(pgsocket fd, const char *serialized)
+gp_ic_execute(pgsocket fd, const char *serialized, uint64 request_id)
 {
 	PlannedStmt *stmt = (PlannedStmt *) stringToNode(serialized);
 	QueryDesc   *query;
@@ -700,9 +703,18 @@ gp_ic_execute(pgsocket fd, const char *serialized)
 							(DestReceiver *) dest, NULL, NULL, 0);
 	ExecutorStart(query, 0);
 	ExecutorRun(query, ForwardScanDirection, 0L);
+	/* The executor stops the scan quietly when receiveSlot fails; a row
+	 * that did not reach the client must fail the fragment at once */
+	if (dest->failed)
+		ereport(ERROR,
+				errcode(ERRCODE_CONNECTION_FAILURE),
+				errmsg("could not send a row of the interconnect answer"));
 	ExecutorFinish(query);
 	ExecutorEnd(query);
 	FreeQueryDesc(query);
+	ereport(LOG,
+			errmsg("interconnect request %llu sent %u rows",
+				   (unsigned long long) request_id, dest->row_number));
 	pfree(dest);
 }
 
@@ -813,7 +825,7 @@ gp_ic_serve(pgsocket fd, const char *token, int slot_id, uint64 *request_id)
 			/* Tests park a self-motion reader beside its living parent */
 			if (requester == gp_segment_id && snapshots->count > 0)
 				INJECTION_POINT("gp-interconnect-reader", NULL);
-			gp_ic_execute(fd, sql);
+			gp_ic_execute(fd, sql, id);
 			gp_ic_current_snapshots = NULL;
 
 			if (!gp_ic_write_message(fd, GP_IC_EOS, NULL, 0))
@@ -2080,6 +2092,10 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 					ereport(ERROR,
 							errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("a nonempty end of the interconnect answer"));
+				ereport(LOG,
+						errmsg("interconnect request %llu received %u rows from %s",
+							   (unsigned long long) request_id, row_number,
+							   host));
 				break;
 			}
 			if (type == GP_IC_ERROR)
