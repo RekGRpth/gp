@@ -10,6 +10,8 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
+use GpTest qw(same_answers);
+
 my $coordinator = PostgreSQL::Test::Cluster->new('coordinator');
 $coordinator->init;
 $coordinator->append_conf('postgresql.conf',
@@ -95,7 +97,7 @@ foreach my $query (@queries)
 	# one missing, and a single check misses such a race
 	for my $attempt (1 .. 5)
 	{
-		is(run($query), run($local),
+		same_answers($coordinator, \@segments, $query, $local,
 			"the same answer as on the coordinator (attempt $attempt): $query");
 	}
 }

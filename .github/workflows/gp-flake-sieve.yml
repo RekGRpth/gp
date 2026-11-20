@@ -1,0 +1,77 @@
+# A sieve for the racing multiway slice: run the gp suite several times on
+# a small runner, where a lost or duplicated group of an answer (041/043/044)
+# shows up once in a while.  The detector in GpTest and the request ids in
+# the interconnect logs leave the facts in the artifacts of a red round.
+
+name: gp flake sieve
+
+on:
+  schedule:
+    # Sunday night, when CI minutes are cheap; tune freely
+    - cron: '47 2 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  # A round that caught something finishes its upload before the next start
+  cancel-in-progress: false
+
+jobs:
+  sieve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    container:
+      image: ghcr.io/anarazel/pg-vm-images/main/linux_debian_trixie_ci:latest
+      options: --privileged --pid=host --ipc=host --ulimit memlock=-1:-1
+    env:
+      BUILD_JOBS: 4
+      TEST_JOBS: 4
+      PGCTLTIMEOUT: 120
+    defaults:
+      run:
+        shell: su postgres -c "bash --noprofile --norc -eo pipefail {0}"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Prepare workspace
+        shell: bash
+        run: |
+          useradd -m postgres
+          chown -R postgres:postgres .
+
+      - name: Configure
+        run: |
+          meson setup \
+            -Dcassert=true \
+            -Dinjection_points=true \
+            -Dtap_tests=enabled \
+            --buildtype=debug \
+            build
+
+      - name: Build
+        run: ninja -C build -j${BUILD_JOBS} all testprep
+
+      - name: Test world
+        run: |
+          meson test -C build --no-rebuild --print-errorlogs --suite setup
+          for round in 1 2 3 4; do
+            echo "== sieve round $round"
+            meson test -C build --no-rebuild --print-errorlogs \
+              --num-processes ${TEST_JOBS} --suite gp
+          done
+
+      - name: Upload logs
+        if: failure() && !cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-${{ github.workflow }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/testrun/**/*.log
+            build/testrun/**/*.diffs
+            build/meson-logs/**
+          if-no-files-found: ignore

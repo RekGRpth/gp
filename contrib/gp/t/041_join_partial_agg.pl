@@ -10,6 +10,8 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
+use GpTest qw(same_answers);
+
 my $coordinator = PostgreSQL::Test::Cluster->new('coordinator');
 $coordinator->init;
 $coordinator->append_conf('postgresql.conf',
@@ -100,7 +102,8 @@ foreach my $query (@queries)
 	my $local = $query;
 	$local =~ s/\bt1\b/l1/g;
 	$local =~ s/\bt2\b/l2/g;
-	is(run($query), run($local), "the same answer as on the coordinator: $query");
+	same_answers($coordinator, \@segments, $query, $local,
+		"the same answer as on the coordinator: $query");
 }
 
 # If the original aggregate supplied the order without a Sort node, the final
@@ -109,7 +112,8 @@ run('SET enable_sort = off');
 my $sorted = 'SELECT t1.g, sum(t2.v) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.g ORDER BY t1.g';
 like(plan_for($sorted), qr/Sort.*GpSlice/s,
 	'a partial grouped join gets a final Sort when the planner omitted it');
-is(run($sorted), run('SELECT l1.g, sum(l2.v) FROM l1 JOIN l2 ON l1.a = l2.a GROUP BY l1.g ORDER BY l1.g'),
+same_answers($coordinator, \@segments, $sorted,
+	'SELECT l1.g, sum(l2.v) FROM l1 JOIN l2 ON l1.a = l2.a GROUP BY l1.g ORDER BY l1.g',
 	'the added final Sort answers ORDER BY');
 
 $_->stop foreach (@segments, $coordinator);
