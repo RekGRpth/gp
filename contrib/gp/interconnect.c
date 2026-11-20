@@ -65,7 +65,7 @@
 
 #include "gp.h"
 
-#define GP_IC_MAGIC "GPIC0002"
+#define GP_IC_MAGIC "GPIC0003"
 #define GP_IC_MAGIC_LEN 8
 #define GP_IC_MAX_STRING (16 * 1024 * 1024)
 #define GP_IC_MAX_FIELD (1024 * 1024 * 1024)
@@ -86,6 +86,9 @@
 
 /* Snapshot exports received by this worker, forwarded by its nested motions */
 static GpSnapshots *gp_ic_current_snapshots = NULL;
+
+/* The number of this backend's interconnect requests, for log correlation */
+static uint64 gp_ic_next_request = 0;
 
 GpSnapshots *
 gp_interconnect_snapshots(void)
@@ -342,6 +345,18 @@ gp_ic_read_i32(pgsocket fd, int32 *value)
 	if (!gp_ic_read(fd, &net, sizeof(net)))
 		return false;
 	*value = (int32) ntohl(net);
+	return true;
+}
+
+static bool
+gp_ic_read_i64(pgsocket fd, uint64 *value)
+{
+	int32		hi;
+	int32		lo;
+
+	if (!gp_ic_read_i32(fd, &hi) || !gp_ic_read_i32(fd, &lo))
+		return false;
+	*value = ((uint64) (uint32) hi << 32) | (uint32) lo;
 	return true;
 }
 
@@ -693,9 +708,10 @@ gp_ic_execute(pgsocket fd, const char *serialized)
 
 /* Execute the request of one connection and answer it */
 static bool
-gp_ic_serve(pgsocket fd, const char *token)
+gp_ic_serve(pgsocket fd, const char *token, int slot_id, uint64 *request_id)
 {
 	char		magic[GP_IC_MAGIC_LEN];
+	uint64		id;
 	char	   *provided;
 	char	   *db = NULL;
 	char	   *user = NULL;
@@ -709,6 +725,9 @@ gp_ic_serve(pgsocket fd, const char *token)
 	if (!gp_ic_read(fd, magic, sizeof(magic)) ||
 		memcmp(magic, GP_IC_MAGIC, sizeof(magic)) != 0)
 		return false;
+	if (!gp_ic_read_i64(fd, &id))
+		return false;
+	*request_id = id;
 	provided = gp_ic_read_string(fd);
 	if (provided == NULL || strlen(provided) != 64 ||
 		timingsafe_bcmp(provided, token, 64) != 0)
@@ -734,6 +753,9 @@ gp_ic_serve(pgsocket fd, const char *token)
 				errmsg("the interconnect client went away in the middle of its request"));
 		return false;
 	}
+	ereport(LOG,
+			errmsg("interconnect worker of slot %d starts request %llu",
+				   slot_id, (unsigned long long) id));
 
 	PG_TRY();
 	{
@@ -1151,8 +1173,12 @@ gp_ic_assign(pgsocket fd, const char *token)
 	uint64		generation = 0;
 	bool		assigned = false;
 
+	uint64		discard_id;
+
 	if (!gp_ic_read(fd, magic, sizeof(magic)) ||
 		memcmp(magic, GP_IC_MAGIC, sizeof(magic)) != 0)
+		return false;
+	if (!gp_ic_read_i64(fd, &discard_id))
 		return false;
 	provided = gp_ic_read_string(fd);
 	if (provided == NULL || strlen(provided) != 64 ||
@@ -1457,14 +1483,13 @@ gp_interconnect_request_main(Datum main_arg)
 	token = gp_interconnect_token();
 	if (token != NULL)
 	{
-		ereport(LOG,
-				errmsg("interconnect worker of slot %d starts a request",
-					   slot_id));
-		(void) gp_ic_serve(fd, token);
+		uint64		request_id = 0;
+
+		(void) gp_ic_serve(fd, token, slot_id, &request_id);
 		closesocket(fd);
 		ereport(LOG,
-				errmsg("interconnect worker of slot %d finished its request",
-					   slot_id));
+				errmsg("interconnect worker of slot %d finished request %llu",
+					   slot_id, (unsigned long long) request_id));
 	}
 	gp_ic_slot_publish(slot, generation, GP_IC_SLOT_FREE);
 	proc_exit(0);
@@ -1727,10 +1752,12 @@ gp_ic_connect(const char *host, int port)
  */
 static void
 gp_ic_cancel_request(const char *host, int port, const char *token,
-					 int32 slot_id, uint64 generation)
+					 uint64 request_id, int32 slot_id, uint64 generation)
 {
-	char		message[GP_IC_MAGIC_LEN + 4 + 64 + 4 + 4 + 8];
+	char		message[GP_IC_MAGIC_LEN + 8 + 4 + 64 + 4 + 4 + 8];
 	char	   *p = message;
+	uint32		id_hi = htonl((uint32) (request_id >> 32));
+	uint32		id_lo = htonl((uint32) request_id);
 	int32		net_len = htonl(64);
 	int32		net_cancel = htonl(-1);
 	int32		net_slot = htonl(slot_id);
@@ -1740,6 +1767,10 @@ gp_ic_cancel_request(const char *host, int port, const char *token,
 
 	memcpy(p, GP_IC_MAGIC, GP_IC_MAGIC_LEN);
 	p += GP_IC_MAGIC_LEN;
+	memcpy(p, &id_hi, sizeof(id_hi));
+	p += sizeof(id_hi);
+	memcpy(p, &id_lo, sizeof(id_lo));
+	p += sizeof(id_lo);
 	memcpy(p, &net_len, sizeof(net_len));
 	p += sizeof(net_len);
 	memcpy(p, token, 64);
@@ -1754,7 +1785,8 @@ gp_ic_cancel_request(const char *host, int port, const char *token,
 
 	/* The attempt itself tells whether this side did its part */
 	ereport(LOG,
-			errmsg("stopping interconnect slot %d on %s", slot_id, host));
+			errmsg("stopping interconnect slot %d (request %llu) on %s",
+				   slot_id, (unsigned long long) request_id, host));
 
 	/* The cancel must not fail the failure it answers */
 	PG_TRY();
@@ -1787,6 +1819,13 @@ gp_ic_write_i32_latched(pgsocket fd, WaitEventSet *wes, int32 value)
 }
 
 static bool
+gp_ic_write_i64_latched(pgsocket fd, WaitEventSet *wes, uint64 value)
+{
+	return gp_ic_write_i32_latched(fd, wes, (int32) (value >> 32)) &&
+		gp_ic_write_i32_latched(fd, wes, (int32) value);
+}
+
+static bool
 gp_ic_write_snapshots_latched(pgsocket fd, WaitEventSet *wes,
 							  const GpSnapshots *snapshots)
 {
@@ -1810,11 +1849,13 @@ gp_ic_write_snapshots_latched(pgsocket fd, WaitEventSet *wes,
 
 /* Send the full request over the socket of its connection */
 static bool
-gp_ic_send_query_latched(pgsocket fd, WaitEventSet *wes, const char *token,
+gp_ic_send_query_latched(pgsocket fd, WaitEventSet *wes, uint64 request_id,
+						 const char *token,
 						 const char *db, const char *user, int requester,
 						 const char *sql, const GpSnapshots *snapshots)
 {
 	return gp_ic_write_latched(fd, wes, GP_IC_MAGIC, GP_IC_MAGIC_LEN) &&
+		gp_ic_write_i64_latched(fd, wes, request_id) &&
 		gp_ic_write_i32_latched(fd, wes, strlen(token)) &&
 		gp_ic_write_latched(fd, wes, token, strlen(token)) &&
 		gp_ic_write_i32_latched(fd, wes, strlen(db)) &&
@@ -1834,8 +1875,8 @@ gp_ic_send_query_latched(pgsocket fd, WaitEventSet *wes, const char *token,
 bool
 gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 					  const char *db, const char *user, const char *sql,
-					  const char *host, int port, int requester,
-					  GpSnapshots *snapshots)
+					  const char *host, int port, int segment_id,
+					  int requester, GpSnapshots *snapshots)
 {
 	/*
 	 * The socket, the worker it goes to and the fact of it are written
@@ -1854,6 +1895,11 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 	char	   *token;
 	bool		retry = false;
 	uint32		row_number = 0;
+	uint64		request_id = ++gp_ic_next_request;
+
+	ereport(LOG,
+			errmsg("interconnect request %llu asks segment %d",
+				   (unsigned long long) request_id, segment_id));
 
 	token = gp_interconnect_token();
 	if (token == NULL)
@@ -1888,8 +1934,8 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 
 	PG_TRY();
 	{
-		if (!gp_ic_send_query_latched(fd, wes, token, db, user, requester,
-									  sql, snapshots))
+		if (!gp_ic_send_query_latched(fd, wes, request_id, token, db, user,
+									 requester, sql, snapshots))
 			retry = true;
 
 		/* The broker answers with the worker of the request */
@@ -1960,8 +2006,9 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 				else
 				{
 					wes = gp_ic_wes(fd);
-					if (!gp_ic_send_query_latched(fd, wes, token, db, user,
-												  requester, sql, snapshots))
+					if (!gp_ic_send_query_latched(fd, wes, request_id, token,
+												  db, user, requester, sql,
+												  snapshots))
 						retry = true;
 				}
 			}
@@ -2076,12 +2123,14 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 
 		/* A request that never ran to its end does not run on */
 		if (retry && have_target)
-			gp_ic_cancel_request(host, port, token, slot_id, generation);
+			gp_ic_cancel_request(host, port, token, request_id,
+								 slot_id, generation);
 	}
 	PG_CATCH();
 	{
 		if (have_target)
-			gp_ic_cancel_request(host, port, token, slot_id, generation);
+			gp_ic_cancel_request(host, port, token, request_id,
+								 slot_id, generation);
 		closesocket(fd);
 		if (wes != NULL)
 			FreeWaitEventSet(wes);
@@ -2095,13 +2144,14 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 void
 gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
 					  const char *db, const char *user, const char *sql,
-					  const char *host, int port, int requester,
-					  GpSnapshots *snapshots)
+					  const char *host, int port, int segment_id,
+					  int requester, GpSnapshots *snapshots)
 {
 	for (int i = 0; i < 60; i++)
 	{
 		if (gp_interconnect_query_try(store, tupdesc, db, user, sql,
-									  host, port, requester, snapshots))
+									  host, port, segment_id, requester,
+									  snapshots))
 			return;
 		CHECK_FOR_INTERRUPTS();
 		pg_usleep(100000);
