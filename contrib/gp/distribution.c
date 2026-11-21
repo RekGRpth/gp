@@ -84,6 +84,28 @@ gp_hash_proc(Oid typid)
 }
 
 /*
+ * The hash function of a type, remembered from call to call: the bucket of
+ * a key is asked per row of a motion, and the catalog lookup of the
+ * operator class would burn there
+ */
+static Oid
+gp_hash_proc_of(Oid typid)
+{
+#define GP_HASH_PROC_CACHE 32
+	static Oid	cache_type[GP_HASH_PROC_CACHE];
+	static Oid	cache_proc[GP_HASH_PROC_CACHE];
+	Oid			proc;
+	int			slot = (int) typid % GP_HASH_PROC_CACHE;
+
+	if (cache_type[slot] == typid)
+		return cache_proc[slot];
+	proc = gp_hash_proc(typid);
+	cache_type[slot] = typid;
+	cache_proc[slot] = proc;
+	return proc;
+}
+
+/*
  * The bucket of a key among nbuckets: the hashes of its columns combined,
  * skipping NULLs
  */
@@ -102,7 +124,7 @@ gp_key_bucket(int nbuckets, int nkeys, const Datum *values, const bool *nulls,
 
 		if (nulls[i])
 			continue;
-		h = DatumGetUInt64(OidFunctionCall2Coll(gp_hash_proc(types[i]),
+		h = DatumGetUInt64(OidFunctionCall2Coll(gp_hash_proc_of(types[i]),
 												collation, values[i],
 												UInt64GetDatum(GP_HASH_SEED)));
 		hash = hash_combine64(hash, h);

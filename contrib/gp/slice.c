@@ -75,6 +75,7 @@ typedef struct GpSliceState
 	bool		replicated;
 	bool		motion;
 	bool		autonomous;
+	int			only;			/* the one segment to read, 0 for all */
 	Tuplestorestate *store;		/* all rows, once read */
 } GpSliceState;
 
@@ -554,6 +555,7 @@ typedef struct GpJoinTable GpJoinTable;
 static bool gp_slice_join_rows(Query *parse, GpJoinTable *table, double *rows);
 static bool gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
 							   bool *replicated, bool *motion, GpLocus *locus);
+static bool gp_slice_agg_two_phase(Query *parse, Agg *agg, Plan *below);
 static bool gp_slice_cte_agg_replace(Query *ctequery, PlannedStmt *stmt,
 									 int cteplanid, Plan *parent, Agg *agg,
 									 bool replicated, bool motion);
@@ -724,6 +726,8 @@ gp_slice_load_libpq(GpSliceState *state)
 					errmsg("the cluster has no segments"));
 		only = segments[MyProcPid % n].segment_id;
 	}
+	if (state->only != 0)
+		only = state->only;
 
 	/* A fragment with motions reads its peers through interconnect workers
 	 * that import the statement snapshots; attach the map to the fragment
@@ -810,6 +814,8 @@ gp_slice_load_interconnect(GpSliceState *state)
 					errmsg("the cluster has no segments"));
 		only = segments[MyProcPid % nsegments].segment_id;
 	}
+	if (state->only != 0)
+		only = state->only;
 
 	/* A segment whose broker has not reported its port is not ready yet */
 	for (int i = 0; i < nsegments; i++)
@@ -862,6 +868,8 @@ gp_slice_begin(CustomScanState *node, EState *estate, int eflags)
 	state->replicated = boolVal(lsecond(cscan->custom_private));
 	state->motion = boolVal(lthird(cscan->custom_private));
 	state->autonomous = boolVal(lfourth(cscan->custom_private));
+	state->only = list_length(cscan->custom_private) >= 5 ?
+		intVal(list_nth(cscan->custom_private, 4)) : 0;
 }
 
 static TupleTableSlot *
@@ -995,7 +1003,7 @@ gp_slice_agg_query(Query *parse)
  * table.  The sort and the limit above the aggregate are left in place.
  */
 bool
-gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
+gp_slice_agg_plan(Query *original, Query *parse, PlannedStmt *stmt)
 {
 	/* Returns whether the plan was rewritten */
 	Plan	   *parent = NULL;
@@ -1040,7 +1048,13 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 	locus = gp_locus_plan(&agg->plan, stmt->rtable, stmt->subplans);
 	if (locus.kind == GP_LOCUS_COORDINATOR)
 	{
-		/* A grouping that is not colocated can still move by its columns */
+		/*
+		 * A grouping that is not colocated moves no row of the table when
+		 * the aggregate answers in phases: the segments combine partials
+		 * instead.  Otherwise it can still move by its columns.
+		 */
+		if (gp_slice_agg_two_phase(parse, agg, below))
+			return true;
 		if (!gp_slice_agg_locus(original, agg, below, &replicated, &motion, &locus))
 			return false;
 	}
@@ -5057,6 +5071,7 @@ typedef struct GpPartialAgg
 {
 	Aggref	   *aggref;			/* the aggregate of the query */
 	Index		pos;			/* its column in the answer of the segments */
+	bool		iscount;		/* count moves through a sum of its counts */
 } GpPartialAgg;
 
 /* A grouping column of the segments' answer */
@@ -5087,16 +5102,16 @@ typedef struct GpPartialState
 	Index		npos;			/* columns of the answer so far */
 	int			nextaggno;		/* aggno for the next combining aggregate */
 	Plan	   *below;			/* old input, for resolving planned join Vars */
+	List	   *below_seen;	/* vars of the resolution, against self-references */
 	bool		ok;				/* false once anything unsplittable is met */
 } GpPartialState;
 
 /*
- * Whether the segments can answer an aggregate with a column that the
- * coordinator finishes by the same aggregate again: min and max of any
- * type, and sum of a type it adds up in, whose argument, result and
- * transition are all of one type.  count counts the partial columns
- * instead of adding them, and the average divides, so neither can be
- * combined by itself
+ * Whether the segments can answer an aggregate with a column the coordinator
+ * finishes over the columns of every segment: min and max of any type, sum of
+ * a type it adds up in, and count, whose partial counts the coordinator sums
+ * up.  The average divides, so it moves through a partial sum and a partial
+ * count of its own.
  */
 static bool
 gp_partial_splittable(Aggref *aggref)
@@ -5107,13 +5122,19 @@ gp_partial_splittable(Aggref *aggref)
 	Form_pg_proc procform;
 	const char *name;
 	bool		ok;
+	bool		iscount = aggref->aggstar;
 
-	if (aggref->aggkind != AGGKIND_NORMAL || aggref->aggstar ||
-		aggref->aggvariadic || aggref->aggdirectargs != NIL ||
-		aggref->aggdistinct != NIL || aggref->aggorder != NIL ||
-		aggref->aggfilter != NULL ||
-		list_length(aggref->args) != 1 ||
-		list_length(aggref->aggargtypes) != 1)
+	if (aggref->aggkind != AGGKIND_NORMAL || aggref->aggvariadic ||
+		aggref->aggdirectargs != NIL || aggref->aggdistinct != NIL ||
+		aggref->aggorder != NIL || aggref->aggfilter != NULL)
+		return false;
+	if (iscount)
+	{
+		if (aggref->args != NIL)
+			return false;
+	}
+	else if (list_length(aggref->args) != 1 ||
+			 list_length(aggref->aggargtypes) != 1)
 		return false;
 
 	agg_tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggref->aggfnoid));
@@ -5129,18 +5150,23 @@ gp_partial_splittable(Aggref *aggref)
 	if (!HeapTupleIsValid(proc_tup))
 		return false;
 	procform = (Form_pg_proc) GETSTRUCT(proc_tup);
-	name = NameStr(procform->proname);
+	name = pstrdup(NameStr(procform->proname));
+	ReleaseSysCache(proc_tup);
+	if (iscount)
+		return strcmp(name, "count") == 0;
 	ok = (strcmp(name, "min") == 0 || strcmp(name, "max") == 0 ||
 		  strcmp(name, "sum") == 0 || strcmp(name, "avg") == 0);
-	ReleaseSysCache(proc_tup);
 	if (!ok)
 		return false;
 
 	/*
 	 * An average moves through a partial sum and a partial count, so its
-	 * result type may differ from the type of its argument
+	 * result type may differ from the type of its argument.  So may the
+	 * result of a sum: sum of int4 answers in int8.  min, max and count
+	 * answer in the type of the result itself.
 	 */
-	return strcmp(name, "avg") == 0 ||
+	return strcmp(name, "avg") == 0 || strcmp(name, "sum") == 0 ||
+		strcmp(name, "count") == 0 ||
 		linitial_oid(aggref->aggargtypes) == aggref->aggtype;
 }
 
@@ -5362,6 +5388,15 @@ gp_partial_walker(Node *node, GpPartialState *state)
 
 	if (node == NULL)
 		return false;
+	/*
+	 * A parameter of the query has no value in the SQL text of a fragment;
+	 * the aggregate stays whole where the parameter lives
+	 */
+	if (IsA(node, Param) && ((Param *) node)->paramkind == PARAM_EXTERN)
+	{
+		state->ok = false;
+		return true;
+	}
 	if (IsA(node, Aggref))
 	{
 		Aggref	   *aggref = (Aggref *) node;
@@ -5388,27 +5423,27 @@ gp_partial_walker(Node *node, GpPartialState *state)
 		{
 			HeapTuple	tup = SearchSysCache1(PROCOID,
 											  ObjectIdGetDatum(aggref->aggfnoid));
-			bool		isavg;
+			const char *proname;
 
 			if (!HeapTupleIsValid(tup))
 			{
 				state->ok = false;
 				return true;
 			}
-			isavg = strcmp(NameStr(((Form_pg_proc) GETSTRUCT(tup))->proname),
-						   "avg") == 0;
+			proname = pstrdup(NameStr(((Form_pg_proc) GETSTRUCT(tup))->proname));
 			ReleaseSysCache(tup);
-			if (isavg && !state->allow_avg)
+			if (strcmp(proname, "avg") == 0 && !state->allow_avg)
 			{
 				state->ok = false;
 				return true;
 			}
-			if (isavg)
+			if (strcmp(proname, "avg") == 0)
 			{
 				GpPartialAvg *pa = palloc0(sizeof(GpPartialAvg));
 				Oid			sumoid = gp_partial_func("sum",
 									 linitial_oid(aggref->aggargtypes));
 				Oid			cntoid = gp_partial_func("count", ANYOID);
+
 				if (!OidIsValid(sumoid) || !OidIsValid(cntoid))
 				{
 					state->ok = false;
@@ -5424,15 +5459,60 @@ gp_partial_walker(Node *node, GpPartialState *state)
 				state->avgs = lappend(state->avgs, pa);
 				return false;
 			}
+			partial = palloc0(sizeof(GpPartialAgg));
+			partial->aggref = aggref;
+			partial->iscount = strcmp(proname, "count") == 0;
+			state->npos++;
+			partial->pos = state->npos;
+			state->aggs = lappend(state->aggs, partial);
+			return false;
 		}
-		partial = palloc0(sizeof(GpPartialAgg));
-		partial->aggref = aggref;
-		state->npos++;
-		partial->pos = state->npos;
-		state->aggs = lappend(state->aggs, partial);
-		return false;
 	}
 	return expression_tree_walker(node, gp_partial_walker, state);
+}
+
+/* A parameter of the query has no value in the SQL text of a fragment */
+static bool
+gp_slice_extern_param_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param) && ((Param *) node)->paramkind == PARAM_EXTERN)
+		return true;
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, gp_slice_extern_param_walker,
+								 context, 0);
+	return expression_tree_walker(node, gp_slice_extern_param_walker, context);
+}
+
+/*
+ * Whether the parts of the query that move to the segments verbatim answer
+ * differently there: volatile functions read the state of the server they
+ * run on.  The caller refuses the rewrite and the coordinator answers
+ */
+static bool
+gp_partial_mutable_parts(Query *parse, GpPartialState *state)
+{
+	ListCell   *lc;
+
+	if (parse->jointree->quals != NULL &&
+		contain_mutable_functions(parse->jointree->quals))
+		return true;
+	foreach(lc, state->aggs)
+	{
+		GpPartialAgg *partial = lfirst(lc);
+
+		if (contain_mutable_functions((Node *) partial->aggref->args))
+			return true;
+	}
+	foreach(lc, state->avgs)
+	{
+		GpPartialAvg *pa = lfirst(lc);
+
+		if (contain_mutable_functions((Node *) pa->aggref->args))
+			return true;
+	}
+	return false;
 }
 
 /* Replace a group key with its column, an aggregate with its combining one */
@@ -5443,7 +5523,16 @@ gp_partial_mutator(Node *node, GpPartialState *state)
 
 	if (node == NULL)
 		return NULL;
-	if (IsA(node, Var) && state->below != NULL)
+	/*
+	 * A planned var of the old input resolves through the target lists of
+	 * the plan below, down to a var the query knows.  The resolution is
+	 * guarded against circles: a node without children whose target list
+	 * refers to its own outputs — a gather of a replaced scan — leaves the
+	 * var unresolved, and the caller refuses the rewrite
+	 */
+	if (IsA(node, Var) && state->below != NULL &&
+		(((Var *) node)->varno == OUTER_VAR ||
+		 ((Var *) node)->varno == INNER_VAR))
 	{
 		Plan	   *source = state->below;
 
@@ -5454,7 +5543,11 @@ gp_partial_mutator(Node *node, GpPartialState *state)
 			Var		   *var = (Var *) node;
 			TargetEntry *tle;
 
-			if (var->varattno <= 0)
+			if (list_member_ptr(state->below_seen, node))
+				break;
+			state->below_seen = lappend(state->below_seen, node);
+			if (var->varattno <= 0 ||
+				var->varattno > list_length(source->targetlist))
 				break;
 			tle = list_nth(source->targetlist, var->varattno - 1);
 			node = (Node *) tle->expr;
@@ -5503,10 +5596,45 @@ gp_partial_mutator(Node *node, GpPartialState *state)
 		foreach(lc, state->aggs)
 		{
 			GpPartialAgg *partial = lfirst(lc);
+			HeapTuple	tup;
+			Form_pg_proc procform;
+			const char *proname;
+			Oid			combineoid;
+			Oid			combinetype;
+			Expr	   *result;
 
 			if (!equal(partial->aggref, aggref))
 				continue;
-			combine = copyObject(aggref);
+			tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(aggref->aggfnoid));
+			if (!HeapTupleIsValid(tup))
+			{
+				state->ok = false;
+				return node;
+			}
+			procform = (Form_pg_proc) GETSTRUCT(tup);
+			proname = pstrdup(NameStr(procform->proname));
+			ReleaseSysCache(tup);
+
+			/*
+			 * count counts the partial columns instead of adding them, so
+			 * its combining aggregate is a sum.  The partial column of every
+			 * aggregate has the result type of the aggregate itself.
+			 */
+			if (partial->iscount)
+				proname = "sum";
+			combineoid = gp_partial_func(proname, aggref->aggtype);
+			if (!OidIsValid(combineoid))
+			{
+				state->ok = false;
+				return node;
+			}
+			combinetype = get_func_rettype(combineoid);
+			combine = makeNode(Aggref);
+			combine->aggfnoid = combineoid;
+			combine->aggtype = combinetype;
+			combine->aggcollid = aggref->aggcollid;
+			combine->inputcollid = aggref->inputcollid;
+			combine->aggkind = AGGKIND_NORMAL;
 			var = makeVar(OUTER_VAR, partial->pos, aggref->aggtype,
 						  -1, aggref->aggcollid, 0);
 			combine->args = list_make1(makeTargetEntry((Expr *) var, 1,
@@ -5517,7 +5645,22 @@ gp_partial_mutator(Node *node, GpPartialState *state)
 			combine->aggno = state->nextaggno;
 			combine->aggtransno = state->nextaggno;
 			state->nextaggno++;
-			return (Node *) combine;
+
+			/*
+			 * The combining aggregate runs over its own result type, which
+			 * it may answer in another type: sum of int8 answers in numeric.
+			 * The value must come back in the type of the original aggregate.
+			 */
+			if (combinetype == aggref->aggtype)
+				return (Node *) combine;
+			result = gp_partial_cast((Expr *) combine, combinetype,
+									 aggref->aggtype);
+			if (result == NULL)
+			{
+				state->ok = false;
+				return node;
+			}
+			return (Node *) result;
 		}
 		state->ok = false;
 		return node;
@@ -5536,11 +5679,15 @@ gp_partial_final_vars(Node *node, void *context)
 	return expression_tree_walker(node, gp_partial_final_vars, context);
 }
 
-/* Finish a partial aggregate over the slice built from its remote query */
-static bool
-gp_slice_partial_finish(Agg *agg, GpPartialState *state,
-						Query *remote, bool motion,
-						List *final_target, List *final_qual)
+/*
+ * The slice that replaces the input of a partial aggregate: its columns are
+ * those of the answer of the segments, and its SQL is given ready, deparsed
+ * from the remote query of the caller or built for the fragment.
+ */
+static CustomScan *
+gp_slice_partial_cscan(Agg *agg, GpPartialState *state, const char *remote_sql,
+					   List *remote_cols, bool motion, bool autonomous,
+					   int only)
 {
 	CustomScan *cscan = makeNode(CustomScan);
 	Plan	   *below = agg->plan.lefttree;
@@ -5548,7 +5695,7 @@ gp_slice_partial_finish(Agg *agg, GpPartialState *state,
 	ListCell   *lc;
 	int			pos = 0;
 
-	foreach(lc, remote->targetList)
+	foreach(lc, remote_cols)
 	{
 		TargetEntry *tle = lfirst_node(TargetEntry, lc);
 		TargetEntry *out;
@@ -5564,25 +5711,40 @@ gp_slice_partial_finish(Agg *agg, GpPartialState *state,
 	cscan->scan.plan.targetlist = tlist;
 	cscan->scan.plan.qual = NIL;
 	cscan->scan.scanrelid = 0;
-	cscan->scan.plan.startup_cost = agg->plan.lefttree->startup_cost;
-	cscan->scan.plan.total_cost = agg->plan.lefttree->total_cost;
-	cscan->scan.plan.plan_rows = agg->plan.lefttree->plan_rows;
-	cscan->scan.plan.plan_width = agg->plan.lefttree->plan_width;
-	cscan->custom_scan_tlist = copyObject(remote->targetList);
-	cscan->custom_private = list_make4(makeString(pg_get_querydef(remote, false)),
-								   makeBoolean(false), makeBoolean(motion),
-								   makeBoolean(gp_slice_autonomous(remote)));
+	cscan->scan.plan.startup_cost = below->startup_cost;
+	cscan->scan.plan.total_cost = below->total_cost;
+	cscan->scan.plan.plan_rows = below->plan_rows;
+	cscan->scan.plan.plan_width = below->plan_width;
+	cscan->custom_scan_tlist = copyObject(remote_cols);
+	cscan->custom_private = list_make4(makeString(pstrdup(remote_sql)),
+									   makeBoolean(false), makeBoolean(motion),
+									   makeBoolean(autonomous));
+	if (only != 0)
+		cscan->custom_private = lappend(cscan->custom_private,
+										makeInteger(only));
 	cscan->methods = &gp_slice_plan_methods;
+	return cscan;
+}
+
+/* Rebuild the final aggregate over the columns of the segments' answer */
+static bool
+gp_slice_partial_combine(Agg *agg, GpPartialState *state, Plan *below,
+						 CustomScan *cscan, List *final_target, List *final_qual)
+{
+	List	   *tlist = NIL;
+	ListCell   *lc;
 
 	/* The final aggregate over the columns of the answer */
 	state->ok = true;
 	state->below = below;
-	tlist = NIL;
 	foreach(lc, final_target)
 	{
 		TargetEntry *tle = lfirst_node(TargetEntry, lc);
 		TargetEntry *out;
-		Node	   *expr = gp_partial_mutator((Node *) tle->expr, state);
+		Node	   *expr;
+
+		state->below_seen = NIL;
+		expr = gp_partial_mutator((Node *) tle->expr, state);
 
 		if (!state->ok)
 			return false;
@@ -5646,6 +5808,310 @@ gp_slice_partial_finish(Agg *agg, GpPartialState *state,
 	agg->plan.targetlist = tlist;
 	agg->plan.lefttree = &cscan->scan.plan;
 	return true;
+}
+
+/* Finish a partial aggregate over the slice built from its remote query */
+static bool
+gp_slice_partial_finish(Agg *agg, GpPartialState *state,
+						Query *remote, bool motion,
+						List *final_target, List *final_qual, int only)
+{
+	CustomScan *cscan = gp_slice_partial_cscan(agg, state,
+											   pg_get_querydef(remote, false),
+											   remote->targetList, motion,
+											   gp_slice_autonomous(remote),
+											   only);
+
+	return gp_slice_partial_combine(agg, state, agg->plan.lefttree, cscan,
+									final_target, final_qual);
+}
+
+/*
+ * Whether a cast from one type to another answers through a function, so a
+ * combine aggregate of the first type can come back in the second
+ */
+static bool
+gp_partial_castable(Oid fromtype, Oid totype)
+{
+	HeapTuple	tup = SearchSysCache2(CASTSOURCETARGET,
+									  ObjectIdGetDatum(fromtype),
+									  ObjectIdGetDatum(totype));
+	bool		ok = false;
+
+	if (HeapTupleIsValid(tup))
+	{
+		ok = OidIsValid(((Form_pg_cast) GETSTRUCT(tup))->castfunc);
+		ReleaseSysCache(tup);
+	}
+	return ok;
+}
+
+/*
+ * Answer an aggregate whose grouping does not cover the distribution key in
+ * two phases.  Every segment runs a partial aggregate over its own rows, and
+ * the partials of all the segments answer one combine query: each segment
+ * combines the groups the hash of the grouping columns assigns to it, so
+ * every group is combined exactly once, and the coordinator finishes the
+ * aggregate over the per-segment answers.  No row of the table crosses the
+ * interconnect: the motion carries the partials only.
+ *
+ * The fragment is built as text.  The partial aggregate moves as a
+ * serialized plan, like the motion of a join, and the combine query reads it
+ * through gp.peer_query(), keeping to the columns of the answer for its own
+ * grouping and aggregation.
+ */
+static bool
+gp_slice_agg_two_phase(Query *parse, Agg *agg, Plan *below)
+{
+	RangeTblRef *ref;
+	RangeTblEntry *rte;
+	Relation	rel;
+	TupleDesc	tupdesc;
+	GpPolicy	policy;
+	GpPartialState state;
+	StringInfoData sql;
+	StringInfoData cols;
+	StringInfoData keys;
+	StringInfoData map;
+	StringInfoData aggs;
+	ListCell   *lc;
+	int			nkeys;
+	int			pos;
+	StringInfoData marker;
+	Query	   *remote;
+	AttrNumber *keyatts;
+	char	   *planned;
+	int			only = 0;
+
+	if (agg->numCols == 0 || agg->numCols != list_length(parse->groupClause) ||
+		gp_dispatch_in_xact())
+		return false;
+	if (!IsA(parse->jointree, FromExpr) ||
+		list_length(parse->jointree->fromlist) != 1 ||
+		!IsA(linitial(parse->jointree->fromlist), RangeTblRef))
+		return false;
+	ref = linitial_node(RangeTblRef, parse->jointree->fromlist);
+	rte = rt_fetch(ref->rtindex, parse->rtable);
+	if (rte->rtekind != RTE_RELATION || !gp_policy_get(rte->relid, &policy) ||
+		policy.replicated || policy.nbuckets <= 0)
+		return false;
+
+	rel = table_open(rte->relid, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		if (TupleDescAttr(tupdesc, i)->attisdropped)
+		{
+			table_close(rel, AccessShareLock);
+			return false;
+		}
+	}
+
+	memset(&state, 0, sizeof(state));
+	state.aggs = NIL;
+	state.avgs = NIL;
+	state.keys = NIL;
+	state.allow_avg = false;
+	state.npos = 0;
+	state.nextaggno = 0;
+	state.below = NULL;
+	state.ok = true;
+
+	nkeys = 0;
+	keyatts = palloc_array(AttrNumber, list_length(parse->groupClause));
+	foreach(lc, parse->groupClause)
+	{
+		SortGroupClause *sc = lfirst_node(SortGroupClause, lc);
+		TargetEntry *tle = get_sortgroupclause_tle(sc, parse->targetList);
+		GpPartialKey *key;
+		Var		   *var;
+
+		if (tle == NULL || !IsA(tle->expr, Var))
+		{
+			table_close(rel, AccessShareLock);
+			return false;
+		}
+		var = (Var *) tle->expr;
+		if (var->varno != ref->rtindex || var->varattno <= 0 ||
+			!gp_slice_hashable(var->vartype))
+		{
+			table_close(rel, AccessShareLock);
+			return false;
+		}
+		key = palloc0(sizeof(GpPartialKey));
+		key->expr = tle->expr;
+		state.npos++;
+		key->pos = state.npos;
+		key->ressortgroupref = tle->ressortgroupref;
+		state.keys = lappend(state.keys, key);
+		keyatts[nkeys++] = var->varattno;
+	}
+
+	gp_partial_walker((Node *) parse->targetList, &state);
+	if (state.ok)
+		gp_partial_walker((Node *) parse->havingQual, &state);
+	if (state.ok && gp_partial_mutable_parts(parse, &state))
+		state.ok = false;
+	if (state.ok && parse->jointree->quals != NULL &&
+		gp_slice_extern_param_walker(parse->jointree->quals, NULL))
+		state.ok = false;
+	if (!state.ok || state.aggs == NIL)
+	{
+		table_close(rel, AccessShareLock);
+		return false;
+	}
+
+	/*
+	 * The partial aggregate over the rows of one segment: the grouping
+	 * columns and the aggregates are its whole answer, named for the combine
+	 * query
+	 */
+	initStringInfo(&keys);
+	initStringInfo(&map);
+	appendStringInfoString(&map, "ARRAY[");
+	for (int i = 0; i < policy.nbuckets; i++)
+		appendStringInfo(&map, "%s%d", i > 0 ? "," : "", policy.map[i]);
+	appendStringInfoString(&map, "]");
+
+	/*
+	 * The marker is the query of the partial aggregate, deparsed as before
+	 * and wrapped in the ownership filter: every segment computes the
+	 * partials
+	 * of the groups of the asking segment only.  The filter reads the
+	 * output columns of the aggregate, and the planner puts it below the
+	 * grouping
+	 */
+	remote = copyObject(parse);
+	if (remote->jointree->quals != NULL &&
+		IsA(remote->jointree->quals, List))
+		remote->jointree->quals =
+			(Node *) makeBoolExpr(AND_EXPR, (List *) remote->jointree->quals, -1);
+	remote->targetList = NIL;
+	pos = 0;
+	foreach(lc, state.keys)
+	{
+		GpPartialKey *key = lfirst(lc);
+		TargetEntry *tle = makeTargetEntry(copyObject(key->expr),
+										   key->pos,
+										   pstrdup(NameStr(TupleDescAttr(tupdesc,
+																	 keyatts[pos++] - 1)->attname)),
+										   false);
+
+		tle->ressortgroupref = key->ressortgroupref;
+		remote->targetList = lappend(remote->targetList, tle);
+	}
+	foreach(lc, state.aggs)
+	{
+		GpPartialAgg *part = lfirst(lc);
+		TargetEntry *tle = makeTargetEntry((Expr *) copyObject(part->aggref),
+										   part->pos,
+										   psprintf("gp_p%u", part->pos),
+										   false);
+
+		remote->targetList = lappend(remote->targetList, tle);
+	}
+	remote->havingQual = NULL;
+	remote->sortClause = NIL;
+	remote->limitCount = NULL;
+	remote->limitOffset = NULL;
+
+	pos = 0;
+	foreach(lc, state.keys)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, keyatts[pos++] - 1);
+
+		appendStringInfo(&keys, "%s%s%s", keys.len > 0 ? ", " : "",
+						 quote_identifier(NameStr(att->attname)),
+						 att->attcollation != InvalidOid ?
+						 " COLLATE pg_catalog.default" : "");
+	}
+	initStringInfo(&marker);
+	appendStringInfo(&marker,
+					 "SELECT * FROM (%s) AS gp_partial WHERE (%s)[gp.bucket(%d, %s) + 1] "
+					 "OPERATOR(pg_catalog.=) (SELECT current_setting('gp.requester_segment')::int4)",
+					 pg_get_querydef(remote, false), map.data,
+					 policy.nbuckets, keys.data);
+	planned = gp_interconnect_plan(marker.data);
+
+	/* A table pinned to one segment answers there alone */
+	if (policy.nbuckets > 0)
+	{
+		bool		uniform = true;
+
+		for (int i = 1; i < policy.nbuckets; i++)
+			if (policy.map[i] != policy.map[0])
+			{
+				uniform = false;
+				break;
+			}
+		if (uniform)
+			only = policy.map[0];
+	}
+
+	/*
+	 * The combine query of every segment over the partials of all of them:
+	 * the groups whose hash lands on the segment, as the segment reads its
+	 * own number from gp.segment_id
+	 */
+	initStringInfo(&sql);
+	initStringInfo(&cols);
+	initStringInfo(&aggs);
+
+	pos = 0;
+	foreach(lc, state.keys)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, keyatts[pos++] - 1);
+
+		appendStringInfo(&cols, "%s%s %s", cols.len > 0 ? ", " : "",
+						 quote_identifier(NameStr(att->attname)),
+						 format_type_with_typemod(att->atttypid,
+												  att->atttypmod));
+	}
+	table_close(rel, AccessShareLock);
+	foreach(lc, state.aggs)
+	{
+		GpPartialAgg *partial = lfirst(lc);
+		Aggref	   *aggref = partial->aggref;
+		char	   *colname = psprintf("gp_p%u", partial->pos);
+		const char *proname = partial->iscount ? "sum" :
+			get_func_name(aggref->aggfnoid);
+		Oid			combineoid = gp_partial_func(proname, aggref->aggtype);
+		Oid			combinetype;
+		const char *cast = "";
+
+		if (!OidIsValid(combineoid))
+			return false;
+		combinetype = get_func_rettype(combineoid);
+		if (combinetype != aggref->aggtype)
+		{
+			if (!gp_partial_castable(combinetype, aggref->aggtype))
+				return false;
+			cast = psprintf("::%s", format_type_be(aggref->aggtype));
+		}
+		appendStringInfo(&cols, "%s%s %s", cols.len > 0 ? ", " : "",
+						 quote_identifier(colname),
+						 format_type_be(aggref->aggtype));
+		appendStringInfo(&aggs, "%s%s(%s)%s", aggs.len > 0 ? ", " : "",
+						 proname, quote_identifier(colname), cast);
+	}
+
+	appendStringInfo(&sql,
+					 "SELECT %s, %s FROM gp.peer_query(%s) AS gp_two_phase(%s) "
+					 "GROUP BY %s HAVING (%s)[gp.bucket(%d, %s) + 1] "
+					 "OPERATOR(pg_catalog.=) current_setting('gp.segment_id')::int4",
+					 keys.data, aggs.data, quote_literal_cstr(planned),
+					 cols.data, keys.data, map.data, policy.nbuckets, keys.data);
+
+	{
+		CustomScan *cscan = gp_slice_partial_cscan(agg, &state, sql.data,
+												   remote->targetList, true,
+												   gp_slice_autonomous(parse),
+												   only);
+
+		return gp_slice_partial_combine(agg, &state, below, cscan,
+										parse->targetList,
+										(List *) parse->havingQual);
+	}
 }
 
 /*
@@ -5720,6 +6186,11 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 	gp_partial_walker((Node *) parse->targetList, &state);
 	if (state.ok)
 		gp_partial_walker((Node *) parse->havingQual, &state);
+	if (state.ok && gp_partial_mutable_parts(parse, &state))
+		state.ok = false;
+	if (state.ok && parse->jointree->quals != NULL &&
+		gp_slice_extern_param_walker(parse->jointree->quals, NULL))
+		state.ok = false;
 	if (!state.ok || (state.aggs == NIL && state.avgs == NIL))
 	return;
 
@@ -5828,8 +6299,27 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 			return;
 	}
 
-	(void) gp_slice_partial_finish(agg, &state, remote, false,
-								  parse->targetList, (List *) parse->havingQual);
+	{
+		int			only = 0;
+
+		/* A table pinned to one segment answers there alone */
+		if (policy.nbuckets > 0)
+		{
+			bool		uniform = true;
+
+			for (int i = 1; i < policy.nbuckets; i++)
+				if (policy.map[i] != policy.map[0])
+				{
+					uniform = false;
+					break;
+				}
+			if (uniform)
+				only = policy.map[0];
+		}
+		(void) gp_slice_partial_finish(agg, &state, remote, false,
+									  parse->targetList,
+									  (List *) parse->havingQual, only);
+	}
 }
 
 /*
@@ -6223,7 +6713,7 @@ gp_slice_initplan_plan(List *candidates, PlannedStmt *stmt)
 		out = makeTargetEntry(final, ptle->resno,
 							  ptle->resname, ptle->resjunk);
 		if (!gp_slice_partial_finish(agg, &state, remote, false,
-									 list_make1(out), NIL))
+									 list_make1(out), NIL, 0))
 			return false;
 	}
 	return true;
@@ -6318,7 +6808,7 @@ gp_slice_join_partial(Query *original, PlannedStmt *stmt, Plan *plan,
 		return false;
 
 	if (!gp_slice_partial_finish(agg, &finalstate, remote, motion,
-								 agg->plan.targetlist, agg->plan.qual))
+								 agg->plan.targetlist, agg->plan.qual, 0))
 		return false;
 	/* Partial groups from different segments are not sorted by group key */
 	agg->aggstrategy = AGG_HASHED;
