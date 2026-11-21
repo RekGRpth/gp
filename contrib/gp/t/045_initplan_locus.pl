@@ -67,14 +67,14 @@ like(plan_for('SELECT count(*) FROM t WHERE a > (SELECT avg(a) FROM u)'),
 unlike(plan_for('SELECT count(*) FROM t s WHERE s.b > (SELECT avg(s2.b) FROM t s2 WHERE s2.a = s.a)'),
 	qr/InitPlan.*GpSlice/s,
 	'a correlated subselect is not an init plan of the segments');
-unlike(plan_for('SELECT count(*) FROM t WHERE b > (SELECT avg(b) FROM rep)'),
-	qr/InitPlan.*GpSlice/s,
+like(plan_for('SELECT count(*) FROM t WHERE b > (SELECT avg(b) FROM rep)'),
+	qr/InitPlan expr_1\n.*Seq Scan on rep/s,
 	'a replicated table is answered by one segment already');
 unlike(plan_for('SELECT count(*) FROM t WHERE b > (SELECT avg(b) FROM l)'),
 	qr/InitPlan.*GpSlice/s,
 	'a table of the coordinator has no gather to answer');
-unlike(plan_for('SELECT count(*) FROM t WHERE b > (SELECT avg(b) FROM t) AND c > (SELECT min(c) FROM t)'),
-	qr/InitPlan.*GpSlice/s,
+like(plan_for('SELECT count(*) FROM t WHERE b > (SELECT avg(b) FROM t) AND c > (SELECT min(c) FROM t)'),
+	qr/InitPlan expr_1.*InitPlan expr_2/s,
 	'two init plans over one table share the one candidate, so both stay');
 
 my @queries = (

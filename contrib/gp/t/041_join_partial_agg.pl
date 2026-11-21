@@ -38,12 +38,12 @@ like(plan_for('SELECT sum(t2.v) FROM t1 JOIN t2 ON t1.a + 0 = t2.a'),
 	qr/GpSlice/, 'a broadcast join feeds a partial aggregate');
 like(plan_for('SELECT t2.g, sum(t2.v) FROM t1 LEFT JOIN t2 ON t1.a + 0 = t2.a GROUP BY t2.g'),
 	qr/GpSlice/, 'final grouping merges null groups of an outer join');
-unlike(plan_for('SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.a'),
-	qr/GpSlice/, 'count does not combine by counting partial rows');
+like(plan_for('SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.a'),
+	qr/GpSlice/, 'count combines by a sum of the partial counts');
 unlike(plan_for('SELECT avg(t2.v) FROM t1 JOIN t2 ON t1.a = t2.a'),
 	qr/GpSlice/, 'average does not combine by dividing partial sums');
-unlike(plan_for('SELECT sum(t1.g) FROM t1 JOIN t2 ON t1.a = t2.a'),
-	qr/GpSlice/, 'sum with another result type keeps its original combiner');
+like(plan_for('SELECT sum(t1.g) FROM t1 JOIN t2 ON t1.a = t2.a'),
+	qr/GpSlice/, 'sum with another result type combines in its result type');
 like(plan_for('SELECT t1.g, count(*) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.g'),
 	qr/GpSlice/, 'a grouped count uses redistribution instead of a partial count');
 like(plan_for('SELECT t1.g, avg(t2.v) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.g'),

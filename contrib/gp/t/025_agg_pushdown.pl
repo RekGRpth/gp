@@ -42,8 +42,8 @@ like(plan_for('SELECT b, count(DISTINCT a) FROM t GROUP BY b'), qr/GpSlice/,
 	'a distinct aggregate works after redistribution too');
 like(plan_for('SELECT b, n FROM (SELECT b, count(*) AS n FROM t GROUP BY b) s'),
 	qr/GpSlice/, 'a non-key aggregate redistributes inside a subquery too');
-unlike(plan_for('SELECT count(*) FROM t'), qr/GpSlice/,
-	'a global aggregate of a hashed table is not pushed');
+like(plan_for('SELECT count(*) FROM t'), qr/GpSlice/,
+	'a global count of a hashed table is answered in two steps');
 unlike(plan_for('SELECT a, count(DISTINCT b) FROM t GROUP BY a ORDER BY a'),
 	qr/GpSlice/,
 	'a sorted aggregate that answers the order by itself is not pushed');
@@ -121,8 +121,9 @@ $session->query_safe('PREPARE own_slice AS SELECT a, count(*) FROM t WHERE a = 1
 $session->query_safe('BEGIN');
 $session->query_safe("INSERT INTO t VALUES (11, 'new', 1)");
 $session->query_safe("INSERT INTO l VALUES (11, 'new', 1)");
-unlike($session->query_safe('EXPLAIN (COSTS OFF) SELECT b, count(*) FROM t GROUP BY b'),
-	qr/GpSlice/, 'an aggregate motion after a write stays on the coordinator');
+like($session->query_safe('EXPLAIN (COSTS OFF) SELECT b, count(*) FROM t GROUP BY b'),
+	qr/GpSlice/,
+	'an aggregate after a write is answered in two steps without a motion');
 is($session->query_safe("SELECT b, count(*) FROM t WHERE b = 'new' GROUP BY b"),
 	$session->query_safe("SELECT b, count(*) FROM l WHERE b = 'new' GROUP BY b"),
 	'an aggregate after a write sees the new row');
@@ -147,8 +148,8 @@ is(run(sprintf($tz_query, 'ts')), run(sprintf($tz_query, 'ts_l')),
 # A dropped column cannot be returned by the record of a motion
 run('ALTER TABLE t ADD COLUMN junk int');
 run('ALTER TABLE t DROP COLUMN junk');
-unlike(plan_for('SELECT b, count(*) FROM t GROUP BY b'), qr/GpSlice/,
-	'a dropped column cancels aggregate redistribution');
+like(plan_for('SELECT b, count(*) FROM t GROUP BY b'), qr/GpSlice/,
+	'a partial aggregate names its columns, a dropped one stops only redistribution');
 is(run('SELECT b, count(*) FROM t GROUP BY b ORDER BY b LIMIT 3'),
 	run('SELECT b, count(*) FROM l GROUP BY b ORDER BY b LIMIT 3'),
 	'a dropped column leaves the right answer on the coordinator');

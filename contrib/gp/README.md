@@ -646,10 +646,33 @@ the segments aggregate their own rows — grouped by the grouping of the
 query, or all rows together when there is none — and the coordinator
 finishes the aggregate over the columns of every segment.  The final
 aggregate is the same aggregate again, which only `min`, `max` and `sum`
-of a type they combine in truly answer; on this path `count` counts the
-partial columns instead of adding them, and the average divides, so they
-stay on the coordinator with every query they are in.  `HAVING` stays on
-the coordinator too, for a group may pass it only as a whole.
+of a type they combine in truly answer; `count` sums the partial counts
+up, and the average divides, so it stays on the coordinator with every
+query it is in.  `HAVING` stays on the coordinator too, for a group may
+pass it only as a whole.
+
+An aggregate of one hashed table, grouped by columns that do not cover
+its distribution key, answers in two phases instead of moving its rows:
+every segment computes a partial aggregate over its own rows, the
+partials of all the segments answer one combine query in which every
+segment combines the groups the hash of the grouping columns assigns to
+it — the fragment reads its own number from `gp.segment_id` — and the
+coordinator finishes the aggregate over the per-segment answers, so no
+row of the table crosses the interconnect.  The fragment is built as
+text: the partial aggregate moves as a serialized plan through
+`gp.peer_query()`, like the motion of a join, and the combine query
+groups and aggregates its columns.  The marker of the partial aggregate
+is wrapped in the same ownership filter, so a segment computes the
+partials of the groups of the asking segment only.  The combining
+aggregate runs over
+the result type of the original one and comes back to it through a cast
+when they differ, as `sum` of `int8` answers in `numeric`.  `count`
+moves through a `sum` of the partial counts; the average, distinct and
+ordered aggregates are not splittable and take the row-moving fallback.
+Queries with volatile functions in their conditions or aggregate
+arguments, with external parameters, or after a write in the same
+transaction are not pushed either; a table pinned to one segment is read
+there alone.
 
 `EXPLAIN (VERBOSE)` shows the query of the segments.
 
@@ -823,6 +846,7 @@ runner) turns into the evidence of a racing slice.
 | `052_alter_system.pl` | A parameter of the whole cluster through SQL: `gp.alter_system()` reaches every node and `gp.reload_conf()` makes it served, a quoted value survives the trip, an unknown parameter changes nothing, the functions are for the superuser alone, and a segment refuses them |
 | `053_multiway_outer.pl` | A chain of base tables joined by one kind of an outer join keeps the rows its every join keeps: a left join chain stays on the segments with the first table and broadcasts the rest, a full join chain broadcasts everything to one segment, null keys keep their rows, mixed levels and aggregates of null-supplying columns stay on the coordinator, and the answers match the coordinator |
 | `054_fragment_snapshots.pl` | A fragment of a slice with motions attaches the exported snapshots of its statement: pull workers parked through a segment-local commit answer from the state before it, never a mix of both, and the next statement sees the commit |
+| `055_two_phase_agg.pl` | An aggregate grouped by columns that do not cover the distribution key answers in two phases: the fragment combines a serialized partial aggregate through `gp.peer_query()` and the ownership filter reads `gp.segment_id`; the answers match the local ones |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show

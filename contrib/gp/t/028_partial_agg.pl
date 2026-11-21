@@ -5,7 +5,7 @@
 # move all rows to one segment, is answered in two steps: the segments
 # aggregate their own rows, and the coordinator finishes the aggregate over
 # the columns of every segment.  min, max and sum of a closing type combine
-# by the same aggregate again
+# by the same aggregate again, and count by a sum of the partial counts
 
 use strict;
 use warnings FATAL => 'all';
@@ -36,14 +36,14 @@ like(plan_for('SELECT sum(c) FROM t WHERE c > 100 AND c < 1000'),
 	qr/GpSlice/, 'a partial aggregate deparses several WHERE conditions');
 like(plan_for('SELECT a % 2, min(c) FROM t GROUP BY a % 2 HAVING min(c) > 100'),
 	qr/GpSlice/, 'HAVING stays on the coordinator and does not stop the answer');
-unlike(plan_for('SELECT a % 2, count(*) FROM t GROUP BY a % 2'), qr/GpSlice/,
-	'count counts the partial columns, so it stays on the coordinator');
+like(plan_for('SELECT a % 2, count(*) FROM t GROUP BY a % 2'), qr/GpSlice/,
+	'count combines by a sum of the partial counts');
 like(plan_for('SELECT avg(c) FROM t'), qr/GpSlice/,
 	'the average answers a partial sum and a partial count on the segments');
 like(plan_for('SELECT a % 2, avg(c) FROM t GROUP BY a % 2'), qr/GpSlice/,
 	'a grouped average is answered partly on the segments');
-unlike(plan_for('SELECT a % 2, sum(c), count(*) FROM t GROUP BY a % 2'),
-	qr/GpSlice/, 'a mix with count stays on the coordinator');
+like(plan_for('SELECT a % 2, sum(c), count(*) FROM t GROUP BY a % 2'),
+	qr/GpSlice/, 'a mix with count moves to the segments too');
 
 my @queries = (
 	'SELECT a % 2, sum(c) FROM t GROUP BY a % 2 ORDER BY 1',

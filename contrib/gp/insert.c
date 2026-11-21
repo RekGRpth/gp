@@ -1015,7 +1015,7 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 		(void) gp_slice_initplan_plan(initplan_cands, stmt);
 
 	if (agg_original != NULL)
-		replaced = gp_slice_agg_plan(agg_original, stmt);
+		replaced = gp_slice_agg_plan(agg_original, parse, stmt);
 	else if (join_original != NULL)
 		replaced = gp_slice_join_plan(join_original, stmt);
 
@@ -1045,7 +1045,7 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 		Query	   *flattened = gp_slice_agg_query(parse);
 
 		if (flattened != NULL)
-			replaced = gp_slice_agg_plan(flattened, stmt);
+			replaced = gp_slice_agg_plan(flattened, parse, stmt);
 		if (!replaced)
 		{
 			flattened = gp_slice_join_query(parse);

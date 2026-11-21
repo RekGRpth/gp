@@ -114,6 +114,7 @@ tests += {
       't/052_alter_system.pl',
       't/053_multiway_outer.pl',
       't/054_fragment_snapshots.pl',
+      't/055_two_phase_agg.pl',
     ],
   },
 }

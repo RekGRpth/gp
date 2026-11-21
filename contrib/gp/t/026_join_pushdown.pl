@@ -65,8 +65,8 @@ like(plan_for('SELECT j1.a, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.
 	'a sorted aggregate over a join gets its final Sort above GpSlice');
 like(plan_for('SELECT j1.b, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.b'),
 	qr/GpSlice/, 'a join grouped by another key is redistributed and pushed');
-unlike(plan_for('SELECT count(*) FROM j1 JOIN j2 ON j1.a = j2.a'), qr/GpSlice/,
-	'a global aggregate over a join is not pushed');
+like(plan_for('SELECT count(*) FROM j1 JOIN j2 ON j1.a = j2.a'), qr/GpSlice/,
+	'a global count over a join combines partial counts');
 like(plan_for('SELECT j1.a, r1.d, count(*) FROM j1 JOIN r1 ON j1.a = r1.a GROUP BY j1.a, r1.d'),
 	qr/GpSlice/, 'an aggregate over a hashed and a replicated table is pushed');
 like(plan_for('SELECT r1.a, count(*) FROM r1 JOIN r2 ON r1.a = r2.a GROUP BY r1.a'),
