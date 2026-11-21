@@ -152,9 +152,17 @@ $session->pump
 like($stderr, qr/canceling statement due to user request/,
 	'the nested query dies of the cancellation itself');
 $session->finish;
+# The cancel stops the root; the reader stops with it unless it parked at
+# the injection point first, which only the test can wake, so wake a parked
+# one and let the rest go with the detach
+if ($segment->safe_psql('postgres',
+	"SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'gp interconnect request' AND wait_event = 'gp-interconnect-reader'") eq 't')
+{
+	$segment->safe_psql('postgres',
+		"SELECT injection_points_wakeup('gp-interconnect-reader')");
+}
 $segment->safe_psql('postgres',
-	"SELECT injection_points_wakeup('gp-interconnect-reader');
-SELECT injection_points_detach('gp-interconnect-reader')");
+	"SELECT injection_points_detach('gp-interconnect-reader')");
 foreach my $node (@segments)
 {
 	$node->poll_query_until('postgres',

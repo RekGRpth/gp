@@ -38,6 +38,7 @@
 #include "lib/stringinfo.h"
 #include "libpq-fe.h"
 #include "libpq/libpq-be-fe-helpers.h"
+#include "libpq/libpq.h"
 #include "miscadmin.h"
 #include "nodes/readfuncs.h"
 #include "optimizer/planner.h"
@@ -86,6 +87,12 @@
 
 /* Snapshot exports received by this worker, forwarded by its nested motions */
 static GpSnapshots *gp_ic_current_snapshots = NULL;
+
+/* The socket of the client of this worker, watched from its nested
+ * waits: a client that dies says so on this socket, and the waits of
+ * the fragment must hear it instead of waiting for a peer that the
+ * dead client will never read */
+static pgsocket gp_ic_supervisor_fd = PGINVALID_SOCKET;
 
 /* The number of this backend's interconnect requests, for log correlation */
 static uint64 gp_ic_next_request = 0;
@@ -399,11 +406,14 @@ static WaitEventSet *
 gp_ic_wes(pgsocket fd)
 {
 	/* Session lifetime: the set is freed explicitly with the connection */
-	WaitEventSet *wes = CreateWaitEventSet(NULL, 3);
+	WaitEventSet *wes = CreateWaitEventSet(NULL, 4);
 
 	AddWaitEventToSet(wes, WL_SOCKET_READABLE, fd, NULL, NULL);
 	AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
 	AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET, NULL, NULL);
+	if (gp_ic_supervisor_fd != PGINVALID_SOCKET)
+		AddWaitEventToSet(wes, WL_SOCKET_READABLE,
+						  gp_ic_supervisor_fd, NULL, NULL);
 	return wes;
 }
 
@@ -418,19 +428,29 @@ gp_ic_wes(pgsocket fd)
 static int
 gp_ic_wait(WaitEventSet *wes, uint32 socket_events)
 {
-	WaitEvent	event;
+	WaitEvent	events[2];
 	int			wake;
 	int			holdoff = InterruptHoldoffCount;
+	uint32		occurred = 0;
 
 	ModifyWaitEvent(wes, GP_IC_WES_SOCKET, socket_events, NULL);
 	InterruptHoldoffCount = 0;
-	wake = WaitEventSetWait(wes, 100L, &event, 1, gp_ic_client_event());
-	if (wake > 0 && (event.events & WL_LATCH_SET))
-		ResetLatch(MyLatch);
+	wake = WaitEventSetWait(wes, 100L, events, 2, gp_ic_client_event());
+	for (int i = 0; i < wake; i++)
+	{
+		if (gp_ic_supervisor_fd != PGINVALID_SOCKET &&
+			events[i].fd == gp_ic_supervisor_fd)
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("the interconnect client went away while its fragment ran")));
+		if (events[i].events & WL_LATCH_SET)
+			ResetLatch(MyLatch);
+		occurred |= events[i].events;
+	}
 	/* An interrupt is answered here, while nothing holds it back */
 	CHECK_FOR_INTERRUPTS();
 	InterruptHoldoffCount = holdoff;
-	return wake > 0 ? event.events : 0;
+	return occurred;
 }
 
 /* Read from the socket, waiting on the set of its connection */
@@ -834,10 +854,16 @@ gp_ic_serve(pgsocket fd, const char *token, int slot_id, uint64 *request_id)
 						errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("could not set the receiving segment"));
 			gp_ic_current_snapshots = snapshots;
+			/* The nested waits of the fragment watch this socket: the
+			 * client sends nothing after GO, so an event on it means it
+			 * died, and the fragment must not wait for a peer whose rows
+			 * nobody will read */
+			gp_ic_supervisor_fd = fd;
 			/* Tests park a self-motion reader beside its living parent */
 			if (requester == gp_segment_id && snapshots->count > 0)
 				INJECTION_POINT("gp-interconnect-reader", NULL);
 			gp_ic_execute(fd, sql, id);
+			gp_ic_supervisor_fd = PGINVALID_SOCKET;
 			gp_ic_current_snapshots = NULL;
 
 			if (!gp_ic_write_message(fd, GP_IC_EOS, NULL, 0))
@@ -1939,6 +1965,14 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 	bool		retry = false;
 	uint32		row_number = 0;
 	uint64		request_id = ++gp_ic_next_request;
+	/* A top-level request watches the socket of its session: a client
+	 * that dies cancels the query, and the fragment and its workers go
+	 * with it.  A nested request already watches its own supervisor. */
+	pgsocket	saved_supervisor = gp_ic_supervisor_fd;
+
+	if (saved_supervisor == PGINVALID_SOCKET &&
+		MyProcPort != NULL && MyProcPort->sock >= 0)
+		gp_ic_supervisor_fd = MyProcPort->sock;
 
 	ereport(LOG,
 			errmsg("interconnect request %llu asks segment %d",
@@ -2196,6 +2230,7 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	gp_ic_supervisor_fd = saved_supervisor;
 	MemoryContextDelete(rowcxt);
 	return !retry;
 }
