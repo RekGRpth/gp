@@ -854,11 +854,15 @@ gp_ic_serve(pgsocket fd, const char *token, int slot_id, uint64 *request_id)
 						errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("could not set the receiving segment"));
 			gp_ic_current_snapshots = snapshots;
+#ifndef WIN32
 			/* The nested waits of the fragment watch this socket: the
 			 * client sends nothing after GO, so an event on it means it
 			 * died, and the fragment must not wait for a peer whose rows
-			 * nobody will read */
+			 * nobody will read.  Windows is left out: the event semantics
+			 * of a second socket in the set need their own campaign, and
+			 * a spurious wake would fail a healthy fragment */
 			gp_ic_supervisor_fd = fd;
+#endif
 			/* Tests park a self-motion reader beside its living parent */
 			if (requester == gp_segment_id && snapshots->count > 0)
 				INJECTION_POINT("gp-interconnect-reader", NULL);
@@ -1970,9 +1974,11 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 	 * with it.  A nested request already watches its own supervisor. */
 	pgsocket	saved_supervisor = gp_ic_supervisor_fd;
 
+#ifndef WIN32
 	if (saved_supervisor == PGINVALID_SOCKET &&
 		MyProcPort != NULL && MyProcPort->sock >= 0)
 		gp_ic_supervisor_fd = MyProcPort->sock;
+#endif
 
 	ereport(LOG,
 			errmsg("interconnect request %llu asks segment %d",
