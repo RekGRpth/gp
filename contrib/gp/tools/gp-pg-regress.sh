@@ -105,19 +105,10 @@ set +e
 rc=$?
 set -e
 
-# A cluster answer can name a relation OID that only the OID counter of
-# the run fixes: a concurrent drop opens the relation by OID, and the
-# counter depends on the catalog the cluster was made of.  When that is
-# the only difference of the run, the run passed.
-if [ "$rc" -ne 0 ] && [ -f "$OUTDIR/regression.diffs" ]; then
-	leftovers=$(grep -E '^[+-]' "$OUTDIR/regression.diffs" |
-		grep -vE '^(\+\+\+|---)' |
-		grep -cvE '^[+-]ERROR:  could not open relation with OID [0-9]+$' || true)
-	if [ "$leftovers" -eq 0 ] &&
-		grep -qE '^-ERROR:  could not open relation with OID [0-9]+$' \
-			"$OUTDIR/regression.diffs"; then
-		echo "gp-pg-regress.sh: only relation-OID differences remain; the run passes" >&2
-		rc=0
-	fi
+# A difference the cluster decides by a race is not a failure: the check
+# names the spans of the answers where a race lives
+if [ "$rc" -ne 0 ] && "$(dirname "$0")/gp-gp-racy-check.sh" "$OUTDIR"; then
+	echo "gp-pg-regress.sh: only a racy scenario differs; the run passes" >&2
+	rc=0
 fi
 exit "$rc"
