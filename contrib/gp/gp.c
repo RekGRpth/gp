@@ -128,6 +128,16 @@ _PG_init(void)
 	if (!process_shared_preload_libraries_in_progress)
 		return;
 
+	/*
+	 * The interconnect assigns a dynamic worker per request and parallel
+	 * motions ask every segment at once, so the postmaster must be able
+	 * to start them all
+	 */
+	if (max_worker_processes < GP_IC_SLOTS + 16)
+		SetConfigOption("max_worker_processes",
+						psprintf("%d", GP_IC_SLOTS + 16),
+						PGC_POSTMASTER, PGC_S_OVERRIDE);
+
 	prev_shmem_request_hook = shmem_request_hook;
 	shmem_request_hook = gp_shmem_request;
 

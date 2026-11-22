@@ -66,6 +66,9 @@ typedef struct GpSegment
 	char		host[GP_HOST_LEN];
 } GpSegment;
 
+/* interconnect.c: concurrent request workers a broker assigns */
+#define GP_IC_SLOTS 64
+
 /* GUC variables */
 extern const char *gp_coordinator_conninfo(void);
 extern const char *gp_host_address(void);
@@ -152,14 +155,11 @@ extern void gp_motion_init(void);
 extern void gp_interconnect_init(void);
 extern char *gp_interconnect_plan(const char *sql);
 extern GpSnapshots *gp_interconnect_snapshots(void);
-extern void gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
-								  const char *db, const char *user, const char *sql,
-								  const char *host, int port, int segment_id,
-								  int requester, GpSnapshots *snapshots);
-extern bool gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
-								  const char *db, const char *user, const char *sql,
-								  const char *host, int port, int segment_id,
-								  int requester, GpSnapshots *snapshots);
+extern void gp_interconnect_pulls(Tuplestorestate *store, TupleDesc tupdesc,
+								  const char *db, const char *user,
+								  const char *sql, int requester,
+								  GpSnapshots *snapshots,
+								  const GpSegment *segments, int nsegments);
 
 /* recovery.c */
 extern void gp_recovery_init(void);
