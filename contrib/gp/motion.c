@@ -177,22 +177,28 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 	if (snapshots != NULL)
 		INJECTION_POINT("gp-interconnect-parent", NULL);
 
-	for (int i = 0; i < PQntuples(segments); i++)
 	{
-		const char *host = PQgetvalue(segments, i, 1);
-		int			segment_id = atoi(PQgetvalue(segments, i, 0));
-		int			broker = PQgetisnull(segments, i, 3) ? 0 :
-			atoi(PQgetvalue(segments, i, 3));
-		int			requester = gp_segment_id;
+		int			nsegments = PQntuples(segments);
+		GpSegment  *wanted = palloc0_array(GpSegment, nsegments);
 
-		if (broker == 0)
-			ereport(ERROR,
-					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					errmsg("segment %d has not reported its interconnect port yet",
-						   segment_id));
-		gp_interconnect_query(store, tupdesc, db,
-							  GetUserNameFromId(GetUserId(), false), serialized,
-							  host, broker, segment_id, requester, snapshots);
+		for (int i = 0; i < nsegments; i++)
+		{
+			wanted[i].segment_id = atoi(PQgetvalue(segments, i, 0));
+			strlcpy(wanted[i].host, PQgetvalue(segments, i, 1),
+					sizeof(wanted[i].host));
+			wanted[i].port = atoi(PQgetvalue(segments, i, 2));
+			wanted[i].interconnect_port = PQgetisnull(segments, i, 3) ? 0 :
+				atoi(PQgetvalue(segments, i, 3));
+			if (wanted[i].interconnect_port == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("segment %d has not reported its interconnect port yet",
+								wanted[i].segment_id)));
+		}
+		gp_interconnect_pulls(store, tupdesc, db,
+							  GetUserNameFromId(GetUserId(), false),
+							  serialized, gp_segment_id, snapshots,
+							  wanted, nsegments);
 	}
 
 	PQclear(segments);

@@ -425,6 +425,12 @@ STARTING, READY, ASSIGNED and BUSY back to FREE, and the broker reaps stopped
 workers.  Nested Motion to the same segment therefore gets another worker
 instead of waiting for a busy single listener.
 
+A motion asks every segment at once.  The client opens a pull on each
+segment — the broker handshake through the READY of the worker —, starts
+every worker with GO, and reads the answers as they come on one wait
+set, disabling the sockets of the pulls that reached their end, so the
+segments of an answer and the sources of a moving table run at once.
+
 All readers of one statement share one snapshot per segment.  Before the
 first of them starts, and under the statement's distributed commit-exclusion
 lock, the coordinator opens a separate READ ONLY REPEATABLE READ connection

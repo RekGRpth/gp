@@ -150,7 +150,7 @@ my @queries = (
 	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t FROM s, t WHERE s.b = t.b AND s.t = (SELECT max(t) FROM s) ORDER BY 1',
 	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, t.a FROM s, t WHERE s.b = t.b AND s.t > (SELECT min(t) FROM s) ORDER BY 1, 3',
 	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, u.n FROM s LEFT JOIN u ON s.b = u.b WHERE s.t = (SELECT max(t) FROM s) ORDER BY 1',
-	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, t.a FROM s JOIN t ON s.b = t.b AND s.t = (SELECT max(t) FROM s) ORDER BY 1',
+	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, t.a FROM s JOIN t ON s.b = t.b AND s.t = (SELECT max(t) FROM s) ORDER BY 1, 3',
 	'WITH s AS MATERIALIZED (SELECT b, sum(v) AS t FROM t GROUP BY b) SELECT s.b, s.t, u.n FROM s LEFT JOIN u ON s.b = u.b AND s.t = (SELECT max(t) FROM s) ORDER BY 1',
 );
 foreach my $query (@queries)

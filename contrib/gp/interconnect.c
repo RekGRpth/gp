@@ -82,7 +82,6 @@
 #define GP_IC_ASSIGN 'A'
 #define GP_IC_CANCEL 'C'
 
-#define GP_IC_SLOTS 64
 #define GP_IC_MAX_SNAPSHOTS 1024
 
 /* Snapshot exports received by this worker, forwarded by its nested motions */
@@ -1771,7 +1770,6 @@ gp_interconnect_row(Tuplestorestate *store, TupleDesc tupdesc,
 	ExecDropSingleTupleTableSlot(slot);
 }
 
-/* Connect to the broker or to an assigned worker */
 static pgsocket
 gp_ic_connect(const char *host, int port)
 {
@@ -1942,36 +1940,457 @@ gp_ic_send_query_latched(pgsocket fd, WaitEventSet *wes, uint64 request_id,
 }
 
 /*
- * Ask one peer for its rows; false asks for a dispatched-connection
- * fallback.  The port is that of the peer's broker, not of its server
+ * One pull of rows from one segment.  A parallel motion opens a pull for
+ * every segment, lets every worker start, and reads the answers as they
+ * come; the struct keeps the socket and the bytes of a message that is
+ * only half read
  */
-bool
-gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
-					  const char *db, const char *user, const char *sql,
-					  const char *host, int port, int segment_id,
-					  int requester, GpSnapshots *snapshots)
+typedef struct GpIcPull
 {
-	/*
-	 * The socket, the worker it goes to and the fact of it are written
-	 * in the try block and read in the catch, after the error jump:
-	 * without the volatile the values there are undefined, and on i386
-	 * the catch read the target as empty and quietly cancelled nothing
-	 */
-	pgsocket	volatile fd = PGINVALID_SOCKET;
-	WaitEventSet *wes = NULL;
-	bool		volatile have_target = false;
-	int32		volatile slot_id = 0;
-	uint64		volatile generation = 0;
-	FmgrInfo   *recv;
+	const char *host;			/* the broker of the segment */
+	int			port;
+	int			segment_id;
+	uint64		request_id;
+	pgsocket	fd;				/* the worker connection */
+	StringInfoData inbuf;		/* received, not consumed */
+	uint32		row_number;		/* rows consumed */
+	bool		done;			/* the end of the answer */
+	bool		have_target;	/* a worker owns the request */
+	int			slot_id;
+	uint64		generation;
+} GpIcPull;
+
+/*
+ * The opening of a pull: the broker names a worker, the worker names its
+ * segment, and the connection is left ready for the start.  A busy
+ * broker is asked again, the way a single request retries
+ */
+static void
+gp_ic_pull_open(GpIcPull *pull, const char *db, const char *user,
+				const char *sql, int requester, GpSnapshots *snapshots)
+{
+	char	   *token = gp_interconnect_token();
+
+	if (token == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the interconnect token is not installed yet")));
+
+	pull->request_id = ++gp_ic_next_request;
+	ereport(LOG,
+			(errmsg("interconnect request %llu asks segment %d",
+					(unsigned long long) pull->request_id,
+					pull->segment_id)));
+
+	for (int attempt = 0;; attempt++)
+	{
+		WaitEventSet *wes;
+		bool		retry = false;
+		const char *why = "connect";
+		char		type;
+		int32		len;
+		char		answer[16];
+		int			worker_port = 0;
+
+		pull->fd = gp_ic_connect(pull->host, pull->port);
+		if (pull->fd == PGINVALID_SOCKET)
+			retry = true;
+		else if (!pg_set_noblock(pull->fd))
+		{
+			closesocket(pull->fd);
+			pull->fd = PGINVALID_SOCKET;
+			retry = true;
+		}
+		if (retry)
+		{
+			if (attempt >= 59)
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("could not connect to the interconnect of %s",
+								pull->host)));
+			pg_usleep(100000);
+			continue;
+		}
+		wes = gp_ic_wes(pull->fd);
+		PG_TRY();
+		{
+			if (!gp_ic_send_query_latched(pull->fd, wes, pull->request_id,
+										  token, db, user, requester, sql,
+										  snapshots))
+			{
+				retry = true;
+				why = "broker-send";
+			}
+			if (!retry &&
+				(!gp_ic_read_latched(pull->fd, wes, &type, 1) ||
+				 !gp_ic_read_i32_latched(pull->fd, wes, &len) ||
+				 len < 0 || len > GP_IC_MAX_STRING))
+			{
+				retry = true;
+				why = "broker-read";
+			}
+			if (!retry && type == GP_IC_ASSIGN && len == sizeof(answer))
+			{
+				uint32		net_port;
+				uint32		gen_hi;
+				uint32		gen_lo;
+				int32		assigned_slot;
+
+				if (!gp_ic_read_latched(pull->fd, wes, answer, sizeof(answer)))
+				{
+					retry = true;
+					why = "assign-read";
+				}
+				else
+				{
+					memcpy(&net_port, answer + 0, sizeof(net_port));
+					memcpy(&assigned_slot, answer + 4, sizeof(assigned_slot));
+					memcpy(&gen_hi, answer + 8, sizeof(gen_hi));
+					memcpy(&gen_lo, answer + 12, sizeof(gen_lo));
+					worker_port = (int) ntohl(net_port);
+					pull->slot_id = ntohl(assigned_slot);
+					pull->generation = ((uint64) ntohl(gen_hi) << 32) |
+						ntohl(gen_lo);
+					pull->have_target = true;
+				}
+			}
+			else if (!retry && type == GP_IC_RETRY && len == 0)
+			{
+				retry = true;
+				why = "broker-retry";
+			}
+			else if (!retry && type == GP_IC_ERROR)
+			{
+				char	   *data = palloc(len);
+
+				if (!gp_ic_read_latched(pull->fd, wes, data, len))
+					retry = true;
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_INTERNAL_ERROR),
+							 errmsg("the segment returned an error: %.*s",
+									len, data)));
+			}
+			else if (!retry)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("an unknown assignment of the interconnect")));
+		}
+		PG_FINALLY();
+		{
+			closesocket(pull->fd);
+			pull->fd = PGINVALID_SOCKET;
+			FreeWaitEventSet(wes);
+		}
+		PG_END_TRY();
+
+		if (!retry)
+		{
+			pull->fd = gp_ic_connect(pull->host, worker_port);
+			if (pull->fd == PGINVALID_SOCKET)
+			{
+				retry = true;
+				why = "worker-connect";
+			}
+			else if (!pg_set_noblock(pull->fd))
+			{
+				closesocket(pull->fd);
+				pull->fd = PGINVALID_SOCKET;
+				retry = true;
+				why = "worker-noblock";
+			}
+		}
+		if (!retry)
+		{
+			wes = gp_ic_wes(pull->fd);
+			PG_TRY();
+			{
+				char		go_ready;
+				char	   *data;
+				int32		rlen;
+
+				if (!gp_ic_send_query_latched(pull->fd, wes,
+											  pull->request_id, token,
+											  db, user, requester, sql,
+											  snapshots))
+				{
+					retry = true;
+					why = "worker-send";
+				}
+				if (!retry &&
+					(!gp_ic_read_latched(pull->fd, wes, &go_ready, 1) ||
+					 !gp_ic_read_i32_latched(pull->fd, wes, &rlen) ||
+					 rlen < 0 || rlen > GP_IC_MAX_STRING))
+				{
+					retry = true;
+					why = "ready-read";
+				}
+				if (!retry)
+				{
+					data = palloc(rlen);
+					if (!gp_ic_read_latched(pull->fd, wes, data, rlen))
+					{
+						retry = true;
+						why = "ready-data";
+					}
+					else if (go_ready == GP_IC_RETRY && rlen == 0)
+					{
+						retry = true;
+						why = "worker-retry";
+					}
+					else if (go_ready == GP_IC_READY &&
+							 rlen == sizeof(int32))
+					{
+						int32		net_segment;
+						int			answered;
+
+						memcpy(&net_segment, data, sizeof(net_segment));
+						answered = (int) ntohl(net_segment);
+						if (answered != pull->segment_id)
+							ereport(ERROR,
+									(errcode(ERRCODE_DATA_CORRUPTED),
+									 errmsg("interconnect request %llu asked segment %d at %s:%d and heard segment %d",
+											(unsigned long long) pull->request_id,
+											pull->segment_id, pull->host,
+											pull->port, answered),
+									 errdetail("The address of the cluster map crossed to another segment.")));
+					}
+					else if (go_ready == GP_IC_ERROR)
+						ereport(ERROR,
+								(errcode(ERRCODE_INTERNAL_ERROR),
+								 errmsg("the segment returned an error: %.*s",
+										rlen, data)));
+					else
+						ereport(ERROR,
+								(errcode(ERRCODE_DATA_CORRUPTED),
+								 errmsg("an unknown start of the interconnect answer")));
+				}
+			}
+			PG_FINALLY();
+			{
+				FreeWaitEventSet(wes);
+			}
+			PG_END_TRY();
+		}
+		if (!retry)
+			return;
+		if (pull->have_target)
+		{
+			gp_ic_cancel_request(pull->host, pull->port, token,
+								 pull->request_id, pull->slot_id,
+								 pull->generation);
+			pull->have_target = false;
+		}
+		if (attempt >= 59)
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("could not connect to the interconnect of %s with the requested database and role (last: %s)",
+							pull->host, why)));
+		pg_usleep(100000);
+	}
+}
+
+/* Let the worker of a started pull run its fragment */
+static void
+gp_ic_pull_go(GpIcPull *pull)
+{
+	WaitEventSet *wes = gp_ic_wes(pull->fd);
+	char		go = GP_IC_GO;
+
+	PG_TRY();
+	{
+		if (!gp_ic_write_latched(pull->fd, wes, &go, 1))
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("could not start the motion query on %s",
+							pull->host)));
+	}
+	PG_FINALLY();
+	{
+		FreeWaitEventSet(wes);
+	}
+	PG_END_TRY();
+}
+
+/*
+ * Consume the complete messages in the buffer of a pull; the bytes of a
+ * message that is only half received stay for the next read
+ */
+static bool
+gp_ic_pull_consume(GpIcPull *pull, Tuplestorestate *store,
+				   TupleDesc tupdesc, FmgrInfo *recvfns, Oid *ioparam,
+				   MemoryContext rowcxt)
+{
+	StringInfo	buf = &pull->inbuf;
+
+	while (buf->len - buf->cursor >= 5)
+	{
+		char		type = buf->data[buf->cursor];
+		int32		len;
+		char	   *data;
+
+		memcpy(&len, buf->data + buf->cursor + 1, sizeof(len));
+		len = ntohl(len);
+		if (len < 0 || len > GP_IC_MAX_STRING)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("an unknown message in the interconnect answer")));
+		if (buf->len - buf->cursor < 5 + len)
+			break;
+		data = buf->data + buf->cursor + 5;
+		if (type == GP_IC_RETRY)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a retry after the start of the interconnect query")));
+		if (type == GP_IC_EOS)
+		{
+			if (len != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("a nonempty end of the interconnect answer")));
+			pull->done = true;
+		}
+		else if (type == GP_IC_ERROR)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("the segment returned an error: %.*s", len, data)));
+		else if (type == GP_IC_ROW)
+		{
+			uint32		net_row;
+			uint32		expected;
+			uint32		received;
+			MemoryContext oldcontext;
+
+			if (len < sizeof(net_row))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("a short row number in the interconnect answer")));
+			memcpy(&net_row, data, sizeof(net_row));
+			expected = ++pull->row_number;
+			received = (uint32) ntohl(net_row);
+			if (received != expected)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("interconnect row number %u, expected %u on %s",
+								received, expected, pull->host)));
+			oldcontext = MemoryContextSwitchTo(rowcxt);
+			gp_interconnect_row(store, tupdesc, recvfns, ioparam,
+								data + sizeof(net_row),
+								len - sizeof(net_row));
+			MemoryContextSwitchTo(oldcontext);
+			MemoryContextReset(rowcxt);
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("an unknown message in the interconnect answer")));
+		buf->cursor += 5 + len;
+		if (pull->done)
+			break;
+	}
+	if (buf->cursor > 0)
+	{
+		memmove(buf->data, buf->data + buf->cursor,
+				buf->len - buf->cursor);
+		buf->len -= buf->cursor;
+		buf->cursor = 0;
+	}
+	return pull->done;
+}
+
+/* Read what arrived on the socket of a pull and consume it */
+static bool
+gp_ic_pull_read(GpIcPull *pull, Tuplestorestate *store, TupleDesc tupdesc,
+				FmgrInfo *recvfns, Oid *ioparam, MemoryContext rowcxt)
+{
+	char		tmp[8192];
+	ssize_t		got;
+
+	for (;;)
+	{
+		got = recv(pull->fd, tmp, sizeof(tmp), 0);
+		if (got > 0)
+		{
+			appendBinaryStringInfo(&pull->inbuf, tmp, got);
+			/* The worker closes its end after the end of the answer */
+			if (gp_ic_pull_consume(pull, store, tupdesc, recvfns, ioparam,
+								   rowcxt))
+				return true;
+		}
+		else if (got == 0)
+		{
+			if (!pull->done)
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("could not read the interconnect answer of %s",
+								pull->host)));
+			break;
+		}
+		else if (errno == EINTR)
+			continue;
+		else
+			break;
+	}
+	return gp_ic_pull_consume(pull, store, tupdesc, recvfns, ioparam, rowcxt);
+}
+
+/* A pull that did not run to its end does not run on */
+static void
+gp_ic_pull_abort(GpIcPull *pull)
+{
+	if (pull->fd != PGINVALID_SOCKET)
+	{
+		if (pull->have_target && !pull->done)
+		{
+			char	   *token = gp_interconnect_token();
+
+			if (token != NULL)
+				gp_ic_cancel_request(pull->host, pull->port, token,
+									 pull->request_id, pull->slot_id,
+									 pull->generation);
+		}
+		closesocket(pull->fd);
+		pull->fd = PGINVALID_SOCKET;
+	}
+	pull->have_target = false;
+}
+
+/* A wait set over the sockets of the pulls that are still reading */
+static WaitEventSet *
+gp_ic_pulls_wes(GpIcPull *pulls, int nsegments)
+{
+	WaitEventSet *wes = CreateWaitEventSet(NULL, nsegments + 3);
+
+	for (int i = 0; i < nsegments; i++)
+		if (!pulls[i].done)
+			AddWaitEventToSet(wes, WL_SOCKET_READABLE, pulls[i].fd,
+							  NULL, &pulls[i]);
+	AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
+	AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET,
+					  NULL, NULL);
+	if (gp_ic_supervisor_fd != PGINVALID_SOCKET)
+		AddWaitEventToSet(wes, WL_SOCKET_READABLE,
+						  gp_ic_supervisor_fd, NULL, NULL);
+	return wes;
+}
+
+/*
+ * Answer one motion on any number of segments at once: every segment
+ * gets a pull, every worker starts, and the rows are read as they come.
+ * The order of the rows of the answer is the order of their arrival
+ */
+void
+gp_interconnect_pulls(Tuplestorestate *store, TupleDesc tupdesc,
+					  const char *db, const char *user, const char *sql,
+					  int requester, GpSnapshots *snapshots,
+					  const GpSegment *segments, int nsegments)
+{
+	GpIcPull   *pulls = palloc0_array(GpIcPull, nsegments);
+	WaitEventSet *wes;
+	WaitEvent  *events;
+	FmgrInfo   *recvfns;
 	Oid		   *ioparam;
 	MemoryContext rowcxt;
-	char	   *token;
-	bool		retry = false;
-	uint32		row_number = 0;
-	uint64		request_id = ++gp_ic_next_request;
-	/* A top-level request watches the socket of its session: a client
-	 * that dies cancels the query, and the fragment and its workers go
-	 * with it.  A nested request already watches its own supervisor. */
 	pgsocket	saved_supervisor = gp_ic_supervisor_fd;
 
 #ifndef WIN32
@@ -1980,27 +2399,7 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 		gp_ic_supervisor_fd = MyProcPort->sock;
 #endif
 
-	ereport(LOG,
-			errmsg("interconnect request %llu asks segment %d",
-				   (unsigned long long) request_id, segment_id));
-
-	token = gp_interconnect_token();
-	if (token == NULL)
-		ereport(ERROR,
-				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("the interconnect token is not installed yet"));
-
-	fd = gp_ic_connect(host, port);
-	if (fd == PGINVALID_SOCKET)
-		return false;
-	if (!pg_set_noblock(fd))
-	{
-		closesocket(fd);
-		return false;
-	}
-	wes = gp_ic_wes(fd);
-
-	recv = palloc0_array(FmgrInfo, tupdesc->natts);
+	recvfns = palloc0_array(FmgrInfo, tupdesc->natts);
 	ioparam = palloc_array(Oid, tupdesc->natts);
 	for (int i = 0; i < tupdesc->natts; i++)
 	{
@@ -2010,254 +2409,113 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 			continue;
 		getTypeBinaryInputInfo(TupleDescAttr(tupdesc, i)->atttypid,
 							   &recvfn, &ioparam[i]);
-		fmgr_info(recvfn, &recv[i]);
+		fmgr_info(recvfn, &recvfns[i]);
 	}
 	rowcxt = AllocSetContextCreate(CurrentMemoryContext, "interconnect row",
 								   ALLOCSET_DEFAULT_SIZES);
 
 	PG_TRY();
 	{
-		if (!gp_ic_send_query_latched(fd, wes, request_id, token, db, user,
-									 requester, sql, snapshots))
-			retry = true;
-
-		/* The broker answers with the worker of the request */
-		if (!retry)
+		for (int i = 0; i < nsegments; i++)
 		{
-			char		type;
-			int32		len;
-			char		answer[16];
-			int			worker_port = 0;
-
-			if (!gp_ic_read_latched(fd, wes, &type, 1) ||
-				!gp_ic_read_i32_latched(fd, wes, &len) ||
-				len < 0 || len > GP_IC_MAX_STRING)
-				retry = true;
-			else if (type == GP_IC_ASSIGN && len == sizeof(answer))
-			{
-				uint32		net_port;
-				uint32		gen_hi;
-				uint32		gen_lo;
-				int32		assigned_slot;
-
-				if (!gp_ic_read_latched(fd, wes, answer, sizeof(answer)))
-					retry = true;
-				else
-				{
-					memcpy(&net_port, answer + 0, sizeof(net_port));
-					memcpy(&assigned_slot, answer + 4, sizeof(assigned_slot));
-					memcpy(&gen_hi, answer + 8, sizeof(gen_hi));
-					memcpy(&gen_lo, answer + 12, sizeof(gen_lo));
-					worker_port = (int) ntohl(net_port);
-					slot_id = ntohl(assigned_slot);
-					generation = ((uint64) ntohl(gen_hi) << 32) | ntohl(gen_lo);
-					have_target = true;
-				}
-			}
-			else if (type == GP_IC_RETRY && len == 0)
-				retry = true;
-			else if (type == GP_IC_ERROR)
-			{
-				char	   *data = palloc(len);
-
-				if (!gp_ic_read_latched(fd, wes, data, len))
-					retry = true;
-				else
-					ereport(ERROR,
-							errcode(ERRCODE_INTERNAL_ERROR),
-							errmsg("the segment returned an error: %.*s", len, data));
-			}
-			else
-				ereport(ERROR,
-						errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("an unknown assignment of the interconnect"));
-			closesocket(fd);
-			fd = PGINVALID_SOCKET;
-			FreeWaitEventSet(wes);
-			wes = NULL;
-			if (!retry)
-			{
-				fd = gp_ic_connect(host, worker_port);
-				if (fd == PGINVALID_SOCKET)
-					retry = true;
-				else if (!pg_set_noblock(fd))
-				{
-					closesocket(fd);
-					fd = PGINVALID_SOCKET;
-					retry = true;
-				}
-				else
-				{
-					wes = gp_ic_wes(fd);
-					if (!gp_ic_send_query_latched(fd, wes, request_id, token,
-												  db, user, requester, sql,
-												  snapshots))
-						retry = true;
-				}
-			}
+			pulls[i].host = segments[i].host;
+			pulls[i].port = segments[i].interconnect_port;
+			pulls[i].segment_id = segments[i].segment_id;
+			initStringInfo(&pulls[i].inbuf);
+			gp_ic_pull_open(&pulls[i], db, user, sql, requester,
+							snapshots);
 		}
+		for (int i = 0; i < nsegments; i++)
+			gp_ic_pull_go(&pulls[i]);
 
-		/* Until GO is sent, the peer has not executed the fragment */
-		if (!retry)
+		wes = gp_ic_pulls_wes(pulls, nsegments);
+		events = palloc0_array(WaitEvent, nsegments + 3);
+
+		for (;;)
 		{
-			char		type;
-			int32		len;
-			char	   *data;
-			char		go = GP_IC_GO;
-
-			if (!gp_ic_read_latched(fd, wes, &type, 1) ||
-				!gp_ic_read_i32_latched(fd, wes, &len) ||
-				len < 0 || len > GP_IC_MAX_STRING)
-				retry = true;
-			else
-			{
-				data = palloc(len);
-				if (!gp_ic_read_latched(fd, wes, data, len))
-					retry = true;
-				else if (type == GP_IC_RETRY && len == 0)
-					retry = true;
-				else if (type == GP_IC_READY && len == sizeof(int32))
-				{
-					int32		net_segment;
-					int			answered;
-
-					memcpy(&net_segment, data, sizeof(net_segment));
-					answered = (int) ntohl(net_segment);
-					if (answered != segment_id)
-						ereport(ERROR,
-								(errcode(ERRCODE_DATA_CORRUPTED),
-								 errmsg("interconnect request %llu asked segment %d at %s:%d and heard segment %d",
-										(unsigned long long) request_id,
-										segment_id, host, port, answered),
-								 errdetail("The address of the cluster map crossed to another segment.")));
-					if (!gp_ic_write_latched(fd, wes, &go, 1))
-						ereport(ERROR,
-								errcode(ERRCODE_CONNECTION_FAILURE),
-								errmsg("could not start the motion query on %s", host));
-				}
-				else if (type == GP_IC_ERROR)
-					ereport(ERROR,
-							errcode(ERRCODE_INTERNAL_ERROR),
-							errmsg("the segment returned an error: %.*s", len, data));
-				else
-					ereport(ERROR,
-							errcode(ERRCODE_DATA_CORRUPTED),
-							errmsg("an unknown start of the interconnect answer"));
-				pfree(data);
-			}
-		}
-
-		for (; !retry;)
-		{
-			char		type;
-			int32		len;
-			char	   *data;
+			int			wake;
+			bool		pending = false;
+			int			holdoff = InterruptHoldoffCount;
 
 			CHECK_FOR_INTERRUPTS();
-			if (!gp_ic_read_latched(fd, wes, &type, 1) ||
-				!gp_ic_read_i32_latched(fd, wes, &len) ||
-				len < 0 || len > GP_IC_MAX_STRING)
-				ereport(ERROR,
-						errcode(ERRCODE_CONNECTION_FAILURE),
-						errmsg("could not read the interconnect answer of %s: %m", host));
-			data = palloc(len);
-			if (!gp_ic_read_latched(fd, wes, data, len))
-				ereport(ERROR,
-						errcode(ERRCODE_CONNECTION_FAILURE),
-						errmsg("could not read the interconnect answer of %s: %m", host));
-			if (type == GP_IC_RETRY)
-				ereport(ERROR,
-						errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("a retry after the start of the interconnect query"));
-			if (type == GP_IC_EOS)
-			{
-				if (len != 0)
-					ereport(ERROR,
-							errcode(ERRCODE_DATA_CORRUPTED),
-							errmsg("a nonempty end of the interconnect answer"));
-				ereport(LOG,
-						errmsg("interconnect request %llu received %u rows from %s",
-							   (unsigned long long) request_id, row_number,
-							   host));
+			for (int i = 0; i < nsegments; i++)
+				if (!pulls[i].done)
+					pending = true;
+			if (!pending)
 				break;
-			}
-			if (type == GP_IC_ERROR)
-				ereport(ERROR,
-						errcode(ERRCODE_INTERNAL_ERROR),
-						errmsg("the segment returned an error: %.*s", len, data));
-			if (type != GP_IC_ROW)
-				ereport(ERROR,
-						errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("an unknown message in the interconnect answer"));
+			InterruptHoldoffCount = 0;
+			wake = WaitEventSetWait(wes, 100L, events, nsegments + 3,
+									gp_ic_client_event());
+			/* The interrupt is answered here, while nothing holds it
+			 * back, the way gp_ic_wait answers it */
+			CHECK_FOR_INTERRUPTS();
+			InterruptHoldoffCount = holdoff;
+			for (int i = 0; i < wake; i++)
 			{
-				uint32		net_row;
-				uint32		expected;
-				uint32		received;
-				MemoryContext oldcontext;
+				if (gp_ic_supervisor_fd != PGINVALID_SOCKET &&
+					events[i].fd == gp_ic_supervisor_fd)
+					ereport(ERROR,
+							(errcode(ERRCODE_CONNECTION_FAILURE),
+							 errmsg("the interconnect client went away while its fragment ran")));
+				if (events[i].events & WL_LATCH_SET)
+					ResetLatch(MyLatch);
+				if (events[i].events & WL_SOCKET_READABLE &&
+					events[i].user_data != NULL)
+				{
+					GpIcPull   *pull = events[i].user_data;
 
-				if (len < sizeof(net_row))
-					ereport(ERROR,
-							errcode(ERRCODE_DATA_CORRUPTED),
-							errmsg("a short row number in the interconnect answer"));
-				memcpy(&net_row, data, sizeof(net_row));
-				expected = ++row_number;
-				received = (uint32) ntohl(net_row);
-				if (received != expected)
-					ereport(ERROR,
-							errcode(ERRCODE_DATA_CORRUPTED),
-							errmsg("interconnect row number %u, expected %u on %s",
-								   received, expected, host));
-				oldcontext = MemoryContextSwitchTo(rowcxt);
-				gp_interconnect_row(store, tupdesc, recv, ioparam,
-									data + sizeof(net_row), len - sizeof(net_row));
-				MemoryContextSwitchTo(oldcontext);
-				MemoryContextReset(rowcxt);
+					if (!pull->done &&
+						gp_ic_pull_read(pull, store, tupdesc,
+										recvfns, ioparam, rowcxt))
+					{
+						/*
+						 * The set of the OS watches the sockets of the
+						 * open pulls alone: a finished pull leaves it,
+						 * which keeps a half-closed socket from waking
+						 * the wait forever (and a closed one is not a
+						 * socket a Windows set may keep watching)
+						 */
+						closesocket(pull->fd);
+						pull->fd = PGINVALID_SOCKET;
+						pull->have_target = false;
+						FreeWaitEventSet(wes);
+						wes = gp_ic_pulls_wes(pulls, nsegments);
+					}
+				}
 			}
-			pfree(data);
+			CHECK_FOR_INTERRUPTS();
 		}
-		closesocket(fd);
-		if (wes != NULL)
-			FreeWaitEventSet(wes);
-		wes = NULL;
-
-		/* A request that never ran to its end does not run on */
-		if (retry && have_target)
-			gp_ic_cancel_request(host, port, token, request_id,
-								 slot_id, generation);
+		for (int i = 0; i < nsegments; i++)
+		{
+			if (!pulls[i].done)
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("could not read the interconnect answer of %s",
+								pulls[i].host)));
+			ereport(LOG,
+					(errmsg("interconnect request %llu received %u rows from %s",
+							(unsigned long long) pulls[i].request_id,
+							pulls[i].row_number, pulls[i].host)));
+			if (pulls[i].fd != PGINVALID_SOCKET)
+				closesocket(pulls[i].fd);
+			pulls[i].fd = PGINVALID_SOCKET;
+			pulls[i].have_target = false;
+			pfree(pulls[i].inbuf.data);
+		}
+		FreeWaitEventSet(wes);
 	}
 	PG_CATCH();
 	{
-		if (have_target)
-			gp_ic_cancel_request(host, port, token, request_id,
-								 slot_id, generation);
-		closesocket(fd);
-		if (wes != NULL)
-			FreeWaitEventSet(wes);
+		for (int i = 0; i < nsegments; i++)
+			gp_ic_pull_abort(&pulls[i]);
+		gp_ic_supervisor_fd = saved_supervisor;
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 	gp_ic_supervisor_fd = saved_supervisor;
 	MemoryContextDelete(rowcxt);
-	return !retry;
 }
 
-void
-gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
-					  const char *db, const char *user, const char *sql,
-					  const char *host, int port, int segment_id,
-					  int requester, GpSnapshots *snapshots)
-{
-	for (int i = 0; i < 60; i++)
-	{
-		if (gp_interconnect_query_try(store, tupdesc, db, user, sql,
-									  host, port, segment_id, requester,
-									  snapshots))
-			return;
-		CHECK_FOR_INTERRUPTS();
-		pg_usleep(100000);
-	}
-	ereport(ERROR,
-			errcode(ERRCODE_CONNECTION_FAILURE),
-			errmsg("could not connect to the interconnect of %s with the requested database and role",
-				   host));
-}
+
+/* Connect to the broker or to an assigned worker */
+

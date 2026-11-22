@@ -334,6 +334,21 @@ _PG_init(void)
 		strlcpy(worker.bgw_type, "gp register segment", BGW_MAXLEN);
 		RegisterBackgroundWorker(&worker);
 	}
+	/*
+	 * A segment's broker assigns a dynamic worker per interconnect
+	 * request, and parallel motions ask every segment at once, so a
+	 * segment's postmaster must be able to start them all.  Other
+	 * servers run no interconnect workers and keep their setting.  The
+	 * check sits at the end of the load: the role arrives from the
+	 * configuration file, which the placeholders hand to the real
+	 * variable only once it is defined above
+	 */
+	if (gp_role == GP_ROLE_SEGMENT &&
+		max_worker_processes < GP_IC_SLOTS + 16)
+		SetConfigOption("max_worker_processes",
+						psprintf("%d", GP_IC_SLOTS + 16),
+						PGC_POSTMASTER, PGC_S_OVERRIDE);
+
 }
 
 /* The connection string of the coordinator, for the motion of a segment */

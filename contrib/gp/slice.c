@@ -830,20 +830,18 @@ gp_slice_load_interconnect(GpSliceState *state)
 	if (snapshots == NULL)
 		return false;
 	state->store = tuplestore_begin_heap(true, false, work_mem);
-	for (int i = 0; i < nsegments; i++)
 	{
-		if (only != 0 && segments[i].segment_id != only)
-			continue;
-		if (!gp_interconnect_query_try(state->store, tupdesc, db, user, plan,
-								   segments[i].host,
-								   segments[i].interconnect_port,
-								   segments[i].segment_id, 0, snapshots))
+		GpSegment  *wanted = palloc_array(GpSegment, nsegments);
+		int			nwanted = 0;
+
+		for (int i = 0; i < nsegments; i++)
 		{
-			/* Earlier workers may have returned rows already */
-			tuplestore_end(state->store);
-			state->store = NULL;
-			return false;
+			if (only != 0 && segments[i].segment_id != only)
+				continue;
+			wanted[nwanted++] = segments[i];
 		}
+		gp_interconnect_pulls(state->store, tupdesc, db, user, plan, 0,
+							  snapshots, wanted, nwanted);
 	}
 	return true;
 }
