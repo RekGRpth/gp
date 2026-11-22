@@ -5847,6 +5847,35 @@ gp_partial_castable(Oid fromtype, Oid totype)
 }
 
 /*
+ * A combining sum over a partial column of the given type, for the combine
+ * query of the segments: the column and the aggregate are appended, with a
+ * cast back to the column type when the sum answers in another one
+ */
+static bool
+gp_two_phase_sum_combine(StringInfo cols, StringInfo aggs,
+						 const char *colname, Oid coltype)
+{
+	Oid			sumoid = gp_partial_func("sum", coltype);
+	Oid			combinetype;
+	const char *cast = "";
+
+	if (!OidIsValid(sumoid))
+		return false;
+	combinetype = get_func_rettype(sumoid);
+	if (combinetype != coltype)
+	{
+		if (!gp_partial_castable(combinetype, coltype))
+			return false;
+		cast = psprintf("::%s", format_type_be(coltype));
+	}
+	appendStringInfo(cols, "%s%s %s", cols->len > 0 ? ", " : "",
+					 quote_identifier(colname), format_type_be(coltype));
+	appendStringInfo(aggs, "%ssum(%s)%s", aggs->len > 0 ? ", " : "",
+					 quote_identifier(colname), cast);
+	return true;
+}
+
+/*
  * Answer an aggregate whose grouping does not cover the distribution key in
  * two phases.  Every segment runs a partial aggregate over its own rows, and
  * the partials of all the segments answer one combine query: each segment
@@ -5911,7 +5940,7 @@ gp_slice_agg_two_phase(Query *parse, Agg *agg, Plan *below)
 	state.aggs = NIL;
 	state.avgs = NIL;
 	state.keys = NIL;
-	state.allow_avg = false;
+	state.allow_avg = true;
 	state.npos = 0;
 	state.nextaggno = 0;
 	state.below = NULL;
@@ -5955,7 +5984,7 @@ gp_slice_agg_two_phase(Query *parse, Agg *agg, Plan *below)
 	if (state.ok && parse->jointree->quals != NULL &&
 		gp_slice_extern_param_walker(parse->jointree->quals, NULL))
 		state.ok = false;
-	if (!state.ok || state.aggs == NIL)
+	if (!state.ok || (state.aggs == NIL && state.avgs == NIL))
 	{
 		table_close(rel, AccessShareLock);
 		return false;
@@ -6000,15 +6029,51 @@ gp_slice_agg_two_phase(Query *parse, Agg *agg, Plan *below)
 		tle->ressortgroupref = key->ressortgroupref;
 		remote->targetList = lappend(remote->targetList, tle);
 	}
-	foreach(lc, state.aggs)
+	for (Index p = (Index) list_length(state.keys) + 1; p <= state.npos;)
 	{
-		GpPartialAgg *part = lfirst(lc);
-		TargetEntry *tle = makeTargetEntry((Expr *) copyObject(part->aggref),
-										   part->pos,
-										   psprintf("gp_p%u", part->pos),
-										   false);
+		GpPartialAgg *part = NULL;
+		GpPartialAvg *pa = NULL;
+		TargetEntry *tle;
 
+		foreach(lc, state.aggs)
+		{
+			part = lfirst(lc);
+
+			if (part->pos == p)
+				break;
+			part = NULL;
+		}
+		if (part != NULL)
+		{
+			tle = makeTargetEntry((Expr *) copyObject(part->aggref),
+								  part->pos,
+								  psprintf("gp_p%u", part->pos),
+								  false);
+			remote->targetList = lappend(remote->targetList, tle);
+			p++;
+			continue;
+		}
+		foreach(lc, state.avgs)
+		{
+			pa = lfirst(lc);
+
+			if (pa->pos_sum == p)
+				break;
+			pa = NULL;
+		}
+		if (pa == NULL)
+			elog(ERROR, "a partial column has no aggregate");
+		tle = makeTargetEntry((Expr *) copyObject(pa->sum),
+							  pa->pos_sum,
+							  psprintf("gp_p%d", pa->pos_sum),
+							  false);
 		remote->targetList = lappend(remote->targetList, tle);
+		tle = makeTargetEntry((Expr *) copyObject(pa->count),
+							  pa->pos_count,
+							  psprintf("gp_p%d", pa->pos_count),
+							  false);
+		remote->targetList = lappend(remote->targetList, tle);
+		p += 2;
 	}
 	remote->havingQual = NULL;
 	remote->sortClause = NIL;
@@ -6068,31 +6133,69 @@ gp_slice_agg_two_phase(Query *parse, Agg *agg, Plan *below)
 												  att->atttypmod));
 	}
 	table_close(rel, AccessShareLock);
-	foreach(lc, state.aggs)
+	for (Index p = (Index) list_length(state.keys) + 1; p <= state.npos;)
 	{
-		GpPartialAgg *partial = lfirst(lc);
-		Aggref	   *aggref = partial->aggref;
-		char	   *colname = psprintf("gp_p%u", partial->pos);
-		const char *proname = partial->iscount ? "sum" :
-			get_func_name(aggref->aggfnoid);
-		Oid			combineoid = gp_partial_func(proname, aggref->aggtype);
-		Oid			combinetype;
-		const char *cast = "";
+		GpPartialAgg *partial = NULL;
+		GpPartialAvg *pa = NULL;
+		char	   *colname;
 
-		if (!OidIsValid(combineoid))
-			return false;
-		combinetype = get_func_rettype(combineoid);
-		if (combinetype != aggref->aggtype)
+		foreach(lc, state.aggs)
 		{
-			if (!gp_partial_castable(combinetype, aggref->aggtype))
-				return false;
-			cast = psprintf("::%s", format_type_be(aggref->aggtype));
+			partial = lfirst(lc);
+
+			if (partial->pos == p)
+				break;
+			partial = NULL;
 		}
-		appendStringInfo(&cols, "%s%s %s", cols.len > 0 ? ", " : "",
-						 quote_identifier(colname),
-						 format_type_be(aggref->aggtype));
-		appendStringInfo(&aggs, "%s%s(%s)%s", aggs.len > 0 ? ", " : "",
-						 proname, quote_identifier(colname), cast);
+		if (partial != NULL)
+		{
+			Aggref	   *aggref = partial->aggref;
+			const char *proname = get_func_name(aggref->aggfnoid);
+
+			colname = psprintf("gp_p%u", partial->pos);
+			if (partial->iscount || strcmp(proname, "sum") == 0)
+			{
+				if (!gp_two_phase_sum_combine(&cols, &aggs, colname,
+											  aggref->aggtype))
+					return false;
+			}
+			else
+			{
+				appendStringInfo(&cols, "%s%s %s",
+								 cols.len > 0 ? ", " : "",
+								 quote_identifier(colname),
+								 format_type_be(aggref->aggtype));
+				appendStringInfo(&aggs, "%s%s(%s)",
+								 aggs.len > 0 ? ", " : "",
+								 proname, quote_identifier(colname));
+			}
+			p++;
+			continue;
+		}
+		foreach(lc, state.avgs)
+		{
+			pa = lfirst(lc);
+
+			if (pa->pos_sum == p)
+				break;
+			pa = NULL;
+		}
+		if (pa == NULL)
+			elog(ERROR, "a partial column has no aggregate");
+
+		/*
+		 * The average divides only on the coordinator, which finishes it
+		 * over the sums of the partial sums and counts; the combine
+		 * query keeps both columns in the types of the partials
+		 */
+		colname = psprintf("gp_p%d", pa->pos_sum);
+		if (!gp_two_phase_sum_combine(&cols, &aggs, colname,
+									  exprType((Node *) pa->sum)))
+			return false;
+		colname = psprintf("gp_p%d", pa->pos_count);
+		if (!gp_two_phase_sum_combine(&cols, &aggs, colname, INT8OID))
+			return false;
+		p += 2;
 	}
 
 	appendStringInfo(&sql,

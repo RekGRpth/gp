@@ -43,6 +43,11 @@ like(plan_for('SELECT b, sum(c * 2 + 1), count(*) FROM t GROUP BY b HAVING sum(c
 	qr/GpSlice/, 'expression arguments and HAVING move too');
 like(plan_for('SELECT b, sum(n) FROM t GROUP BY b'), qr/GpSlice/,
 	'a numeric sum answers in its own type without a cast');
+like(plan_for('SELECT b, avg(c), count(*) FROM t GROUP BY b'), qr/GpSlice/,
+	'an average moves through a partial sum and a partial count');
+my $avg_remote = remote_sql('SELECT b, avg(c) FROM t GROUP BY b');
+like($avg_remote, qr/sum\(gp_p2\)::bigint.*sum\(gp_p3\)::bigint/s,
+	'the combine query keeps the sums and counts of the partials');
 like(plan_for('SELECT b, stddev(c) FROM t GROUP BY b'), qr/GpSlice/,
 	'an aggregate without a combine function redistributes its rows instead');
 
@@ -65,7 +70,12 @@ my @queries = (
 	'SELECT b, count(*) FROM t WHERE s = \'g1\' GROUP BY b HAVING count(*) > 5 ORDER BY b',
 	'SELECT b, min(s), max(s) FROM t GROUP BY b ORDER BY b',
 	'SELECT b, sum(n) FROM t GROUP BY b ORDER BY b',
+	'SELECT b, avg(c), count(*) FROM t GROUP BY b ORDER BY b',
+	'SELECT b, avg(n) FROM t GROUP BY b ORDER BY b',
+	'SELECT b, avg(c * 2), sum(c), min(c), max(c) FROM t GROUP BY b ORDER BY b',
+	'SELECT b, count(*), avg(c) FROM t GROUP BY b HAVING avg(c) > 5 ORDER BY b',
 	'SELECT count(*), sum(c) FROM t',
+	'SELECT b, avg(c) FROM t WHERE a <= 500 GROUP BY b ORDER BY b',
 	'SELECT b, count(*), sum(c) FROM t GROUP BY b ORDER BY sum(c) DESC, b LIMIT 3',
 );
 foreach my $query (@queries)

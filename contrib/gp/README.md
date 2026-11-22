@@ -667,8 +667,10 @@ partials of the groups of the asking segment only.  The combining
 aggregate runs over
 the result type of the original one and comes back to it through a cast
 when they differ, as `sum` of `int8` answers in `numeric`.  `count`
-moves through a `sum` of the partial counts; the average, distinct and
-ordered aggregates are not splittable and take the row-moving fallback.
+moves through a `sum` of the partial counts, and the average divides on
+the coordinator, which finishes it over the sums of the partial sums
+and counts the combine query keeps; distinct and ordered aggregates are
+not splittable and take the row-moving fallback.
 Queries with volatile functions in their conditions or aggregate
 arguments, with external parameters, or after a write in the same
 transaction are not pushed either; a table pinned to one segment is read
