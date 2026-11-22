@@ -2355,6 +2355,25 @@ gp_ic_pull_abort(GpIcPull *pull)
 	pull->have_target = false;
 }
 
+/* A wait set over the sockets of the pulls that are still reading */
+static WaitEventSet *
+gp_ic_pulls_wes(GpIcPull *pulls, int nsegments)
+{
+	WaitEventSet *wes = CreateWaitEventSet(NULL, nsegments + 3);
+
+	for (int i = 0; i < nsegments; i++)
+		if (!pulls[i].done)
+			AddWaitEventToSet(wes, WL_SOCKET_READABLE, pulls[i].fd,
+							  NULL, &pulls[i]);
+	AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
+	AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET,
+					  NULL, NULL);
+	if (gp_ic_supervisor_fd != PGINVALID_SOCKET)
+		AddWaitEventToSet(wes, WL_SOCKET_READABLE,
+						  gp_ic_supervisor_fd, NULL, NULL);
+	return wes;
+}
+
 /*
  * Answer one motion on any number of segments at once: every segment
  * gets a pull, every worker starts, and the rows are read as they come.
@@ -2373,7 +2392,6 @@ gp_interconnect_pulls(Tuplestorestate *store, TupleDesc tupdesc,
 	Oid		   *ioparam;
 	MemoryContext rowcxt;
 	pgsocket	saved_supervisor = gp_ic_supervisor_fd;
-	int			nfds = 0;
 
 #ifndef WIN32
 	if (saved_supervisor == PGINVALID_SOCKET &&
@@ -2406,23 +2424,12 @@ gp_interconnect_pulls(Tuplestorestate *store, TupleDesc tupdesc,
 			initStringInfo(&pulls[i].inbuf);
 			gp_ic_pull_open(&pulls[i], db, user, sql, requester,
 							snapshots);
-			nfds++;
 		}
 		for (int i = 0; i < nsegments; i++)
 			gp_ic_pull_go(&pulls[i]);
 
-		wes = CreateWaitEventSet(NULL, nfds + 3);
-		for (int i = 0; i < nsegments; i++)
-			if (!pulls[i].done)
-				AddWaitEventToSet(wes, WL_SOCKET_READABLE, pulls[i].fd,
-								  NULL, &pulls[i]);
-		AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
-		AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET,
-						  NULL, NULL);
-		if (gp_ic_supervisor_fd != PGINVALID_SOCKET)
-			AddWaitEventToSet(wes, WL_SOCKET_READABLE,
-							  gp_ic_supervisor_fd, NULL, NULL);
-		events = palloc0_array(WaitEvent, nfds + 3);
+		wes = gp_ic_pulls_wes(pulls, nsegments);
+		events = palloc0_array(WaitEvent, nsegments + 3);
 
 		for (;;)
 		{
@@ -2437,7 +2444,7 @@ gp_interconnect_pulls(Tuplestorestate *store, TupleDesc tupdesc,
 			if (!pending)
 				break;
 			InterruptHoldoffCount = 0;
-			wake = WaitEventSetWait(wes, 100L, events, nfds + 3,
+			wake = WaitEventSetWait(wes, 100L, events, nsegments + 3,
 									gp_ic_client_event());
 			/* The interrupt is answered here, while nothing holds it
 			 * back, the way gp_ic_wait answers it */
@@ -2457,15 +2464,22 @@ gp_interconnect_pulls(Tuplestorestate *store, TupleDesc tupdesc,
 				{
 					GpIcPull   *pull = events[i].user_data;
 
-					if (!pull->done)
-						(void) gp_ic_pull_read(pull, store, tupdesc,
-											   recvfns, ioparam, rowcxt);
-					if (pull->done)
+					if (!pull->done &&
+						gp_ic_pull_read(pull, store, tupdesc,
+										recvfns, ioparam, rowcxt))
 					{
-						/* A closed socket leaves the wait set of the OS */
+						/*
+						 * The set of the OS watches the sockets of the
+						 * open pulls alone: a finished pull leaves it,
+						 * which keeps a half-closed socket from waking
+						 * the wait forever (and a closed one is not a
+						 * socket a Windows set may keep watching)
+						 */
 						closesocket(pull->fd);
 						pull->fd = PGINVALID_SOCKET;
 						pull->have_target = false;
+						FreeWaitEventSet(wes);
+						wes = gp_ic_pulls_wes(pulls, nsegments);
 					}
 				}
 			}
