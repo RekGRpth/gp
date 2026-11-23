@@ -349,6 +349,21 @@ _PG_init(void)
 						psprintf("%d", GP_IC_SLOTS + 16),
 						PGC_POSTMASTER, PGC_S_OVERRIDE);
 
+	/*
+	 * A segment's broker assigns a dynamic worker per interconnect
+	 * request, and a deep chain of motions holds a worker at every
+	 * level while it waits for the next, so a segment's postmaster
+	 * must be able to start them all.  The check sits at the end of
+	 * the load: the role arrives from the configuration file, which
+	 * the placeholders hand to the real variable only once it is
+	 * defined above
+	 */
+	if (gp_role == GP_ROLE_SEGMENT &&
+		max_worker_processes < GP_IC_SLOTS * 3 + 32)
+		SetConfigOption("max_worker_processes",
+						psprintf("%d", GP_IC_SLOTS * 3 + 32),
+						PGC_POSTMASTER, PGC_S_OVERRIDE);
+
 }
 
 /* The connection string of the coordinator, for the motion of a segment */

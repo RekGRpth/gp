@@ -69,6 +69,8 @@ typedef struct GpSegment
 /* interconnect.c: concurrent request workers a broker assigns */
 #define GP_IC_SLOTS 64
 
+/* interconnect.c: concurrent request workers a broker assigns */
+
 /* GUC variables */
 extern const char *gp_coordinator_conninfo(void);
 extern const char *gp_host_address(void);
