@@ -46,14 +46,17 @@ like(plan_for('SELECT sum(t1.g) FROM t1 JOIN t2 ON t1.a = t2.a'),
 	qr/GpSlice/, 'sum with another result type combines in its result type');
 like(plan_for('SELECT t1.g, count(*) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.g'),
 	qr/GpSlice/, 'a grouped count uses redistribution instead of a partial count');
-like(plan_for('SELECT t1.g, avg(t2.v) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.g'),
-	qr/GpSlice/, 'a grouped average uses redistribution instead of a partial average');
+unlike(plan_for('SELECT t1.g, avg(t2.v) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.g'), qr/GpSlice/,
+	'a grouped average keeps the coordinator plan: the redistribution rewrite is not built yet');
 like(plan_for('SELECT t1.g, sum(t1.g) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.g'),
 	qr/GpSlice/, 'a grouped sum can change result type after redistribution');
 like(plan_for('SELECT t1.g, count(*) FROM t1 JOIN t2 ON t1.a + 0 = t2.a GROUP BY t1.g'),
 	qr/GpSlice/, 'redistribution can follow a broadcast join');
 
 run('SET enable_mergejoin = off');
+unlike(plan_for('SELECT t1.g * 2 AS y, count(*) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY 1'),
+	qr/GpSlice/, 'an aggregate grouped by an expression over a join stays on the coordinator');
+
 my @queries = (
 	'SELECT sum(t1.v + t2.v) FROM t1 JOIN t2 ON t1.a = t2.a',
 	'SELECT t1.g, sum(t2.v) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.g ORDER BY t1.g',

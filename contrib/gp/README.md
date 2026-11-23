@@ -564,11 +564,10 @@ table on that fully local path.  A global aggregate or grouping by other keys
 can instead use a partial aggregate over any partitioned join: the coordinator
 combines the partial results and performs the final grouping.  This supports
 `min`, `max`, and `sum` whose argument, result, and transition types match.
-When a grouping key cannot be mapped onto the columns of the segments'
-answer, the rewrite is refused and the coordinator plan answers as before.
-Otherwise a grouped join can redistribute its result by all grouping columns
-and run the full aggregate on the segments.  Global aggregates that cannot be
-answered partly keep the coordinator plan.
+Grouping by an expression is not pushed either: the planned aggregate
+no longer matches its parse form there, and a half-matched rewrite would
+read the columns of the answer with the types of the join.  Global
+aggregates that cannot be answered partly keep the coordinator plan.
 
 A subquery in FROM has a locus of its own: an aggregate of a distributed
 table grouped by the key or redistributed by plain grouping columns, or
