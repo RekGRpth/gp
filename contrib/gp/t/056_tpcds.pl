@@ -49,7 +49,7 @@ my $tpcds_dir = dirname(__FILE__) . '/tpcds';
 run(slurp_file("$tpcds_dir/setup.sql"));
 
 my %slice = map { $_ => 1 }
-  qw(query06 query09 query10 query15 query19 query25 query28 query29
+  qw(query06 query09 query10 query15 query19 query25 query29
      query32 query34 query40 query45 query48 query50 query53 query55
      query69 query72 query73 query79 query84 query89
      query91 query92 query96);
@@ -63,11 +63,9 @@ my %known_defect = (
 	query05 =>
 	  'the coordinator fallback does not gather a hashed table under a UNION ALL (Append), so the coordinator reads its empty local copy',
 	query09 =>
-	  'a global aggregate pushed into the slice is not finalized on the coordinator: one row per segment is concatenated',
-	query28 =>
-	  'a global aggregate pushed into the slice is not finalized on the coordinator: one row per segment is concatenated',
+	  'a result over gathered init plans is sliced although its answer is the same on every segment: one row per segment is concatenated',
 	query69 =>
-	  'a global aggregate pushed into the slice is not finalized on the coordinator: one row per segment is concatenated',
+	  'a correlated EXISTS inside the slice reads the local rows of its segment: the probe table is not distributed by the correlation key',
 );
 
 # query14 orders its answer by a sort key with ties; the distributed and
