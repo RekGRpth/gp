@@ -4654,7 +4654,29 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	if (original->sortClause != NIL && !sort_above && !original->hasAggs)
 		return false;
 
-	locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
+		/*
+	 * An aggregate above the join reads the plan positions with the types
+	 * of the plan; a rewritten FROM changes what a position means (a
+	 * grouping over an expression delivers the expression, not its
+	 * argument), so the types must agree position by position
+	 */
+	if (list_length(plan->targetlist) != list_length(original->targetList))
+		return false;
+	{
+		ListCell   *lt;
+		ListCell   *lo;
+
+		forboth(lt, plan->targetlist, lo, original->targetList)
+		{
+			TargetEntry *ptle = lfirst_node(TargetEntry, lt);
+			TargetEntry *otle = lfirst_node(TargetEntry, lo);
+
+			if (exprType((Node *) ptle->expr) != exprType((Node *) otle->expr))
+				return false;
+		}
+	}
+
+locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
 	if (!gp_slice_join_from(original, &tables, &conds))
 		return false;
 	if (!gp_slice_join_sublinks(original, &tables, &conds))
@@ -4711,6 +4733,15 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 		if (gp_slice_join_redistributed_agg(original, stmt, plan, parent,
 										 sort_above, tables))
 			return true;
+		/*
+		 * Keeping the aggregate above the pushed join reads its grouping
+		 * and arguments by the positions of the join, while the slice
+		 * answers with the columns of the query: the two agree only by
+		 * luck.  Until the rewrite remaps the aggregate over the columns
+		 * of the answer, an aggregate the partial path does not take
+		 * stays on the coordinator.
+		 */
+		return false;
 		if (original->groupClause == NIL)
 			return false;
 
@@ -4774,6 +4805,44 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	/* A failed partial aggregate must keep the original ordering here */
 	if (original->sortClause != NIL && !sort_above)
 		return false;
+
+	/*
+	 * An aggregate that stays above the slice reads its grouping columns
+	 * by the positions of the plan below, while the slice answers with
+	 * the columns of the query: where the two differ in type (a grouping
+	 * over an expression delivers the expression, not its argument) the
+	 * executor reads the answer with the wrong types
+	 */
+	if (original->hasAggs && !replicated)
+	{
+		Plan	   *agg = plan;
+
+		while (agg != NULL && !IsA(agg, Agg))
+		{
+			if (agg->righttree != NULL)
+				return false;
+			agg = agg->lefttree;
+		}
+		if (agg != NULL)
+		{
+			Agg		   *a = (Agg *) agg;
+
+			for (int i = 0; i < a->numCols; i++)
+			{
+				int			p = a->grpColIdx[i];
+				TargetEntry *ptle;
+				TargetEntry *rtle;
+
+				if (p <= 0 || p > list_length(a->plan.lefttree->targetlist) ||
+					p > list_length(original->targetList))
+					return false;
+				ptle = list_nth(a->plan.lefttree->targetlist, p - 1);
+				rtle = list_nth(original->targetList, p - 1);
+				if (exprType((Node *) ptle->expr) != exprType((Node *) rtle->expr))
+					return false;
+			}
+		}
+	}
 
 	cscan = gp_slice_make(plan, original, replicated, motion, original->sortClause);
 
@@ -6851,8 +6920,15 @@ gp_slice_join_partial(Query *original, PlannedStmt *stmt, Plan *plan,
 		TargetEntry *tle = get_sortgroupclause_tle(sc, original->targetList);
 		GpPartialKey *key = palloc0(sizeof(GpPartialKey));
 
+		/*
+		 * Only plain columns group the answer of the segments: an
+		 * expression of the planned aggregate no longer matches its
+		 * parse form here, and a half-matched rewrite reads the columns
+		 * of the answer with the types of the join
+		 */
+		if (!IsA(tle->expr, Var))
+			return false;
 		key->expr = tle->expr;
-		if (IsA(key->expr, Var))
 		{
 			Var		   *var = (Var *) key->expr;
 			RangeTblEntry *group = rt_fetch(var->varno, original->rtable);
@@ -6860,6 +6936,8 @@ gp_slice_join_partial(Query *original, PlannedStmt *stmt, Plan *plan,
 			if (group->rtekind == RTE_GROUP && var->varattno > 0)
 				key->expr = list_nth(group->groupexprs, var->varattno - 1);
 		}
+		if (!IsA(key->expr, Var))
+			return false;
 		state.npos++;
 		key->pos = state.npos;
 		key->ressortgroupref = tle->ressortgroupref;
@@ -7056,6 +7134,14 @@ static bool
 gp_slice_join_redistributed_agg(Query *original, PlannedStmt *stmt, Plan *plan,
 								Plan *parent, bool sort_above, List *tables)
 {
+	/*
+	 * Disabled: the plan this builds leaves the aggregate above the slice
+	 * of the redistributed join, but the slice answers with the columns of
+	 * the aggregate itself, so the grouping columns of the aggregate read
+	 * past the answer and the executor aborts.  Until the rewrite carries
+	 * the aggregate into the fragment, the coordinator answers.
+	 */
+#if 0
 	Agg		   *agg;
 	Query	   *inner;
 	Query	   *remote;
@@ -7305,6 +7391,8 @@ gp_slice_join_redistributed_agg(Query *original, PlannedStmt *stmt, Plan *plan,
 			parent->lefttree = &sort->plan;
 	}
 	return true;
+#endif
+	return false;
 }
 
 /*
