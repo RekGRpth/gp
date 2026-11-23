@@ -2423,13 +2423,18 @@ gp_slice_join_derived_full(Query *parse)
 	return false;
 }
 
-/* Whether the Var belongs to the table at this query level */
+/* Whether the Var belongs to the table at this query level
+ *
+ * Disabled together with gp_slice_join_move_key below, its only caller.
+ */
+#if 0
 static bool
 gp_slice_join_var_of(Var *var, GpJoinTable *table, Query *query)
 {
 	return var->varlevelsup == 0 && var->varattno > 0 &&
 		var->varno == table->rti && table->query == query;
 }
+#endif
 
 /*
  * Whether a condition equates a column of the stay table with a column of
