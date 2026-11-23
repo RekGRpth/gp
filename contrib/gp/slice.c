@@ -2434,7 +2434,11 @@ gp_slice_join_var_of(Var *var, GpJoinTable *table, Query *query)
 /*
  * Whether a condition equates a column of the stay table with a column of
  * the move table, and return that column of the move table
+ *
+ * Disabled together with gp_slice_join_redistributed_agg below, its only
+ * caller.
  */
+#if 0
 static bool
 gp_slice_join_move_key(Node *node, Query *query, GpJoinTable *stay,
 					   GpJoinTable *move, AttrNumber *move_attno)
@@ -2478,6 +2482,7 @@ gp_slice_join_move_key(Node *node, Query *query, GpJoinTable *stay,
 	}
 	return false;
 }
+#endif
 
 /* A colocated component of a join graph, ignoring all other tables */
 static List *
@@ -7006,7 +7011,12 @@ gp_slice_join_partial(Query *original, PlannedStmt *stmt, Plan *plan,
 	return true;
 }
 
-/* Resolve a grouping key through the parser's GROUP and join RTEs */
+/* Resolve a grouping key through the parser's GROUP and join RTEs
+ *
+ * Disabled together with gp_slice_join_redistributed_agg below, its only
+ * caller.
+ */
+#if 0
 static Node *
 gp_slice_join_agg_key(Query *original, SortGroupClause *sc)
 {
@@ -7023,7 +7033,9 @@ gp_slice_join_agg_key(Query *original, SortGroupClause *sc)
 	}
 	return flatten_join_alias_for_parser(original, expr, 0);
 }
+#endif
 
+#if 0
 static bool
 gp_slice_join_agg_equal(Node *a, Node *b)
 {
@@ -7032,8 +7044,14 @@ gp_slice_join_agg_equal(Node *a, Node *b)
 		 ((Var *) a)->varno == ((Var *) b)->varno &&
 		 ((Var *) a)->varattno == ((Var *) b)->varattno);
 }
+#endif
 
-/* Mapping of Vars of the original join to columns of its serialized answer */
+/* Mapping of Vars of the original join to columns of its serialized answer
+ *
+ * Disabled together with gp_slice_join_redistributed_agg below, the only
+ * user of the map and its helpers.
+ */
+#if 0
 typedef struct GpJoinAggMap
 {
 	Query	   *original;
@@ -7124,6 +7142,7 @@ gp_slice_join_agg_rte(Query *inner, const char *serialized)
 	rte->inFromCl = true;
 	return rte;
 }
+#endif
 
 /*
  * Compute a full aggregate after redistributing the join itself by all of its
