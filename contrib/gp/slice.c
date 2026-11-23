@@ -4662,22 +4662,29 @@ gp_slice_join_initplans_of(Plan *plan, List **subs)
 		gp_slice_join_initplans_of(((SubqueryScan *) plan)->subplan, subs);
 }
 
+static Oid	gp_slice_peer_query_oid = InvalidOid;
+
+/* The oid of gp.peer_query(text), looked up once per backend */
+static Oid
+gp_slice_peer_query(void)
+{
+	if (gp_slice_peer_query_oid == InvalidOid)
+		gp_slice_peer_query_oid = DatumGetObjectId(DirectFunctionCall1(
+													   regprocedurein,
+													   CStringGetDatum("gp.peer_query(text)")));
+	return gp_slice_peer_query_oid;
+}
+
 /*
- * Whether the plan reads a distributed table through a plain scan of its
- * own.  Scans under a gather custom scan do not count: the gather pulls
- * every row to the node that runs the plan, so the answer is whole there.
- * Slices and motions inside the plan source their rows themselves.
- */
-/*
- * Count the plain scans of the plan by the policy of what they read.
- * Scans under a gather custom scan are whole on the node that runs the
- * plan and do not make its answer vary by segment; slices and motions
- * source their rows themselves.  Custom scans are opaque here, so a plan
- * whose rows come only through them reports no scans at all.
+ * Count the reads of the plan that make its answer vary by segment: a scan
+ * of a distributed table of its own, a gp.peer_query the sublinks of the
+ * query rewrote into, a slice, or a motion.  Scans under a gather custom
+ * scan do not count: the gather pulls every row to the node that runs the
+ * plan, so the answer is whole there, and so is a scan of a replicated
+ * table.
  */
 static void
-gp_slice_join_plan_scans(PlannedStmt *stmt, Plan *plan,
-						 int *replicated, int *distributed)
+gp_slice_join_plan_reads(PlannedStmt *stmt, Plan *plan, int *distributed)
 {
 	ListCell   *lc;
 
@@ -4695,41 +4702,59 @@ gp_slice_join_plan_scans(PlannedStmt *stmt, Plan *plan,
 		{
 			rte = rt_fetch(scan->scanrelid, stmt->rtable);
 			if (rte->rtekind == RTE_RELATION &&
-				gp_policy_get(rte->relid, &policy))
-			{
-				if (policy.replicated)
-					(*replicated)++;
-				else
-					(*distributed)++;
-			}
+				gp_policy_get(rte->relid, &policy) &&
+				!policy.replicated)
+				(*distributed)++;
 		}
 	}
-	gp_slice_join_plan_scans(stmt, plan->lefttree, replicated, distributed);
-	gp_slice_join_plan_scans(stmt, plan->righttree, replicated, distributed);
-	if (IsA(plan, Append))
-		foreach(lc, ((Append *) plan)->appendplans)
-			gp_slice_join_plan_scans(stmt, lfirst(lc), replicated, distributed);
-	if (IsA(plan, MergeAppend))
-		foreach(lc, ((MergeAppend *) plan)->mergeplans)
-			gp_slice_join_plan_scans(stmt, lfirst(lc), replicated, distributed);
-	if (IsA(plan, BitmapAnd))
-		foreach(lc, ((BitmapAnd *) plan)->bitmapplans)
-			gp_slice_join_plan_scans(stmt, lfirst(lc), replicated, distributed);
-	if (IsA(plan, BitmapOr))
-		foreach(lc, ((BitmapOr *) plan)->bitmapplans)
-			gp_slice_join_plan_scans(stmt, lfirst(lc), replicated, distributed);
-	if (IsA(plan, SubqueryScan))
-		gp_slice_join_plan_scans(stmt, ((SubqueryScan *) plan)->subplan,
-								 replicated, distributed);
+	if (IsA(plan, FunctionScan))
+	{
+		RangeTblEntry *rte = rt_fetch(((Scan *) plan)->scanrelid,
+									  stmt->rtable);
+
+		if (rte->rtekind == RTE_FUNCTION && rte->functions != NIL)
+		{
+			RangeTblFunction *rtf = linitial_node(RangeTblFunction,
+												  rte->functions);
+			FuncExpr   *func = (FuncExpr *) rtf->funcexpr;
+
+			if (IsA(func, FuncExpr) && func->funcid == gp_slice_peer_query())
+				(*distributed)++;
+		}
+	}
 	if (IsA(plan, CustomScan))
 	{
 		CustomScan *custom = (CustomScan *) plan;
 
-		if (!gp_is_gather(&custom->scan.plan))
-			foreach(lc, custom->custom_plans)
-				gp_slice_join_plan_scans(stmt, lfirst(lc), replicated,
-										 distributed);
+		if (custom->methods == &gp_slice_plan_methods ||
+			gp_is_motion(&custom->scan.plan))
+		{
+			(*distributed)++;
+			return;
+		}
+		if (gp_is_gather(&custom->scan.plan))
+			return;
 	}
+	gp_slice_join_plan_reads(stmt, plan->lefttree, distributed);
+	gp_slice_join_plan_reads(stmt, plan->righttree, distributed);
+	if (IsA(plan, Append))
+		foreach(lc, ((Append *) plan)->appendplans)
+			gp_slice_join_plan_reads(stmt, lfirst(lc), distributed);
+	if (IsA(plan, MergeAppend))
+		foreach(lc, ((MergeAppend *) plan)->mergeplans)
+			gp_slice_join_plan_reads(stmt, lfirst(lc), distributed);
+	if (IsA(plan, BitmapAnd))
+		foreach(lc, ((BitmapAnd *) plan)->bitmapplans)
+			gp_slice_join_plan_reads(stmt, lfirst(lc), distributed);
+	if (IsA(plan, BitmapOr))
+		foreach(lc, ((BitmapOr *) plan)->bitmapplans)
+			gp_slice_join_plan_reads(stmt, lfirst(lc), distributed);
+	if (IsA(plan, SubqueryScan))
+		gp_slice_join_plan_reads(stmt, ((SubqueryScan *) plan)->subplan,
+								 distributed);
+	if (IsA(plan, CustomScan))
+		foreach(lc, ((CustomScan *) plan)->custom_plans)
+			gp_slice_join_plan_reads(stmt, lfirst(lc), distributed);
 }
 
 static bool
@@ -4743,14 +4768,13 @@ gp_slice_join_initplan_distributed(PlannedStmt *stmt)
 	{
 		SubPlan    *sub = lfirst(lc);
 		Plan	   *subplan;
-		int			replicated = 0;
 		int			distributed = 0;
 
 		if (!sub->isInitPlan || sub->plan_id <= 0 ||
 			sub->plan_id > list_length(stmt->subplans))
 			continue;
 		subplan = (Plan *) list_nth(stmt->subplans, sub->plan_id - 1);
-		gp_slice_join_plan_scans(stmt, subplan, &replicated, &distributed);
+		gp_slice_join_plan_reads(stmt, subplan, &distributed);
 		if (distributed > 0)
 			return true;
 	}
@@ -5000,31 +5024,41 @@ locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
 	}
 
 	/*
-	 * The fragment replays the plan on one segment and reads the local rows
-	 * of its tables.  A query whose own plan scans no distributed table
-	 * answers identically on every segment, and slicing it multiplies the
-	 * answer (TPC-DS q09 is a result over gathered init plans: one row per
+	 * The segments do not run the plan of the coordinator: the slice
+	 * deparses the query, and every segment re-plans it over its local
+	 * tables.  A query whose own FROM reads only replicated tables answers
+	 * identically wherever it runs; when the slice still fans out to every
+	 * segment — a hashed table of a sublink marks it distributed — the
+	 * answer is concatenated once per segment (TPC-DS q09 scans one
+	 * replicated row and evaluates its bucket sublinks: one row per
 	 * segment instead of one).  An init plan that scans a distributed
 	 * table without a gather, or a global aggregate inside a derived table
 	 * of the FROM list, would answer from one segment (q09 without the
-	 * gathers, q28).  Until the replay wires such scans through the
-	 * interconnect, the coordinator answers.
+	 * gathers, q28).  Until the rewrite tells such answers from the
+	 * coordinator, it does not push the slice.
 	 */
-	/*
-	 * The fragment replays the plan on one segment and reads the local rows
-	 * of its tables.  A query without a FROM clause answers identically on
-	 * every segment, and slicing it multiplies the answer.  An init plan
-	 * that scans a distributed table without a gather, or a global
-	 * aggregate inside a derived table of the FROM list, would answer from
-	 * one segment (TPC-DS q28 crosses five such derived tables; q09 keeps
-	 * its gathered init plans in a slice that multiplies the single row).
-	 * Until the replay wires such scans through the interconnect, the
-	 * coordinator answers.
-	 */
-	if (original->jointree->fromlist == NIL ||
-		gp_slice_join_initplan_distributed(stmt) ||
-		gp_slice_join_derived_global(original))
-		return false;
+	{
+		bool		saw_outer = false;
+		bool		outer_replicated = true;
+		ListCell   *lc2;
+
+		foreach(lc2, tables)
+		{
+			GpJoinTable *table = lfirst(lc2);
+
+			if (table->depth == 0)
+			{
+				saw_outer = true;
+				if (!table->policy.replicated)
+					outer_replicated = false;
+			}
+		}
+		if ((saw_outer && outer_replicated && !replicated) ||
+			original->jointree->fromlist == NIL ||
+			gp_slice_join_initplan_distributed(stmt) ||
+			gp_slice_join_derived_global(original))
+			return false;
+	}
 
 	cscan = gp_slice_make(plan, original, replicated, motion, original->sortClause);
 
