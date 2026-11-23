@@ -468,3 +468,11 @@ gp_motion_init(void)
 		set_rel_pathlist_hook = gp_motion_set_rel_pathlist;
 	}
 }
+
+/* Whether a plan node is a motion between the segments */
+bool
+gp_is_motion(Plan *plan)
+{
+	return IsA(plan, CustomScan) &&
+		((CustomScan *) plan)->methods == &gp_motion_plan_methods;
+}

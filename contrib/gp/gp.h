@@ -152,6 +152,7 @@ extern void gp_analyze(VacuumStmt *stmt);
 
 /* motion.c */
 extern void gp_motion_init(void);
+extern bool gp_is_motion(Plan *plan);
 
 /* interconnect.c */
 extern void gp_interconnect_init(void);
