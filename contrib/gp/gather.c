@@ -39,16 +39,21 @@
 #include "nodes/makefuncs.h"
 #include "nodes/pathnodes.h"
 #include "nodes/value.h"
+#include <math.h>
+#include "access/cmptype.h"
+#include "nodes/nodeFuncs.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
 #include "utils/builtins.h"
+#include "lib/binaryheap.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/tuplestore.h"
+#include "utils/typcache.h"
 
 #include "gp.h"
 
@@ -79,7 +84,20 @@ typedef struct GpGatherState
 	int			only;			/* the segment all the rows live on, 0 if not */
 	bool		inherit;
 	Tuplestorestate *store;		/* all rows, once read */
+	List	   *sortkeys;		/* one list per key: attno, desc, nulls first, type, collation; NIL when the gather does not merge */
+	Tuplestorestate **stores;	/* one sorted store per segment */
+	int			nstores;
+	binaryheap *heap;			/* the segment whose next row is the next answer */
+	TupleTableSlot **peeks;		/* the unemitted next row of every store */
 } GpGatherState;
+
+static void gp_gather_append_order(StringInfoData *sql, List *sortkeys,
+								   Oid relid);
+static bool gp_gather_load_one(GpGatherState *state, GpSegment *segment,
+							   int i, GpSnapshots *snapshots, const char *db,
+							   const char *user, TupleDesc tupdesc,
+							   char *plan);
+static int	gp_gather_merge_heap_cmp(Datum a, Datum b, void *arg);
 
 static Node *gp_gather_create_state(CustomScan *cscan);
 
@@ -132,6 +150,8 @@ gp_gather_load_interconnect(GpGatherState *state)
 					 state->inherit ? "" : "ONLY ",
 					 quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
 											  RelationGetRelationName(rel)));
+	if (state->sortkeys != NIL)
+		gp_gather_append_order(&sql, state->sortkeys, rel->rd_id);
 	plan = gp_interconnect_plan(sql.data);
 	db = get_database_name(MyDatabaseId);
 	user = GetUserNameFromId(GetUserId(), false);
@@ -159,6 +179,43 @@ gp_gather_load_interconnect(GpGatherState *state)
 	snapshots = gp_dtx_statement_snapshots(ss->ps.state);
 	if (snapshots == NULL)
 		return false;
+
+	/*
+	 * The merge reads one sorted segment after another: every store holds
+	 * the sorted answer of its segment, and the gather hands out the rows
+	 * in the order of the query without sorting anything here
+	 */
+	if (state->sortkeys != NIL)
+	{
+		state->nstores = 0;
+		state->stores = palloc_array(Tuplestorestate *, nsegments);
+		state->peeks = palloc_array(TupleTableSlot *, nsegments);
+		for (int i = 0; i < nsegments; i++)
+		{
+			if (only != 0 && segments[i].segment_id != only)
+				continue;
+			gp_gather_load_one(state, &segments[i], state->nstores,
+							   snapshots, db, user, tupdesc, plan);
+			state->peeks[state->nstores] =
+				MakeSingleTupleTableSlot(tupdesc, &TTSOpsMinimalTuple);
+			if (tuplestore_gettupleslot(state->stores[state->nstores], true,
+										true, state->peeks[state->nstores]))
+				state->nstores++;
+			else
+				tuplestore_end(state->stores[state->nstores]);
+		}
+		if (state->nstores == 0)
+			state->stores = NULL;
+		else
+		{
+			state->heap = binaryheap_allocate(state->nstores,
+											  gp_gather_merge_heap_cmp, state);
+			for (int i = 0; i < state->nstores; i++)
+				binaryheap_add(state->heap, Int32GetDatum(i));
+		}
+		return true;
+	}
+
 	state->store = tuplestore_begin_heap(true, false, work_mem);
 	{
 		GpSegment  *wanted = palloc_array(GpSegment, nsegments);
@@ -284,6 +341,14 @@ gp_gather_load(GpGatherState *state)
 	if (XactIsoLevel == XACT_READ_COMMITTED && !gp_dispatch_in_xact() &&
 		gp_gather_load_interconnect(state))
 		return;
+	if (state->sortkeys != NIL)
+		/*
+		 * The order of the query is promised by the merge of the segments'
+		 * sorted answers, and only the interconnect carries it
+		 */
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("the sorted gather needs the interconnect"));
 	gp_gather_load_libpq(state);
 }
 
@@ -297,6 +362,99 @@ gp_gather_begin(CustomScanState *node, EState *estate, int eflags)
 	state->replicated = boolVal(lsecond(cscan->custom_private));
 	state->inherit = boolVal(lthird(cscan->custom_private));
 	state->only = intVal(lfourth(cscan->custom_private));
+	state->sortkeys = list_length(cscan->custom_private) > 4
+		? list_nth(cscan->custom_private, 4)
+		: NIL;
+}
+
+/* The comparison of the unemitted next rows of two segments: the smaller
+ * one is the answer, the way the query order names it */
+static int
+gp_gather_merge_cmp(TupleTableSlot *a, TupleTableSlot *b, GpGatherState *state)
+{
+	ListCell   *lc;
+
+	foreach(lc, state->sortkeys)
+	{
+		List	   *key = lfirst(lc);
+		AttrNumber	attno = intVal(linitial(key));
+		bool		isnull[2];
+		Datum		values[2];
+		int			cmp;
+
+		values[0] = slot_getattr(a, attno, &isnull[0]);
+		values[1] = slot_getattr(b, attno, &isnull[1]);
+		if (isnull[0] || isnull[1])
+		{
+			if (isnull[0] && isnull[1])
+				cmp = 0;
+			else if (boolVal(lthird(key)))
+				cmp = isnull[0] ? -1 : 1;
+			else
+				cmp = isnull[0] ? 1 : -1;
+		}
+		else
+		{
+			TypeCacheEntry *tce = lookup_type_cache((Oid) intVal(lfourth(key)),
+													TYPECACHE_CMP_PROC_FINFO);
+
+			cmp = DatumGetInt32(FunctionCall2Coll(&tce->cmp_proc_finfo,
+												  (Oid) intVal(list_nth(key, 4)),
+												  values[0], values[1]));
+		}
+		if (cmp != 0)
+			return boolVal(lsecond(key)) ? -cmp : cmp;
+	}
+	return 0;
+}
+
+/* The heap keeps the indexes of the segments whose next row is pending */
+static int
+gp_gather_merge_heap_cmp(Datum a, Datum b, void *arg)
+{
+	GpGatherState *state = (GpGatherState *) arg;
+	int			cmp = gp_gather_merge_cmp(state->peeks[DatumGetInt32(a)],
+										  state->peeks[DatumGetInt32(b)], state);
+
+	/*
+	 * The heap keeps the largest node on top, so the comparison of the
+	 * order is inverted: the row that comes first sinks to the top
+	 */
+	return cmp == 0 ? 0 : -cmp;
+}
+
+/* Load one segment into its own sorted store */
+static bool
+gp_gather_load_one(GpGatherState *state, GpSegment *segment, int i,
+				   GpSnapshots *snapshots, const char *db, const char *user,
+				   TupleDesc tupdesc, char *plan)
+{
+	state->stores[i] = tuplestore_begin_heap(true, false, work_mem);
+	gp_interconnect_pulls(state->stores[i], tupdesc, db, user, plan, 0,
+						  snapshots, segment, 1);
+	return true;
+}
+
+/*
+ * The answer of the gather is the merge of the segments' sorted stores: the
+ * next row comes from the segment whose unemitted row is the smallest one
+ */
+static TupleTableSlot *
+gp_gather_next_merged(GpGatherState *state, TupleTableSlot *slot)
+{
+	while (state->heap != NULL && !binaryheap_empty(state->heap))
+	{
+		int			i = DatumGetInt32(binaryheap_first(state->heap));
+
+		ExecCopySlot(slot, state->peeks[i]);
+		if (!tuplestore_gettupleslot(state->stores[i], true, true,
+									 state->peeks[i]))
+			binaryheap_remove_first(state->heap);
+		else
+			binaryheap_replace_first(state->heap, Int32GetDatum(i));
+		return slot;
+	}
+	return NULL;
 }
 
 static TupleTableSlot *
@@ -306,8 +464,11 @@ gp_gather_next(ScanState *ss)
 	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
 
 	gp_dtx_statement_start(state->css.ss.ps.state);
-	if (state->store == NULL)
+	if (state->store == NULL && state->stores == NULL)
 		gp_gather_load(state);
+
+	if (state->stores != NULL)
+		return gp_gather_next_merged(state, slot);
 
 	/* At the end the slot is empty, which is what ExecScan() looks for */
 	(void) tuplestore_gettupleslot(state->store, true, false, slot);
@@ -330,20 +491,51 @@ static void
 gp_gather_end(CustomScanState *node)
 {
 	GpGatherState *state = (GpGatherState *) node;
+	int			i;
 
 	if (state->store != NULL)
 		tuplestore_end(state->store);
 	state->store = NULL;
+	if (state->stores != NULL)
+	{
+		for (i = 0; i < state->nstores; i++)
+		{
+			tuplestore_end(state->stores[i]);
+			ExecDropSingleTupleTableSlot(state->peeks[i]);
+		}
+		pfree(state->stores);
+		pfree(state->peeks);
+		state->stores = NULL;
+		state->peeks = NULL;
+	}
+	if (state->heap != NULL)
+	{
+		binaryheap_free(state->heap);
+		state->heap = NULL;
+	}
+	state->peeks = NULL;
 }
 
-/* The rows are all here, so a rescan reads them again from the store */
+/* The rows are all here, so a rescan reads them again from the stores */
 static void
 gp_gather_rescan(CustomScanState *node)
 {
 	GpGatherState *state = (GpGatherState *) node;
+	int			i;
 
 	if (state->store != NULL)
 		tuplestore_rescan(state->store);
+	if (state->stores != NULL)
+	{
+		binaryheap_reset(state->heap);
+		for (i = 0; i < state->nstores; i++)
+		{
+			tuplestore_rescan(state->stores[i]);
+			if (tuplestore_gettupleslot(state->stores[i], true, true,
+										state->peeks[i]))
+				binaryheap_add(state->heap, Int32GetDatum(i));
+		}
+	}
 	ExecScanReScan(&node->ss);
 }
 
@@ -440,6 +632,70 @@ gp_gather_sql(RangeTblEntry *rte)
 	return sql;
 }
 
+/* The ORDER BY clause of the sortkeys, to append to the gather SQL */
+static void
+gp_gather_append_order(StringInfoData *sql, List *sortkeys, Oid relid)
+{
+	ListCell   *lc;
+
+	foreach(lc, sortkeys)
+	{
+		List	   *key = lfirst(lc);
+		AttrNumber	attno = intVal(linitial(key));
+
+		appendStringInfo(sql, "%s%s %s %s", lc == list_head(sortkeys) ?
+						 " ORDER BY " : ", ",
+						 quote_identifier(get_attname(relid, attno, false)),
+						 boolVal(lsecond(key)) ? "DESC" : "ASC",
+						 boolVal(lthird(key)) ? "NULLS FIRST" : "NULLS LAST");
+	}
+}
+
+/*
+ * The sortkeys of the query order, when every one of them is a plain column
+ * of this table: the segments sort them, and the gather merges their sorted
+ * answers.  NIL when the gather cannot promise the order
+ */
+static List *
+gp_gather_sortkeys(PlannerInfo *root, RelOptInfo *rel)
+{
+	List	   *keys = NIL;
+	ListCell   *lc;
+
+	foreach(lc, root->query_pathkeys)
+	{
+		PathKey    *pk = lfirst(lc);
+		EquivalenceClass *ec = pk->pk_eclass;
+		EquivalenceMember *em = NULL;
+		ListCell   *lc2;
+		Var		   *var;
+
+		if (ec->ec_has_volatile)
+			return NIL;
+		foreach(lc2, ec->ec_members)
+		{
+			em = lfirst(lc2);
+
+			if (!em->em_is_child && IsA(em->em_expr, Var) &&
+				((Var *) em->em_expr)->varno == rel->relid)
+				break;
+			em = NULL;
+		}
+		if (em == NULL)
+			return NIL;
+		var = (Var *) em->em_expr;
+		if (var->varattno <= 0)
+			return NIL;
+		keys = lappend(keys, list_make5(makeInteger(var->varattno),
+										makeBoolean(pk->pk_cmptype ==
+													COMPARE_GT),
+										makeBoolean(pk->pk_nulls_first),
+										makeInteger((int) var->vartype),
+										makeInteger((int) exprCollation((Node *) var))));
+	}
+	return keys;
+}
+
 /*
  * The only path to a distributed table is GpGather.  A replicated table
  * keeps a copy on the coordinator as well, so it is read from it alone,
@@ -452,6 +708,7 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	GpPolicy	policy;
 	CustomPath *cpath;
 	Relation	relation;
+	int			only = 0;
 
 	if (prev_set_rel_pathlist)
 		prev_set_rel_pathlist(root, rel, rti, rte);
@@ -553,8 +810,6 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cpath->custom_paths = NIL;
 	{
-		int			only = 0;
-
 		/*
 		 * A table pinned to a segment keeps every row on it: the gather
 		 * reads that segment alone
@@ -577,6 +832,50 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	cpath->methods = &gp_gather_path_methods;
 
 	add_path(rel, &cpath->path);
+
+	/*
+	 * The sorted gather: the segments sort their rows by the order of the
+	 * query, and the gather merges their sorted answers without sorting the
+	 * whole here.  It costs the segments' sort on top of the plain gather;
+	 * the planner takes it when the sort above the gather costs more.  Only
+	 * the plain query of one table takes it: the rescan the plans of a join
+	 * ask of their inputs rewinds the merge, that machinery is not built
+	 * yet, and an aggregate, a DISTINCT or a window of the query pushes its
+	 * own work to the segments, where the sort of the gather is noise.  The
+	 * interconnect carries the merge, so a gather whose rows must come over
+	 * libpq keeps the plain path
+	 */
+	if (root->simple_rel_array_size == 2 &&
+		root->parse->commandType == CMD_SELECT &&
+		!root->parse->hasAggs && root->parse->groupClause == NIL &&
+		root->parse->distinctClause == NIL &&
+		!root->parse->hasWindowFuncs && root->parse->setOperations == NULL)
+	{
+		List	   *sortkeys = gp_gather_sortkeys(root, rel);
+
+		if (sortkeys != NIL)
+		{
+			StringInfoData suffix;
+			CustomPath *spath;
+
+			initStringInfo(&suffix);
+			gp_gather_append_order(&suffix, sortkeys, rte->relid);
+			spath = makeNode(CustomPath);
+			spath->path = cpath->path;
+			spath->path.pathkeys = root->query_pathkeys;
+			spath->path.total_cost += 3.0 * rel->tuples *
+				log(rel->tuples + 2.0) * cpu_operator_cost;
+			spath->custom_private = list_make5(makeString(psprintf("%s%s",
+																	gp_gather_sql(rte),
+																	suffix.data)),
+											   makeBoolean(policy.replicated),
+											   makeBoolean(rte->inh),
+											   makeInteger(only),
+											   sortkeys);
+			spath->methods = &gp_gather_path_methods;
+			add_path(rel, &spath->path);
+		}
+	}
 }
 
 /*
