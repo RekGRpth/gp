@@ -850,7 +850,13 @@ static void
 gp_slice_load(GpSliceState *state)
 {
 	gp_dispatches_bump();
-	if (!gp_transport_libpq &&
+
+	/*
+	 * A slice with a motion reads the fragments of other segments, and
+	 * only the interconnect workers carry it; a motion-free slice runs in
+	 * an ordinary libpq session of the segment when the transport says so
+	 */
+	if ((state->motion || !gp_transport_libpq) &&
 		XactIsoLevel == XACT_READ_COMMITTED && !gp_dispatch_in_xact() &&
 		gp_slice_load_interconnect(state))
 		return;
@@ -5001,9 +5007,6 @@ locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
 	 * whole, so over libpq the slices of joins that need a motion are
 	 * refused, and the coordinator answers
 	 */
-	if (gp_transport_libpq && !gp_slice_join_colocated(original, tables, conds))
-		return false;
-
 	if (!gp_slice_join_colocated(original, tables, conds) &&
 		(locus.kind == GP_LOCUS_COORDINATOR || original->hasSubLinks) &&
 		!(gp_slice_join_derived(original) &&
