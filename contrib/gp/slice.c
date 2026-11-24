@@ -841,7 +841,8 @@ gp_slice_load_interconnect(GpSliceState *state)
 			wanted[nwanted++] = segments[i];
 		}
 		gp_interconnect_pulls(state->store, tupdesc, db, user, plan, 0,
-							  snapshots, wanted, nwanted);
+							  snapshots, wanted, nwanted,
+							  gp_segments_refresh);
 	}
 	return true;
 }

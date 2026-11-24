@@ -1950,6 +1950,8 @@ typedef struct GpIcPull
 	const char *host;			/* the broker of the segment */
 	int			port;
 	int			segment_id;
+	GpSegment  *segment;		/* the row the host and the port came from */
+	void		(*refresh) (GpSegment *segment);
 	uint64		request_id;
 	pgsocket	fd;				/* the worker connection */
 	StringInfoData inbuf;		/* received, not consumed */
@@ -1969,12 +1971,7 @@ static void
 gp_ic_pull_open(GpIcPull *pull, const char *db, const char *user,
 				const char *sql, int requester, GpSnapshots *snapshots)
 {
-	char	   *token = gp_interconnect_token();
-
-	if (token == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("the interconnect token is not installed yet")));
+	char	   *token = NULL;
 
 	pull->request_id = ++gp_ic_next_request;
 	ereport(LOG,
@@ -1992,9 +1989,37 @@ gp_ic_pull_open(GpIcPull *pull, const char *db, const char *user,
 		char		answer[16];
 		int			worker_port = 0;
 
+		/*
+		 * The token of the cluster is installed by the registration: right
+		 * after a restart it may still be on its way, so it is waited out
+		 * the way an unreachable broker is, not failed at once
+		 */
+		if (token == NULL)
+			token = gp_interconnect_token();
+		if (token == NULL)
+		{
+			if (attempt >= 59)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("the interconnect token is not installed yet")));
+			pg_usleep(100000);
+			continue;
+		}
+
 		pull->fd = gp_ic_connect(pull->host, pull->port);
 		if (pull->fd == PGINVALID_SOCKET)
+		{
+			/*
+			 * The registry may still carry the port of the broker of the
+			 * previous run, and the fresh one may have arrived while the
+			 * pull waited: ask the registry again before the next attempt
+			 */
+			if (pull->refresh != NULL)
+				pull->refresh(pull->segment);
+			pull->host = pull->segment->host;
+			pull->port = pull->segment->interconnect_port;
 			retry = true;
+		}
 		else if (!pg_set_noblock(pull->fd))
 		{
 			closesocket(pull->fd);
@@ -2383,7 +2408,8 @@ void
 gp_interconnect_pulls(Tuplestorestate *store, TupleDesc tupdesc,
 					  const char *db, const char *user, const char *sql,
 					  int requester, GpSnapshots *snapshots,
-					  const GpSegment *segments, int nsegments)
+					  GpSegment *segments, int nsegments,
+					  void (*refresh) (GpSegment *segment))
 {
 	GpIcPull   *pulls = palloc0_array(GpIcPull, nsegments);
 	WaitEventSet *wes;
@@ -2421,6 +2447,8 @@ gp_interconnect_pulls(Tuplestorestate *store, TupleDesc tupdesc,
 			pulls[i].host = segments[i].host;
 			pulls[i].port = segments[i].interconnect_port;
 			pulls[i].segment_id = segments[i].segment_id;
+			pulls[i].segment = &segments[i];
+			pulls[i].refresh = refresh;
 			initStringInfo(&pulls[i].inbuf);
 			gp_ic_pull_open(&pulls[i], db, user, sql, requester,
 							snapshots);

@@ -525,6 +525,20 @@ gp_register_main(Datum main_arg)
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
 
+	/*
+	 * The token of the previous run would let the broker report its port
+	 * before this run has registered, and the registration would then wipe
+	 * the fresh port of the broker, whose pull clients would knock at a door
+	 * the registry does not name.  Remove the token, so the broker waits for
+	 * the one this worker installs once the registration is through.
+	 */
+	{
+		char	   *path = psprintf("%s/gp_interconnect.token", DataDir);
+
+		unlink(path);
+		pfree(path);
+	}
+
 	wait_event = WaitEventExtensionNew("GpRegisterSegment");
 
 	conn = libpqsrv_connect_params(keywords, values, true, wait_event);

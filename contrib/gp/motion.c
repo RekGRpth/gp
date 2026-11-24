@@ -106,6 +106,53 @@ gp_motion_event(void)
 	return gp_motion_wait_event;
 }
 
+/* The connection of the current fetch, for gp_motion_refresh() below */
+static PGconn  *gp_motion_refresh_conn;
+
+/*
+ * The registry again: the pull may have taken the port of the broker of the
+ * previous run, and the fresh one may have arrived while it waited.  A
+ * failure leaves the address as it is, and the pull keeps its answer
+ */
+static void
+gp_motion_refresh(GpSegment *segment)
+{
+	PGresult   *res;
+
+	if (gp_motion_refresh_conn == NULL)
+		return;
+	PG_TRY();
+	{
+		res = libpqsrv_exec_params(gp_motion_refresh_conn,
+								   "SELECT segment_id, host, port, interconnect_port FROM gp.cluster_segments()",
+								   0, NULL, NULL, NULL, NULL, 0,
+								   gp_motion_event());
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		gp_motion_refresh_conn = NULL;
+		return;
+	}
+	PG_END_TRY();
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		PQclear(res);
+		return;
+	}
+	for (int i = 0; i < PQntuples(res); i++)
+	{
+		if (atoi(PQgetvalue(res, i, 0)) != segment->segment_id)
+			continue;
+		strlcpy(segment->host, PQgetvalue(res, i, 1), sizeof(segment->host));
+		segment->port = atoi(PQgetvalue(res, i, 2));
+		segment->interconnect_port = PQgetisnull(res, i, 3) ? 0 :
+			atoi(PQgetvalue(res, i, 3));
+		break;
+	}
+	PQclear(res);
+}
+
 /* Ask every segment, this one included, for the rows of the fragment */
 static void
 gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
@@ -195,12 +242,14 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 						 errmsg("segment %d has not reported its interconnect port yet",
 								wanted[i].segment_id)));
 		}
+		gp_motion_refresh_conn = conn;
 		gp_interconnect_pulls(store, tupdesc, db,
 							  GetUserNameFromId(GetUserId(), false),
 							  serialized, gp_segment_id, snapshots,
-							  wanted, nsegments);
+							  wanted, nsegments, gp_motion_refresh);
 	}
 
+	gp_motion_refresh_conn = NULL;
 	PQclear(segments);
 	libpqsrv_disconnect(conn);
 }
