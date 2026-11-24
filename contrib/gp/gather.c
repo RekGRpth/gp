@@ -286,6 +286,109 @@ gp_gather_load_libpq(GpGatherState *state)
 		only = state->only;
 	}
 
+	/*
+	 * The merge of the sorted gathers works over libpq too: the query of
+	 * every segment is its own sorted answer (the ORDER BY and the LIMIT
+	 * of the query are in the SQL), the segments are read one after
+	 * another into their own stores, and the gather hands out the rows in
+	 * the order of the query
+	 */
+	if (state->sortkeys != NIL)
+	{
+		GpSegment  *segments;
+		int			nsegments = gp_segments_get(&segments);
+		int			count = only != 0 ? 1 : nsegments;
+
+		if (nsegments == 0)
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("the cluster has no segments"));
+		state->nstores = 0;
+		state->stores = palloc_array(Tuplestorestate *, count);
+		state->peeks = palloc_array(TupleTableSlot *, count);
+		for (int si = 0; si < count; si++)
+		{
+			int			target = only != 0 ? only : segments[si].segment_id;
+
+			state->stores[state->nstores] =
+				tuplestore_begin_heap(true, false, work_mem);
+			query = gp_query_start(state->sql, target, NULL);
+			while ((res = gp_query_next(query)) != NULL)
+			{
+				MemoryContext oldcontext;
+
+				if (PQnfields(res) != ncols)
+					ereport(ERROR,
+							errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("a segment returned %d columns, but table \"%s\" has %d",
+								   PQnfields(res),
+								   RelationGetRelationName(ss->ss_currentRelation),
+								   ncols));
+
+				ExecClearTuple(loadslot);
+				oldcontext = MemoryContextSwitchTo(rowcxt);
+				for (int i = 0; i < natts; i++)
+				{
+					loadslot->tts_values[i] = (Datum) 0;
+					loadslot->tts_isnull[i] = true;
+				}
+				for (int c = 0; c < ncols; c++)
+				{
+					int			i = colmap[c];
+					StringInfoData buf;
+
+					if (PQgetisnull(res, 0, c))
+						continue;
+
+					/* libpq ends every value with a zero byte, as the receive functions expect */
+					buf.data = PQgetvalue(res, 0, c);
+					buf.len = PQgetlength(res, 0, c);
+					buf.maxlen = buf.len + 1;
+					buf.cursor = 0;
+					loadslot->tts_values[i] = ReceiveFunctionCall(&recv[i], &buf,
+																 ioparam[i],
+																 TupleDescAttr(tupdesc, i)->atttypmod);
+					loadslot->tts_isnull[i] = false;
+				}
+				ExecStoreVirtualTuple(loadslot);
+				tuplestore_puttupleslot(state->stores[state->nstores], loadslot);
+				MemoryContextSwitchTo(oldcontext);
+				MemoryContextReset(rowcxt);
+				PQclear(res);
+			}
+			gp_query_end(query);
+			state->peeks[state->nstores] =
+				MakeSingleTupleTableSlot(tupdesc, &TTSOpsMinimalTuple);
+			if (tuplestore_gettupleslot(state->stores[state->nstores], true,
+										true, state->peeks[state->nstores]))
+				state->nstores++;
+			else
+			{
+				tuplestore_end(state->stores[state->nstores]);
+				state->stores[state->nstores] = NULL;
+			}
+		}
+		ExecDropSingleTupleTableSlot(loadslot);
+		MemoryContextDelete(rowcxt);
+		if (state->nstores == 0)
+		{
+			pfree(state->stores);
+			state->stores = NULL;
+			pfree(state->peeks);
+			state->peeks = NULL;
+		}
+		else
+		{
+			/* the heap skips the stores that came back empty */
+			state->heap = binaryheap_allocate(state->nstores,
+											  gp_gather_merge_heap_cmp, state);
+			for (int i = 0; i < state->nstores; i++)
+				if (state->stores[i] != NULL)
+					binaryheap_add(state->heap, Int32GetDatum(i));
+		}
+		return;
+	}
+
 	query = gp_query_start(state->sql, only, NULL);
 	while ((res = gp_query_next(query)) != NULL)
 	{
@@ -339,13 +442,15 @@ static void
 gp_gather_load(GpGatherState *state)
 {
 	gp_dtx_statement_start(state->css.ss.ps.state);
-	if (XactIsoLevel == XACT_READ_COMMITTED && !gp_dispatch_in_xact() &&
+	if (!gp_transport_libpq &&
+		XactIsoLevel == XACT_READ_COMMITTED && !gp_dispatch_in_xact() &&
 		gp_gather_load_interconnect(state))
 		return;
-	if (state->sortkeys != NIL)
+	if (state->sortkeys != NIL && !gp_transport_libpq)
 		/*
 		 * The order of the query is promised by the merge of the segments'
-		 * sorted answers, and only the interconnect carries it
+		 * sorted answers, and over libpq the gather merges them only under
+		 * gp.transport_libpq
 		 */
 		ereport(ERROR,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -850,7 +955,8 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		root->parse->commandType == CMD_SELECT &&
 		!root->parse->hasAggs && root->parse->groupClause == NIL &&
 		root->parse->distinctClause == NIL &&
-		!root->parse->hasWindowFuncs && root->parse->setOperations == NULL)
+		!root->parse->hasWindowFuncs && !root->parse->hasSubLinks &&
+		root->parse->setOperations == NULL)
 	{
 		List	   *sortkeys = gp_gather_sortkeys(root, rel);
 

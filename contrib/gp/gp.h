@@ -206,6 +206,7 @@ extern void gp_dispatch_nonxact(const char *sql, const char *oids,
 extern char *gp_dispatch_oids;
 extern bool gp_dispatch_oids_session;
 extern bool gp_allow_local_ddl;
+extern bool gp_transport_libpq;
 extern void gp_oids_init(void);
 extern bool gp_check_dispatch_oids(char **newval, void **extra,
 								   GucSource source);

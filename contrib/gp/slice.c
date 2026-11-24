@@ -850,7 +850,14 @@ static void
 gp_slice_load(GpSliceState *state)
 {
 	gp_dispatches_bump();
-	if (XactIsoLevel == XACT_READ_COMMITTED && !gp_dispatch_in_xact() &&
+
+	/*
+	 * A slice with a motion reads the fragments of other segments, and
+	 * only the interconnect workers carry it; a motion-free slice runs in
+	 * an ordinary libpq session of the segment when the transport says so
+	 */
+	if ((state->motion || !gp_transport_libpq) &&
+		XactIsoLevel == XACT_READ_COMMITTED && !gp_dispatch_in_xact() &&
 		gp_slice_load_interconnect(state))
 		return;
 	gp_slice_load_libpq(state);
@@ -4990,6 +4997,16 @@ locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
 		return false;
 	if (!gp_slice_join_probes_keyed(tables, conds))
 		return false;
+
+	/*
+	 * Over libpq the fragment deparses the query and the segment replays it
+	 * over its local tables: a join that needs a broadcast or a
+	 * redistribution would read a part of a foreign table and answer with
+	 * the pairs that happen to share a segment.  Only a colocated join
+	 * (every hashed table of one group, joined by the whole key) is locally
+	 * whole, so over libpq the slices of joins that need a motion are
+	 * refused, and the coordinator answers
+	 */
 	if (!gp_slice_join_colocated(original, tables, conds) &&
 		(locus.kind == GP_LOCUS_COORDINATOR || original->hasSubLinks) &&
 		!(gp_slice_join_derived(original) &&
