@@ -457,10 +457,39 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		prev_set_rel_pathlist(root, rel, rti, rte);
 
 	if (!IsUnderPostmaster || fragment_plan || rte->rtekind != RTE_RELATION ||
-		rel->reloptkind != RELOPT_BASEREL ||
 		(rte->relkind != RELKIND_RELATION &&
 		 rte->relkind != RELKIND_PARTITIONED_TABLE))
 		return;
+
+	/*
+	 * A flattened UNION ALL leaf is an other member of an append relation
+	 * whose parent has no relation oid: the planner pulled the leaf up into
+	 * the query, and its scan runs where the query runs.  A partitioned
+	 * parent builds its paths from such members, so a member must be read
+	 * through the gather the same way the whole table is.  Members of real
+	 * inheritance or partitioning (parent oid set) keep the usual paths.
+	 */
+	if (rel->reloptkind == RELOPT_OTHER_MEMBER_REL)
+	{
+		bool		setop_member = false;
+		ListCell   *lc;
+
+		foreach(lc, root->append_rel_list)
+		{
+			AppendRelInfo *appinfo = lfirst_node(AppendRelInfo, lc);
+
+			if (appinfo->child_relid == rti)
+			{
+				setop_member = appinfo->parent_reloid == InvalidOid;
+				break;
+			}
+		}
+		if (!setop_member)
+			return;
+	}
+	else if (rel->reloptkind != RELOPT_BASEREL)
+		return;
+
 	if (!gp_policy_get(rte->relid, &policy))
 		return;
 
@@ -501,8 +530,11 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	 * A partitioned table is read as a whole: the planner must not build its
 	 * paths again from those of the partitions, which are empty here
 	 */
-	rel->part_scheme = NULL;
-	rel->nparts = 0;
+	if (rel->reloptkind == RELOPT_BASEREL)
+	{
+		rel->part_scheme = NULL;
+		rel->nparts = 0;
+	}
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
 	cpath->path.parent = rel;

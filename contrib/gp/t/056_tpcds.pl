@@ -58,10 +58,6 @@ my %slice = map { $_ => 1 }
 # names the defect.  The comparison runs under TODO, so a fix flips the
 # subtest to an unexpected pass instead of hiding a regression.
 my %known_defect = (
-	query02 =>
-	  'the coordinator fallback does not gather a hashed table under a UNION ALL (Append), so the coordinator reads its empty local copy',
-	query05 =>
-	  'the coordinator fallback does not gather a hashed table under a UNION ALL (Append), so the coordinator reads its empty local copy',
 	query69 =>
 	  'a correlated EXISTS inside the slice reads the local rows of its segment: the probe table is not distributed by the correlation key',
 );
