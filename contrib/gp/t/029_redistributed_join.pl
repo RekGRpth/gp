@@ -276,6 +276,22 @@ foreach my $query (@nway_queries)
 	is(run($query), run($local),
 		"the same N-way answer over libpq as on the coordinator: $query");
 }
+
+# An error of a segment stops the read of the slice's rows in the middle:
+# the results the read did not take stay on the connection, and libpq
+# refuses a command on a connection that has them.  The connection must
+# serve the next statement of the session all the same
+my $drain_session = $coordinator->background_psql('postgres', on_error_stop => 0);
+$drain_session->query_safe('SET gp.transport_libpq = on');
+$drain_session->query('SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a WHERE 1/(100 - t1.a) > 0');
+like($drain_session->{stderr}, qr/division by zero/,
+	'the error of the segment inside a slice reaches the session');
+$drain_session->{stderr} = '';
+is($drain_session->query_safe('SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.a'),
+	$drain_session->query_safe('SELECT count(*) FROM l1 JOIN l2 ON l1.a = l2.a'),
+	'the next statement of the session answers after the error of a segment');
+$drain_session->quit;
+
 run('ALTER DATABASE postgres RESET gp.transport_libpq');
 
 # A request without the shared token is not executed
