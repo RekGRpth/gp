@@ -36,11 +36,13 @@ run('CREATE TABLE lc AS SELECT * FROM c');
 run('CREATE TABLE lo AS SELECT * FROM o');
 
 # The anti-join keeps a customer of one segment even when its orders sit
-# on another: no row is kept twice.  A count over the bare join keeps its
-# single group with the coordinator
-like(plan_for('SELECT k FROM c WHERE NOT EXISTS (
+# on another: no row is kept twice.  The probe of the sublink is
+# distributed by its own key, not by the correlation key, so the slice
+# cannot promise the fragment reads the probe whole: the coordinator
+# answers (same_answers checks below stay)
+unlike(plan_for('SELECT k FROM c WHERE NOT EXISTS (
 	SELECT * FROM o WHERE o.k = c.k) ORDER BY k'), qr/GpSlice/,
-	'an anti join driven by a sublink runs on the segments');
+	'an anti join driven by a sublink probes a foreign key: the coordinator answers');
 is(run('SELECT count(*) FROM c WHERE NOT EXISTS (
 	SELECT * FROM o WHERE o.k = c.k)'),
 	run('SELECT count(*) FROM lc WHERE NOT EXISTS (

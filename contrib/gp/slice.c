@@ -2149,6 +2149,132 @@ gp_slice_join_sublinks(Query *parse, List **tables, List **conds)
 	return state.ok;
 }
 
+/* Whether the Var names the probe table at the condition's own level */
+static bool
+gp_slice_join_var_of_table(Var *var, Query *condquery, int cond_depth,
+						   List *ancestors, GpJoinTable *table)
+{
+	if (var->varattno <= 0 || var->varno != table->rti)
+		return false;
+	if (var->varlevelsup == 0)
+		return table->query == condquery;
+	if (table->query == condquery ||
+		var->varlevelsup != cond_depth - table->depth ||
+		var->varlevelsup > list_length(ancestors))
+		return false;
+	return list_nth(ancestors, cond_depth - var->varlevelsup) == table->query;
+}
+
+/*
+ * Whether a condition equates a column of the probe with a variable of the
+ * outer level, and return that column.  A correlated reference in a
+ * sublink condition always carries a positive varlevelsup: the variables
+ * of the sublink itself are of level zero.
+ */
+static bool
+gp_slice_join_probe_key(Node *qual, Query *condquery, int cond_depth,
+						List *ancestors, GpJoinTable *probe,
+						AttrNumber *probe_key)
+{
+	OpExpr	   *op;
+	Var		   *var;
+	Var		   *probevar = NULL;
+
+	if (qual == NULL)
+		return false;
+	if (IsA(qual, BoolExpr) && ((BoolExpr *) qual)->boolop == AND_EXPR)
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((BoolExpr *) qual)->args)
+		{
+			if (gp_slice_join_probe_key(lfirst(lc), condquery, cond_depth,
+										ancestors, probe, probe_key))
+				return true;
+		}
+		return false;
+	}
+	if (!IsA(qual, OpExpr))
+		return false;
+	op = (OpExpr *) qual;
+	if (list_length(op->args) != 2 ||
+		!IsA(linitial(op->args), Var) || !IsA(lsecond(op->args), Var))
+		return false;
+	var = (Var *) linitial(op->args);
+	if (gp_slice_join_var_of_table(var, condquery, cond_depth, ancestors,
+								   probe))
+		probevar = var;
+	else
+	{
+		var = (Var *) lsecond(op->args);
+		if (gp_slice_join_var_of_table(var, condquery, cond_depth, ancestors,
+									   probe))
+			probevar = var;
+		else
+			return false;
+	}
+	var = probevar == (Var *) linitial(op->args)
+		? (Var *) lsecond(op->args)
+		: (Var *) linitial(op->args);
+	if (var->varlevelsup == 0)
+		return false;
+	*probe_key = probevar->varattno;
+	return true;
+}
+
+/*
+ * The fragment replays the query on every segment, and a correlated probe
+ * inside it reads the local rows of the segment.  A probe distributed by
+ * its correlation key keeps every row an outer row can match on one
+ * segment, and a replicated probe is whole on every segment; any other
+ * probe answers from a part of itself (TPC-DS q69 probes store_sales by
+ * ss_customer_sk while the table is distributed by ss_item_sk, and the
+ * fragment counts a third of the customers).  Every correlation key of
+ * every distributed probe must therefore be a key of its distribution.
+ */
+static bool
+gp_slice_join_probes_keyed(List *tables, List *conds)
+{
+	ListCell   *lc;
+
+	foreach(lc, tables)
+	{
+		GpJoinTable *probe = lfirst(lc);
+		ListCell   *lc2;
+
+		if (probe->depth == 0 || probe->policy.replicated)
+			continue;
+		foreach(lc2, conds)
+		{
+			GpJoinCond *cond = lfirst(lc2);
+			AttrNumber	key;
+			bool		is_key = false;
+			int			i;
+
+			/*
+			 * An uncorrelated probe has no key of its own here; the
+			 * segments evaluate such sublinks as their own init plans,
+			 * which gather the whole table
+			 */
+			if (!gp_slice_join_probe_key(cond->qual, cond->query,
+										 cond->depth, cond->ancestors,
+										 probe, &key))
+				continue;
+			for (i = 0; i < probe->policy.nkeys; i++)
+			{
+				if (probe->policy.keys[i] == key)
+				{
+					is_key = true;
+					break;
+				}
+			}
+			if (!is_key)
+				return false;
+		}
+	}
+	return true;
+}
+
 /* Load the policies needed to build a motion, independently of its locus */
 static bool
 gp_slice_join_load_policies(Query *parse, List *tables)
@@ -4861,6 +4987,8 @@ locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
 	if (!gp_slice_join_sublinks(original, &tables, &conds))
 		return false;
 	if (!gp_slice_join_load_policies(original, tables))
+		return false;
+	if (!gp_slice_join_probes_keyed(tables, conds))
 		return false;
 	if (!gp_slice_join_colocated(original, tables, conds) &&
 		(locus.kind == GP_LOCUS_COORDINATOR || original->hasSubLinks) &&

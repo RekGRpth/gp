@@ -1040,13 +1040,16 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 		 * A subquery in FROM may have been flattened into the query by the
 		 * planner, which rewrites the query in place: what was a select
 		 * over a subquery is an aggregate or a colocated join now, and the
-		 * detection above, run before the planner, saw none of it
+		 * detection above, run before the planner, saw none of it.  The
+		 * planner replaced the sublinks of the query with params, whose
+		 * deparsing needs the plan these rewrites run without, so a query
+		 * with sublinks stays on the coordinator here (TPC-DS q06).
 		 */
-		Query	   *flattened = gp_slice_agg_query(parse);
+		Query	   *flattened = parse->hasSubLinks ? NULL : gp_slice_agg_query(parse);
 
 		if (flattened != NULL)
 			replaced = gp_slice_agg_plan(flattened, parse, stmt);
-		if (!replaced)
+		if (!replaced && !parse->hasSubLinks)
 		{
 			flattened = gp_slice_join_query(parse);
 			if (flattened != NULL)
