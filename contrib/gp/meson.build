@@ -116,6 +116,7 @@ tests += {
       't/054_fragment_snapshots.pl',
       't/055_two_phase_agg.pl',
       't/056_tpcds.pl',
+      't/057_merge_gather.pl',
     ],
   },
 }
