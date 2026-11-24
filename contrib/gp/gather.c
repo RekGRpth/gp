@@ -955,7 +955,7 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		root->parse->commandType == CMD_SELECT &&
 		!root->parse->hasAggs && root->parse->groupClause == NIL &&
 		root->parse->distinctClause == NIL &&
-		!root->parse->hasWindowFuncs && !root->parse->hasSubLinks &&
+		!root->parse->hasWindowFuncs &&
 		root->parse->setOperations == NULL)
 	{
 		List	   *sortkeys = gp_gather_sortkeys(root, rel);
@@ -974,9 +974,14 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			 * can cut their answers to the offset plus the count, and the
 			 * merge works on a few rows per segment instead of the whole
 			 * table.  Only literal counts take this: an expression of the
-			 * LIMIT clause is not evaluated yet
+			 * LIMIT clause is not evaluated yet.  The remote SQL carries no
+			 * WHERE, so the filters of the query read the answers above the
+			 * gather: a cut of the segments' answers would drop the rows
+			 * those filters have not seen yet, and the answers would lose
+			 * rows, so a query with a filter keeps the whole answers
 			 */
-			if (root->parse->limitCount != NULL &&
+			if (rel->baserestrictinfo == NIL &&
+				root->parse->limitCount != NULL &&
 				IsA(root->parse->limitCount, Const))
 			{
 				Const	   *limit = (Const *) root->parse->limitCount;
