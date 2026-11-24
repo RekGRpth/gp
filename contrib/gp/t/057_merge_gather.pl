@@ -67,6 +67,41 @@ is(run('SELECT a FROM t ORDER BY n DESC NULLS FIRST, a LIMIT 15'),
 like(run('SELECT a FROM t WHERE b IS NULL ORDER BY a LIMIT 3'),
 	qr/\d/, 'the null rows of the merge answer');
 
+# The transport of libpq answers the merge in ordinary sessions of the
+# segments.  The remote SQL carries no WHERE: the filters of the query read
+# the answers above the gather, so the segments must not cut their answers
+# to the limit of the query, or the filters would read rows that were
+# dropped before they saw them
+run('ALTER DATABASE postgres SET gp.transport_libpq = on');
+
+my $filtered = remote_sql('SELECT a FROM t WHERE b IS NULL ORDER BY a LIMIT 3');
+like($filtered, qr/ORDER BY a/, 'the filtered ordered query still sorts remotely');
+unlike($filtered, qr/LIMIT/, 'a filtered query keeps the whole answers of the segments');
+
+foreach my $query (
+	'SELECT a FROM t WHERE b IS NULL ORDER BY a LIMIT 3',
+	'SELECT a, n FROM t WHERE n > 1000 ORDER BY n LIMIT 5',
+	'SELECT a FROM t WHERE c = 7 ORDER BY a DESC LIMIT 4',
+	'SELECT s, a FROM t WHERE s = \'g2\' ORDER BY a LIMIT 6',
+)
+{
+	is(run($query), run($query =~ s/\bFROM t\b/FROM l/r),
+		"the filtered merge keeps the whole answer over libpq: $query");
+}
+
+# The correlated subplans rescan the merge of the inner gather once per
+# outer row: the minmax answers must survive the rescan over libpq
+like(plan_for('SELECT a, (SELECT max(t2.b) FROM t t2 WHERE t2.a = t.a) FROM t ORDER BY a LIMIT 15'),
+	qr/GpGather/, 'the correlated aggregate rides the merge');
+is(run('SELECT a, (SELECT max(t2.b) FROM t t2 WHERE t2.a = t.a) FROM t ORDER BY a LIMIT 15'),
+	run('SELECT a, (SELECT max(l2.b) FROM l l2 WHERE l2.a = l.a) FROM l ORDER BY a LIMIT 15'),
+	'a correlated scalar aggregate answers over the libpq merge');
+is(run('SELECT a, (SELECT t2.c FROM t t2 WHERE t2.a = t.a AND t2.c IS NOT NULL ORDER BY t2.c DESC LIMIT 1) FROM t ORDER BY a LIMIT 15'),
+	run('SELECT a, (SELECT l2.c FROM l l2 WHERE l2.a = l.a AND l2.c IS NOT NULL ORDER BY l2.c DESC LIMIT 1) FROM l ORDER BY a LIMIT 15'),
+	'a correlated minmax without an aggregate answers over the libpq merge');
+
+run('ALTER DATABASE postgres RESET gp.transport_libpq');
+
 $_->stop foreach (@segments, $coordinator);
 
 done_testing();
