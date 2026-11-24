@@ -955,7 +955,8 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		root->parse->commandType == CMD_SELECT &&
 		!root->parse->hasAggs && root->parse->groupClause == NIL &&
 		root->parse->distinctClause == NIL &&
-		!root->parse->hasWindowFuncs && root->parse->setOperations == NULL)
+		!root->parse->hasWindowFuncs && !root->parse->hasSubLinks &&
+		root->parse->setOperations == NULL)
 	{
 		List	   *sortkeys = gp_gather_sortkeys(root, rel);
 
