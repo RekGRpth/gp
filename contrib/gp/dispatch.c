@@ -145,6 +145,7 @@ PG_FUNCTION_INFO_V1(gp_exec_on_all);
 
 static PGresult **gp_dispatch(const GpSegment *segments, GpConnection **entries,
 							  int nsegments, char **commands, const char *what);
+static void gp_connection_drain(GpConnection *entry);
 
 static void
 gp_connection_close(GpConnection *entry)
@@ -827,7 +828,15 @@ gp_connection_open(const GpSegment *segment)
 		if (strcmp(entry->host, segment->host) == 0 &&
 			entry->port == segment->port &&
 			PQstatus(entry->conn) == CONNECTION_OK)
+		{
+			/*
+			 * A query of a statement that failed before its rows were read
+			 * may still hold its results here, so read them before the
+			 * connection serves again
+			 */
+			gp_connection_drain(entry);
 			return entry;
+		}
 		gp_connection_close(entry);
 	}
 
@@ -1632,16 +1641,38 @@ gp_query_start(const char *sql, int only, GpSnapshots *snapshots)
 }
 
 /*
- * End the local transactions that gp_query_start() began for the statement
- * snapshots, draining whatever they still hold.  Safe on the success path
- * (gp_query_next() already committed each finished segment) and required on
- * the error path, where an unfinished query would otherwise leave its
- * segments in a transaction the pool does not know about.
+ * Read the results a query still holds on the connection, until libpq
+ * considers it idle again.  A query that an error stopped before its rows
+ * were read keeps them, and libpq refuses another command on a connection
+ * that has them, with "another command is already in progress": the caller
+ * of gp_query_next() stopped at the error, so the results of the other
+ * segments, and the error itself, wait here.  Reads nothing on a
+ * connection that serves no query.
+ */
+static void
+gp_connection_drain(GpConnection *entry)
+{
+	PGresult   *res;
+
+	if (!entry->busy)
+		return;
+	while ((res = libpqsrv_get_result(entry->conn, wait_event_result)) != NULL)
+		PQclear(res);
+	entry->busy = false;
+}
+
+/*
+ * End the query of the statement: drain what its segments still hold, and
+ * end the local transactions that gp_query_start() began for the statement
+ * snapshots.  Safe on the success path (gp_query_next() already read each
+ * finished segment to its end) and required on the error path, where an
+ * unfinished query would keep its connection out of libpq's idle state and
+ * leave its segments in a transaction the pool does not know about.
  */
 void
 gp_query_end(GpQuery *query)
 {
-	if (query == NULL || !query->attached)
+	if (query == NULL)
 		return;
 
 	PG_TRY();
@@ -1651,18 +1682,18 @@ gp_query_end(GpQuery *query)
 			GpConnection *entry;
 			PGresult   *res;
 
-			if (!query->local[i])
-				continue;
-			query->local[i] = false;
 			entry = hash_search(connections, &query->segments[i].segment_id,
 								HASH_FIND, NULL);
 			if (entry == NULL)
 				continue;
+			gp_connection_drain(entry);
+			if (!query->local[i])
+				continue;
+			query->local[i] = false;
 			if (PQsendQuery(entry->conn, "COMMIT"))
 				while ((res = libpqsrv_get_result(entry->conn,
 												  wait_event_result)) != NULL)
 					PQclear(res);
-			entry->busy = false;
 		}
 	}
 	PG_CATCH();
