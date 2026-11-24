@@ -850,7 +850,8 @@ static void
 gp_slice_load(GpSliceState *state)
 {
 	gp_dispatches_bump();
-	if (XactIsoLevel == XACT_READ_COMMITTED && !gp_dispatch_in_xact() &&
+	if (!gp_transport_libpq &&
+		XactIsoLevel == XACT_READ_COMMITTED && !gp_dispatch_in_xact() &&
 		gp_slice_load_interconnect(state))
 		return;
 	gp_slice_load_libpq(state);

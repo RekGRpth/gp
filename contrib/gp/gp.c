@@ -284,6 +284,17 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomBoolVariable("gp.transport_libpq",
+							 "Answers the fragments over libpq sessions, without the interconnect workers.",
+							 "The gather and the slice run in ordinary sessions of the segments over libpq; the interconnect stays unused.  Experimental.",
+							 &gp_transport_libpq,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	MarkGUCPrefixReserved("gp");
 
 	/* A misconfigured node does not start */

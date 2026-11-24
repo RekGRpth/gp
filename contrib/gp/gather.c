@@ -339,7 +339,8 @@ static void
 gp_gather_load(GpGatherState *state)
 {
 	gp_dtx_statement_start(state->css.ss.ps.state);
-	if (XactIsoLevel == XACT_READ_COMMITTED && !gp_dispatch_in_xact() &&
+	if (!gp_transport_libpq &&
+		XactIsoLevel == XACT_READ_COMMITTED && !gp_dispatch_in_xact() &&
 		gp_gather_load_interconnect(state))
 		return;
 	if (state->sortkeys != NIL)

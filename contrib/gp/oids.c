@@ -68,6 +68,7 @@ typedef struct GpOidList
 char	   *gp_dispatch_oids = NULL;
 bool		gp_dispatch_oids_session = false;
 bool		gp_allow_local_ddl = false;
+bool		gp_transport_libpq = false;
 
 /*
  * Coordinator: OIDs of the current transaction, in TopTransactionContext,
