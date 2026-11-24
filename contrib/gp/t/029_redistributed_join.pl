@@ -254,6 +254,30 @@ foreach my $query (
 	is(run($query), run($local), "a dropped column falls back correctly: $query");
 }
 
+# The transport of libpq answers the slices in ordinary sessions of the
+# segments: the pull of a motion rides in the query itself as gp.peer_query,
+# so the answers must not change with the transport
+run('ALTER DATABASE postgres SET gp.transport_libpq = on');
+foreach my $query (@queries)
+{
+	my $local = $query;
+	$local =~ s/\bt1\b/l1/g;
+	$local =~ s/\bt2\b/l2/g;
+	is(run($query), run($local),
+		"the same answer over libpq as on the coordinator: $query");
+}
+foreach my $query (@nway_queries)
+{
+	my $local = $query;
+	$local =~ s/\bt1\b/l1/g;
+	$local =~ s/\bt2\b/l2/g;
+	$local =~ s/\bt3\b/l3/g;
+	$local =~ s/\bt4\b/l4/g;
+	is(run($query), run($local),
+		"the same N-way answer over libpq as on the coordinator: $query");
+}
+run('ALTER DATABASE postgres RESET gp.transport_libpq');
+
 # A request without the shared token is not executed
 my $socket;
 if ($segments[0]->host =~ m{^/|^[A-Za-z]:[\\/]})

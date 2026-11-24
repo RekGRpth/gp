@@ -852,11 +852,13 @@ gp_slice_load(GpSliceState *state)
 	gp_dispatches_bump();
 
 	/*
-	 * A slice with a motion reads the fragments of other segments, and
-	 * only the interconnect workers carry it; a motion-free slice runs in
-	 * an ordinary libpq session of the segment when the transport says so
+	 * A slice reads the fragments of other segments through the peers of its
+	 * own query: the deparsed SQL of a motion pulls them with gp.peer_query,
+	 * so the slice runs in an ordinary libpq session of the segment when the
+	 * transport says so, and only the interconnect workers carry it
+	 * otherwise
 	 */
-	if ((state->motion || !gp_transport_libpq) &&
+	if (!gp_transport_libpq &&
 		XactIsoLevel == XACT_READ_COMMITTED && !gp_dispatch_in_xact() &&
 		gp_slice_load_interconnect(state))
 		return;
