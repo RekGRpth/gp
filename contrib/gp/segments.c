@@ -373,6 +373,26 @@ gp_segments_get(GpSegment **segments)
 }
 
 /*
+ * Read the address of one segment again: after a restart of the cluster the
+ * registry may still carry the port of the broker of the previous run, and
+ * a pull that cannot connect to it asks again until the fresh port arrives
+ */
+void
+gp_segments_refresh(GpSegment *segment)
+{
+	GpSegment  *segments;
+	int			nsegments = gp_segments_get(&segments);
+	int			i;
+
+	for (i = 0; i < nsegments; i++)
+		if (segments[i].segment_id == segment->segment_id)
+			break;
+	if (i < nsegments)
+		memcpy(segment, &segments[i], sizeof(GpSegment));
+	pfree(segments);
+}
+
+/*
  * gp.cluster_segments(): the copy of gp.segments, from any database
  */
 Datum

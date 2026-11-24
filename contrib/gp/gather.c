@@ -229,7 +229,8 @@ gp_gather_load_interconnect(GpGatherState *state)
 			wanted[nwanted++] = segments[i];
 		}
 		gp_interconnect_pulls(state->store, tupdesc, db, user, plan, 0,
-							  snapshots, wanted, nwanted);
+							  snapshots, wanted, nwanted,
+							  gp_segments_refresh);
 	}
 	return true;
 }
@@ -537,7 +538,7 @@ gp_gather_load_one(GpGatherState *state, GpSegment *segment, int i,
 {
 	state->stores[i] = tuplestore_begin_heap(true, false, work_mem);
 	gp_interconnect_pulls(state->stores[i], tupdesc, db, user, plan, 0,
-						  snapshots, segment, 1);
+						  snapshots, segment, 1, gp_segments_refresh);
 	return true;
 }
 

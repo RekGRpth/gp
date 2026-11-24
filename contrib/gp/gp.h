@@ -83,6 +83,7 @@ extern int	gp_default_distribution;
 /* segments.c */
 extern void gp_segments_init(void);
 extern int	gp_segments_get(GpSegment **segments);
+extern void gp_segments_refresh(GpSegment *segment);
 
 /* How the rows of a distributed table are placed */
 typedef struct GpPolicy
@@ -162,7 +163,8 @@ extern void gp_interconnect_pulls(Tuplestorestate *store, TupleDesc tupdesc,
 								  const char *db, const char *user,
 								  const char *sql, int requester,
 								  GpSnapshots *snapshots,
-								  const GpSegment *segments, int nsegments);
+								  GpSegment *segments, int nsegments,
+								  void (*refresh) (GpSegment *segment));
 
 /* recovery.c */
 extern void gp_recovery_init(void);

@@ -99,7 +99,12 @@ BEGIN
 			RAISE EXCEPTION 'segment % is already registered at %:%',
 				known.segment_id, known.host, known.port;
 		END IF;
-		UPDATE gp.segments s SET registered = now()
+		-- The broker of the previous run is gone with the segment: its port
+		-- tells nothing about the broker of this run, which reports its own
+		-- when it listens.  Forget the old one, or a query that comes before
+		-- the report would knock at a door no one is behind
+		UPDATE gp.segments s SET registered = now(),
+			interconnect_port = NULL
 		WHERE s.segment_id = register_segment.segment_id;
 		RETURN secret;
 	END IF;
