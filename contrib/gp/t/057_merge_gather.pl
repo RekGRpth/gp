@@ -44,11 +44,20 @@ foreach my $order (
 	'SELECT n FROM t ORDER BY n DESC NULLS LAST LIMIT 5',
 	'SELECT s, a FROM t ORDER BY s DESC, a NULLS FIRST LIMIT 9',
 	'SELECT a FROM t ORDER BY a, b, c LIMIT 4',
+	'SELECT a FROM t ORDER BY a LIMIT 3 OFFSET 4',
+	'SELECT b FROM t ORDER BY a LIMIT 7 OFFSET 2',
 )
 {
 	is(run($order), run($order =~ s/\bFROM t\b/FROM l/r),
 		"the merge keeps the order of the query: $order");
 }
+
+# The limit rides in the remote SQL: the segments answer a few rows, not
+# the whole table
+like(remote_sql('SELECT a FROM t ORDER BY a LIMIT 3'),
+	qr/LIMIT 3/, 'the limit of the query rides to the segments');
+like(remote_sql('SELECT a FROM t ORDER BY a LIMIT 3 OFFSET 4'),
+	qr/LIMIT 7/, 'the offset rides with the limit, added to it');
 
 # A numeric one carries its own type; NULLS FIRST and NULLS LAST are
 # honored per key, and the null rows come first in this order

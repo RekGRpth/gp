@@ -41,6 +41,7 @@
 #include "nodes/value.h"
 #include <math.h>
 #include "access/cmptype.h"
+#include "catalog/pg_type_d.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
@@ -857,14 +858,68 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		{
 			StringInfoData suffix;
 			CustomPath *spath;
+			int64		remote_limit = 0;
 
 			initStringInfo(&suffix);
 			gp_gather_append_order(&suffix, sortkeys, rte->relid);
+
+			/*
+			 * The query asks for the first rows of the order: the segments
+			 * can cut their answers to the offset plus the count, and the
+			 * merge works on a few rows per segment instead of the whole
+			 * table.  Only literal counts take this: an expression of the
+			 * LIMIT clause is not evaluated yet
+			 */
+			if (root->parse->limitCount != NULL &&
+				IsA(root->parse->limitCount, Const))
+			{
+				Const	   *limit = (Const *) root->parse->limitCount;
+
+				if (!limit->constisnull &&
+					(limit->consttype == INT4OID ||
+					 limit->consttype == INT8OID))
+				{
+					remote_limit = limit->consttype == INT4OID
+						? (int64) DatumGetInt32(limit->constvalue)
+						: DatumGetInt64(limit->constvalue);
+					if (root->parse->limitOffset != NULL)
+					{
+						if (IsA(root->parse->limitOffset, Const))
+						{
+							Const	   *offset = (Const *) root->parse->limitOffset;
+
+							if (!offset->constisnull &&
+								(offset->consttype == INT4OID ||
+								 offset->consttype == INT8OID))
+								remote_limit += offset->consttype == INT4OID
+									? (int64) DatumGetInt32(offset->constvalue)
+									: DatumGetInt64(offset->constvalue);
+						}
+						else
+							remote_limit = 0;
+					}
+					if (remote_limit < 0)
+						remote_limit = 0;
+				}
+			}
+			if (remote_limit > 0)
+				appendStringInfo(&suffix, " LIMIT %lld",
+								 (long long) remote_limit);
+
 			spath = makeNode(CustomPath);
 			spath->path = cpath->path;
 			spath->path.pathkeys = root->query_pathkeys;
 			spath->path.total_cost += 3.0 * rel->tuples *
 				log(rel->tuples + 2.0) * cpu_operator_cost;
+			if (remote_limit > 0 && spath->path.rows > (double) remote_limit)
+			{
+				double		factor = spath->path.total_cost /
+					Max(spath->path.rows, 1.0);
+
+				spath->path.rows = (double) remote_limit;
+				spath->path.total_cost = spath->path.startup_cost +
+					spath->path.rows * factor;
+			}
 			spath->custom_private = list_make5(makeString(psprintf("%s%s",
 																	gp_gather_sql(rte),
 																	suffix.data)),
