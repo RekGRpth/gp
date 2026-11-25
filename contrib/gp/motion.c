@@ -797,7 +797,7 @@ gp_fragment_exec(PG_FUNCTION_ARGS)
 	dest = CreateTuplestoreDestReceiver();
 	SetTuplestoreDestReceiverParams(dest, store,
 									rsinfo->econtext->ecxt_per_query_memory,
-									true, rsinfo->expectedDesc, NULL);
+									true, NULL, NULL);
 	query = CreateQueryDesc(stmt, "gp.fragment_exec", GetActiveSnapshot(),
 							NULL, dest, NULL, NULL, 0);
 	ExecutorStart(query, 0);
