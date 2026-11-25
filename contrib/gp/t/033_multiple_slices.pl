@@ -21,8 +21,14 @@ sub run { return $coordinator->safe_psql('postgres', shift); }
 
 # The slices of the transport of libpq run in ordinary sessions and leave no
 # interconnect request behind them: this test asks the workers, so it keeps
-# the interconnect
+# the interconnect.  The pull of a motion runs on the segment and reads the
+# setting of its own database, so the segments keep it off as well
 run('ALTER DATABASE postgres SET gp.transport_libpq = off');
+foreach my $segment (@segments)
+{
+	$segment->safe_psql('postgres',
+		'ALTER DATABASE postgres SET gp.transport_libpq = off');
+}
 
 run('CREATE TABLE t1 (a int, b text)');
 run("SELECT gp.distribute('t1', ARRAY['a'])");

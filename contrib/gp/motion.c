@@ -47,10 +47,12 @@
 
 #include "catalog/pg_type_d.h"
 #include "executor/executor.h"
+#include "executor/tstoreReceiver.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "libpq-fe.h"
 #include "libpq/libpq-be-fe-helpers.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
@@ -62,10 +64,12 @@
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parse_func.h"
+#include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 #include "utils/tuplestore.h"
 #include "utils/wait_event.h"
 
@@ -153,6 +157,224 @@ gp_motion_refresh(GpSegment *segment)
 	PQclear(res);
 }
 
+/*
+ * Read the fragment of every peer in a session of its own: the call of
+ * gp.fragment_exec carries the same serialized plan the workers of the
+ * interconnect answer, and the peer executes it in an ordinary session,
+ * which the snapshots of the statement were attached to.  A failure of one
+ * peer cancels what the others still run and fails the pull
+ */
+static void
+gp_motion_fetch_libpq(Tuplestorestate *store, TupleDesc tupdesc,
+					  const char *serialized, GpSnapshots *snapshots,
+					  GpSegment *wanted, int nsegments,
+					  const char *db, const char *user)
+{
+	const char *keywords[] = {"host", "port", "dbname", "user",
+	"application_name", "client_encoding", NULL};
+	FmgrInfo   *recvfns;
+	Oid		   *ioparam;
+	PGconn	  **conns;
+	bool	   *local;
+	char	   *setup = NULL;
+	char		port[12];
+	StringInfoData sql;
+	MemoryContext rowcxt;
+	TupleTableSlot *loadslot;
+	PGresult   *res;
+	int			natts = tupdesc->natts;
+
+	if (nsegments == 0)
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("the cluster has no segments"));
+
+	/*
+	 * The columns of the answer, as the peer's parser needs them for a
+	 * function that returns record
+	 */
+	initStringInfo(&sql);
+	appendStringInfoString(&sql,
+						   "SELECT * FROM gp.fragment_exec($1) AS f(");
+	for (int i = 0; i < natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+		appendStringInfo(&sql, "%s%s %s", i > 0 ? ", " : "",
+						 quote_identifier(NameStr(att->attname)),
+						 format_type_extended(att->atttypid, att->atttypmod,
+											  FORMAT_TYPE_TYPEMOD_GIVEN |
+											  FORMAT_TYPE_ALLOW_INVALID));
+	}
+	appendStringInfoString(&sql, ")");
+
+	recvfns = palloc0_array(FmgrInfo, natts);
+	ioparam = palloc_array(Oid, natts);
+	for (int i = 0; i < natts; i++)
+	{
+		Oid			recvfn;
+
+		if (TupleDescAttr(tupdesc, i)->attisdropped)
+			continue;
+		getTypeBinaryInputInfo(TupleDescAttr(tupdesc, i)->atttypid,
+							   &recvfn, &ioparam[i]);
+		fmgr_info(recvfn, &recvfns[i]);
+	}
+
+	conns = palloc0_array(PGconn *, nsegments);
+	local = palloc0_array(bool, nsegments);
+	/*
+	 * A session opens with who the rows are for: the filter of a
+	 * redistribution reads the setting, the way the workers of the
+	 * interconnect read it from their request.  The snapshots of the
+	 * statement ride in the same transaction
+	 */
+	if (snapshots != NULL)
+		setup = psprintf("BEGIN; SET gp.requester_segment = %d; %s",
+						 gp_segment_id,
+						 psprintf("SELECT gp.attach_statement_snapshots('%s')",
+								  gp_snapshots_serialize(snapshots)));
+	else
+		setup = psprintf("SET gp.requester_segment = %d", gp_segment_id);
+
+	PG_TRY();
+	{
+		for (int i = 0; i < nsegments; i++)
+		{
+			const char *values[6];
+
+			snprintf(port, sizeof(port), "%d", wanted[i].port);
+			values[0] = wanted[i].host;
+			values[1] = port;
+			values[2] = db;
+			values[3] = user;
+			values[4] = "gp motion";
+			values[5] = GetDatabaseEncodingName();
+			conns[i] = libpqsrv_connect_params(keywords, values, true,
+											   gp_motion_event());
+			if (PQstatus(conns[i]) != CONNECTION_OK)
+			{
+				char	   *err = pchomp(PQerrorMessage(conns[i]));
+
+				ereport(ERROR,
+						errcode(ERRCODE_CONNECTION_FAILURE),
+						errmsg("could not connect to segment %d at %s:%d",
+							   wanted[i].segment_id, wanted[i].host,
+							   wanted[i].port),
+						errdetail("%s", err));
+			}
+			{
+				local[i] = snapshots != NULL;
+				if (!PQsendQuery(conns[i], setup))
+					ereport(ERROR,
+							errcode(ERRCODE_CONNECTION_FAILURE),
+							errmsg("lost the connection to segment %d at %s:%d",
+								   wanted[i].segment_id, wanted[i].host,
+								   wanted[i].port),
+							errdetail_internal("%s",
+											   pchomp(PQerrorMessage(conns[i]))));
+				while ((res = libpqsrv_get_result(conns[i],
+												  gp_motion_event())) != NULL)
+				{
+					if (PQresultStatus(res) != PGRES_COMMAND_OK &&
+						PQresultStatus(res) != PGRES_TUPLES_OK)
+						ereport(ERROR,
+								errcode(ERRCODE_CONNECTION_FAILURE),
+								errmsg("could not attach the statement snapshots on segment %d",
+									   wanted[i].segment_id),
+								errdetail_internal("%s",
+												   pchomp(PQresultErrorMessage(res))));
+					PQclear(res);
+				}
+			}
+			if (!PQsendQueryParams(conns[i], sql.data, 1,
+								   NULL, &serialized, NULL, NULL, 1) ||
+				!PQsetSingleRowMode(conns[i]))
+				ereport(ERROR,
+						errcode(ERRCODE_CONNECTION_FAILURE),
+						errmsg("lost the connection to segment %d at %s:%d",
+							   wanted[i].segment_id, wanted[i].host,
+							   wanted[i].port),
+						errdetail_internal("%s",
+										   pchomp(PQerrorMessage(conns[i]))));
+		}
+
+		rowcxt = AllocSetContextCreate(CurrentMemoryContext, "motion row",
+									   ALLOCSET_DEFAULT_SIZES);
+		loadslot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsVirtual);
+		for (int i = 0; i < nsegments; i++)
+		{
+			while ((res = libpqsrv_get_result(conns[i], gp_motion_event())) != NULL)
+			{
+				MemoryContext oldcontext;
+
+				if (PQresultStatus(res) == PGRES_TUPLES_OK)
+				{
+					PQclear(res);
+					continue;
+				}
+				if (PQresultStatus(res) != PGRES_SINGLE_TUPLE)
+					ereport(ERROR,
+							errcode(ERRCODE_CONNECTION_FAILURE),
+							errmsg("segment %d returned an error",
+								   wanted[i].segment_id),
+							errdetail_internal("%s",
+											   pchomp(PQresultErrorMessage(res))));
+
+				ExecClearTuple(loadslot);
+				oldcontext = MemoryContextSwitchTo(rowcxt);
+				for (int a = 0; a < natts; a++)
+				{
+					StringInfoData buf;
+
+					loadslot->tts_isnull[a] = true;
+					loadslot->tts_values[a] = (Datum) 0;
+					if (PQgetisnull(res, 0, a))
+						continue;
+
+					/* libpq ends every value with a zero byte, as the receive functions expect */
+					buf.data = PQgetvalue(res, 0, a);
+					buf.len = PQgetlength(res, 0, a);
+					buf.maxlen = buf.len + 1;
+					buf.cursor = 0;
+					loadslot->tts_values[a] = ReceiveFunctionCall(&recvfns[a],
+																 &buf,
+																 ioparam[a],
+																 TupleDescAttr(tupdesc, a)->atttypmod);
+					loadslot->tts_isnull[a] = false;
+				}
+				ExecStoreVirtualTuple(loadslot);
+				tuplestore_puttupleslot(store, loadslot);
+				MemoryContextSwitchTo(oldcontext);
+				MemoryContextReset(rowcxt);
+				PQclear(res);
+			}
+		}
+		ExecDropSingleTupleTableSlot(loadslot);
+		MemoryContextDelete(rowcxt);
+	}
+	PG_FINALLY();
+	{
+		for (int i = 0; i < nsegments; i++)
+		{
+			PGconn	   *conn = conns[i];
+
+			if (conn == NULL)
+				continue;
+			if (local[i])
+			{
+				if (PQsendQuery(conn, "COMMIT"))
+					while ((res = libpqsrv_get_result(conn,
+													  gp_motion_event())) != NULL)
+						PQclear(res);
+			}
+			libpqsrv_disconnect(conn);
+			conns[i] = NULL;
+		}
+	}
+	PG_END_TRY();
+}
+
 /* Ask every segment, this one included, for the rows of the fragment */
 static void
 gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
@@ -194,6 +416,9 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 	{
 		bool		reported = true;
 
+		/* The pull of libpq needs no port of a broker, only the peers */
+		bool		need_ports = !gp_transport_libpq;
+
 		if (segments != NULL)
 			PQclear(segments);
 		segments = libpqsrv_exec_params(conn,
@@ -212,7 +437,7 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 					errdetail("%s", err));
 		}
 		for (int i = 0; i < PQntuples(segments); i++)
-			if (PQgetisnull(segments, i, 3))
+			if (need_ports && PQgetisnull(segments, i, 3))
 				reported = false;
 		if (reported || attempt >= 59)
 			break;
@@ -236,17 +461,22 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 			wanted[i].port = atoi(PQgetvalue(segments, i, 2));
 			wanted[i].interconnect_port = PQgetisnull(segments, i, 3) ? 0 :
 				atoi(PQgetvalue(segments, i, 3));
-			if (wanted[i].interconnect_port == 0)
+			if (!gp_transport_libpq && wanted[i].interconnect_port == 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("segment %d has not reported its interconnect port yet",
 								wanted[i].segment_id)));
 		}
 		gp_motion_refresh_conn = conn;
-		gp_interconnect_pulls(store, tupdesc, db,
-							  GetUserNameFromId(GetUserId(), false),
-							  serialized, gp_segment_id, snapshots,
-							  wanted, nsegments, gp_motion_refresh);
+		if (gp_transport_libpq)
+			gp_motion_fetch_libpq(store, tupdesc, serialized, snapshots,
+								  wanted, nsegments, db,
+								  GetUserNameFromId(GetUserId(), false));
+		else
+			gp_interconnect_pulls(store, tupdesc, db,
+								  GetUserNameFromId(GetUserId(), false),
+								  serialized, gp_segment_id, snapshots,
+								  wanted, nsegments, gp_motion_refresh);
 	}
 
 	gp_motion_refresh_conn = NULL;
@@ -498,6 +728,83 @@ gp_peer_query(PG_FUNCTION_ARGS)
 	MemoryContextSwitchTo(oldcontext);
 	sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	gp_motion_fetch(store, tupdesc, sql);
+
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = store;
+	rsinfo->setDesc = tupdesc;
+
+	return (Datum) 0;
+}
+
+/*
+ * Execute the serialized fragment of a query in this session and answer its
+ * rows.  The pull of a motion asks every peer for its fragment with this
+ * call, in a session of its own, where the workers of the interconnect
+ * stood: the guards are the ones the workers kept, and the executor checks
+ * the permissions of the caller as for any query
+ */
+PG_FUNCTION_INFO_V1(gp_fragment_exec);
+
+Datum
+gp_fragment_exec(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	PlannedStmt *stmt;
+	QueryDesc   *query;
+	DestReceiver *dest;
+	Tuplestorestate *store;
+	TupleDesc	tupdesc;
+	MemoryContext oldcontext;
+
+	/* The pulls of the peers write the calls; none runs by hand */
+	if (gp_role != GP_ROLE_SEGMENT)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("gp.fragment_exec runs on a segment only"));
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) ||
+		!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("set-valued function called in context that cannot accept a set"));
+	if (rsinfo->expectedDesc == NULL)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("gp.fragment_exec needs the columns of its answer"));
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("the fragment is required"));
+
+	stmt = (PlannedStmt *) stringToNode(text_to_cstring(PG_GETARG_TEXT_PP(0)));
+	if (!IsA(stmt, PlannedStmt) || stmt->commandType != CMD_SELECT)
+		ereport(ERROR,
+				errcode(ERRCODE_DATA_CORRUPTED),
+				errmsg("an invalid plan fragment"));
+	foreach_node(RangeTblEntry, rte, stmt->rtable)
+	{
+		if (rte->rtekind == RTE_RELATION)
+			LockRelationOid(rte->relid,
+							rte->rellockmode != NoLock ? rte->rellockmode : AccessShareLock);
+	}
+
+	/* The result must survive the per-tuple context of the function call */
+	oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+	tupdesc = CreateTupleDescCopy(rsinfo->expectedDesc);
+	store = tuplestore_begin_heap(true, false, work_mem);
+	MemoryContextSwitchTo(oldcontext);
+
+	dest = CreateTuplestoreDestReceiver();
+	SetTuplestoreDestReceiverParams(dest, store,
+									rsinfo->econtext->ecxt_per_query_memory,
+									true, NULL, NULL);
+	query = CreateQueryDesc(stmt, "gp.fragment_exec", GetActiveSnapshot(),
+							NULL, dest, NULL, NULL, 0);
+	ExecutorStart(query, 0);
+	ExecutorRun(query, ForwardScanDirection, 0L);
+	ExecutorFinish(query);
+	ExecutorEnd(query);
+	FreeQueryDesc(query);
 
 	rsinfo->returnMode = SFRM_Materialize;
 	rsinfo->setResult = store;
