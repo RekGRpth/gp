@@ -284,17 +284,6 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
-	DefineCustomBoolVariable("gp.transport_libpq",
-							 "Answers the fragments over libpq sessions, without the interconnect workers.",
-							 "The gather, the merge and the slices run in ordinary sessions of the segments over libpq, and the pull of a motion rides in the query itself; the interconnect workers carry the fragments when it is off.  On by default.",
-							 &gp_transport_libpq,
-							 true,
-							 PGC_USERSET,
-							 0,
-							 NULL,
-							 NULL,
-							 NULL);
-
 	MarkGUCPrefixReserved("gp");
 
 	/* A misconfigured node does not start */
@@ -333,8 +322,6 @@ _PG_init(void)
 	{
 		BackgroundWorker worker = {0};
 
-		gp_interconnect_init();
-
 		worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 			BGWORKER_BACKEND_DATABASE_CONNECTION;
 		worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
@@ -345,36 +332,6 @@ _PG_init(void)
 		strlcpy(worker.bgw_type, "gp register segment", BGW_MAXLEN);
 		RegisterBackgroundWorker(&worker);
 	}
-	/*
-	 * A segment's broker assigns a dynamic worker per interconnect
-	 * request, and parallel motions ask every segment at once, so a
-	 * segment's postmaster must be able to start them all.  Other
-	 * servers run no interconnect workers and keep their setting.  The
-	 * check sits at the end of the load: the role arrives from the
-	 * configuration file, which the placeholders hand to the real
-	 * variable only once it is defined above
-	 */
-	if (gp_role == GP_ROLE_SEGMENT &&
-		max_worker_processes < GP_IC_SLOTS + 16)
-		SetConfigOption("max_worker_processes",
-						psprintf("%d", GP_IC_SLOTS + 16),
-						PGC_POSTMASTER, PGC_S_OVERRIDE);
-
-	/*
-	 * A segment's broker assigns a dynamic worker per interconnect
-	 * request, and a deep chain of motions holds a worker at every
-	 * level while it waits for the next, so a segment's postmaster
-	 * must be able to start them all.  The check sits at the end of
-	 * the load: the role arrives from the configuration file, which
-	 * the placeholders hand to the real variable only once it is
-	 * defined above
-	 */
-	if (gp_role == GP_ROLE_SEGMENT &&
-		max_worker_processes < GP_IC_SLOTS * 3 + 32)
-		SetConfigOption("max_worker_processes",
-						psprintf("%d", GP_IC_SLOTS * 3 + 32),
-						PGC_POSTMASTER, PGC_S_OVERRIDE);
-
 }
 
 /* The connection string of the coordinator, for the motion of a segment */
@@ -442,59 +399,6 @@ gp_segment_extension(PGconn *conn)
 	CommitTransactionCommand();
 }
 
-/* Save the token returned by the coordinator for the interconnect worker */
-static void
-gp_segment_token_save(const char *token)
-{
-	char	   *path = psprintf("%s/gp_interconnect.token", DataDir);
-	char	   *tmp = psprintf("%s/gp_interconnect.token.tmp", DataDir);
-	int			fd = OpenTransientFilePerm(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-	int			written = 0;
-
-	if (fd < 0)
-		ereport(ERROR,
-				errmsg("could not create the interconnect token file: %m"));
-	while (written < 64)
-	{
-		ssize_t		n = write(fd, token + written, 64 - written);
-
-		if (n <= 0)
-			ereport(ERROR,
-					errmsg("could not write the interconnect token file: %m"));
-		written += n;
-	}
-	if (fsync(fd) != 0)
-		ereport(ERROR,
-				errmsg("could not sync the interconnect token file: %m"));
-	if (CloseTransientFile(fd) != 0)
-		ereport(ERROR,
-				errmsg("could not close the interconnect token file: %m"));
-	if (rename(tmp, path) != 0)
-		ereport(ERROR,
-				errmsg("could not install the interconnect token file: %m"));
-}
-
-/* Install the actual cluster token on the coordinator as well */
-PG_FUNCTION_INFO_V1(gp_interconnect_token_save);
-
-Datum
-gp_interconnect_token_save(PG_FUNCTION_ARGS)
-{
-	char	   *token = text_to_cstring(PG_GETARG_TEXT_PP(0));
-
-	if (gp_role != GP_ROLE_COORDINATOR)
-		ereport(ERROR,
-				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				errmsg("the interconnect token is saved on the coordinator only"));
-	if (strlen(token) != 64 ||
-		strspn(token, "0123456789abcdefABCDEF") != 64)
-		ereport(ERROR,
-				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				errmsg("an interconnect token must be 64 hexadecimal characters"));
-	gp_segment_token_save(token);
-	PG_RETURN_VOID();
-}
-
 /* The address of this segment for other nodes */
 const char *
 gp_host_address(void)
@@ -524,20 +428,6 @@ gp_register_main(Datum main_arg)
 
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
-
-	/*
-	 * The token of the previous run would let the broker report its port
-	 * before this run has registered, and the registration would then wipe
-	 * the fresh port of the broker, whose pull clients would knock at a door
-	 * the registry does not name.  Remove the token, so the broker waits for
-	 * the one this worker installs once the registration is through.
-	 */
-	{
-		char	   *path = psprintf("%s/gp_interconnect.token", DataDir);
-
-		unlink(path);
-		pfree(path);
-	}
 
 	wait_event = WaitEventExtensionNew("GpRegisterSegment");
 
@@ -579,25 +469,6 @@ gp_register_main(Datum main_arg)
 		libpqsrv_disconnect(conn);
 		proc_exit(1);
 	}
-
-	PG_TRY();
-	{
-		if (PQntuples(res) != 1)
-			ereport(ERROR,
-					errmsg("the coordinator returned no interconnect token"));
-		gp_segment_token_save(PQgetvalue(res, 0, 0));
-	}
-	PG_CATCH();
-	{
-		EmitErrorReport();
-		AbortCurrentTransaction();
-		FlushErrorState();
-		PQclear(res);
-		libpqsrv_disconnect(conn);
-		proc_exit(1);
-	}
-	PG_END_TRY();
-
 	PQclear(res);
 	libpqsrv_disconnect(conn);
 	ereport(LOG,

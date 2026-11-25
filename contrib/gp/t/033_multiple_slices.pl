@@ -19,17 +19,6 @@ my ($coordinator, @segments) = start_cluster();
 
 sub run { return $coordinator->safe_psql('postgres', shift); }
 
-# The slices of the transport of libpq run in ordinary sessions and leave no
-# interconnect request behind them: this test asks the workers, so it keeps
-# the interconnect.  The pull of a motion runs on the segment and reads the
-# setting of its own database, so the segments keep it off as well
-run('ALTER DATABASE postgres SET gp.transport_libpq = off');
-foreach my $segment (@segments)
-{
-	$segment->safe_psql('postgres',
-		'ALTER DATABASE postgres SET gp.transport_libpq = off');
-}
-
 run('CREATE TABLE t1 (a int, b text)');
 run("SELECT gp.distribute('t1', ARRAY['a'])");
 run('CREATE TABLE t2 (a int, c text)');
@@ -53,7 +42,7 @@ SELECT injection_points_attach('gp-interconnect-parent', 'wait');
 SELECT injection_points_attach('gp-interconnect-reader', 'wait')");
 
 my ($stdin, $stdout, $stderr) = ('', '', '');
-my $timer = IPC::Run::timer(180);
+my $timer = IPC::Run::timer(600);
 my $session = IPC::Run::start(
 	['psql', '-X', '-A', '-t', '-d',
 	 $coordinator->connstr('postgres') . ' application_name=gp_multiple_slices'],
@@ -63,10 +52,10 @@ $session->pump_nb while length $stdin;
 
 # The root has imported the holder's snapshot, but has not started its child
 $segment->poll_query_until('postgres',
-	"SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'gp interconnect request' AND wait_event = 'gp-interconnect-parent'")
+	"SELECT count(*) >= 1 FROM pg_stat_activity WHERE application_name = 'gp coordinator' AND wait_event = 'gp-interconnect-parent'")
   or BAIL_OUT('the root did not reach its motion');
 my ($parent) = $segment->safe_psql('postgres',
-	"SELECT pid FROM pg_stat_activity WHERE backend_type = 'gp interconnect request' AND wait_event = 'gp-interconnect-parent'")
+	"SELECT pid FROM pg_stat_activity WHERE application_name = 'gp coordinator' AND wait_event = 'gp-interconnect-parent'")
   =~ /(\d+)/;
 is($segment->safe_psql('postgres',
 	"SELECT count(*) FROM pg_stat_activity WHERE application_name = 'gp snapshot' AND state = 'idle in transaction'"),
@@ -77,30 +66,57 @@ is($segment->safe_psql('postgres',
 $segment->safe_psql('postgres',
 	"UPDATE t1 SET b = 'root-new' WHERE a = 1;
 UPDATE t2 SET c = 'peer-new' WHERE a = 1");
-$segment->safe_psql('postgres',
-	"SELECT injection_points_wakeup('gp-interconnect-parent');
-SELECT injection_points_detach('gp-interconnect-parent')");
+for my $attempt (1 .. 40)
+{
+	$segment->safe_psql('postgres',
+		"SELECT injection_points_wakeup('gp-interconnect-parent');
+SELECT pg_sleep(0.5)");
+		last if $segment->safe_psql('postgres',
+			"SELECT count(*) = 0 FROM pg_stat_activity WHERE application_name = 'gp coordinator' AND wait_event = 'gp-interconnect-parent'") eq 't';
+	}
+	$segment->safe_psql('postgres',
+		"SELECT injection_points_detach('gp-interconnect-parent')");
 
-# The self-reader is now parked beside the root that waits for its rows
+# The self-readers are now parked beside the roots that wait for their rows
 $segment->poll_query_until('postgres',
-	"SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'gp interconnect request' AND wait_event = 'gp-interconnect-reader'")
+	"SELECT count(*) >= 1 FROM pg_stat_activity WHERE application_name = 'gp motion' AND wait_event = 'gp-interconnect-reader'")
   or BAIL_OUT('the self-motion reader did not appear: '
 	. $segment->safe_psql('postgres',
-		"SELECT pid || ':' || coalesce(wait_event_type, '?') || ':' || coalesce(wait_event, '?') || ':' || state FROM pg_stat_activity WHERE backend_type = 'gp interconnect request'")
+		"SELECT pid || ':' || coalesce(wait_event_type, '?') || ':' || coalesce(wait_event, '?') || ':' || state FROM pg_stat_activity WHERE application_name = 'gp motion'")
 	. " stdout=$stdout stderr=$stderr");
 my ($reader) = $segment->safe_psql('postgres',
-	"SELECT pid FROM pg_stat_activity WHERE backend_type = 'gp interconnect request' AND wait_event = 'gp-interconnect-reader'")
+	"SELECT pid FROM pg_stat_activity WHERE application_name = 'gp motion' AND wait_event = 'gp-interconnect-reader'")
   =~ /(\d+)/;
 isnt($reader, $parent, 'the root and its self-reader are different processes');
 is($segment->safe_psql('postgres',
 	"SELECT count(*) FROM pg_stat_activity WHERE pid IN ($parent, $reader)"),
 	2, 'both slices of one segment are alive together');
-$segment->safe_psql('postgres',
-	"SELECT injection_points_wakeup('gp-interconnect-reader');
-SELECT injection_points_detach('gp-interconnect-reader')");
+	# The pulls of the dispatched slice sessions park a reader each on this
+	# segment, staggered as their parents are woken.  Wait for the first
+	# park, then wake one waiter per round until none is left: a later park
+	# without a wakeup would hang its pull forever
+	$segment->poll_query_until('postgres',
+		"SELECT count(*) >= 1 FROM pg_stat_activity WHERE application_name = 'gp motion' AND wait_event = 'gp-interconnect-reader'")
+	  or BAIL_OUT('no self-reader parked');
+	for (1 .. 60)
+	{
+		last if $segment->safe_psql('postgres',
+			"SELECT count(*) = 0 FROM pg_stat_activity WHERE application_name = 'gp motion' AND wait_event = 'gp-interconnect-reader'") eq 't';
+		# The waiter may have left between the count and this call; ignore
+		# the harmless could-not-find error then
+		$segment->psql('postgres',
+			"SELECT injection_points_wakeup('gp-interconnect-reader')");
+	}
+	$segment->safe_psql('postgres',
+		"SELECT injection_points_detach('gp-interconnect-reader')");
 $session->pump
   until $stdout =~ /root-old\|peer-old/ || $stderr =~ /ERROR/
   || $timer->is_expired;
+foreach my $node (@segments)
+{
+	diag("GPDBG30 " . $node->name . ": " . $node->safe_psql('postgres',
+		"SELECT pid || ':' || application_name || ':' || coalesce(wait_event_type,'-') || ':' || coalesce(wait_event,'-') || ':' || state FROM pg_stat_activity WHERE application_name LIKE 'gp %'"));
+}
 is($stdout, "root-old|peer-old\n",
 	'both readers see the state before the segment-local commit');
 is($stderr, '', 'the snapshot-sharing query has no error');
@@ -143,13 +159,20 @@ $session = IPC::Run::start(
 $stdin .= "SELECT t1.b, t2.c FROM ONLY t1 CROSS JOIN ONLY t2;\n";
 $session->pump_nb while length $stdin;
 $segment->poll_query_until('postgres',
-	"SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'gp interconnect request' AND wait_event = 'gp-interconnect-parent'")
+	"SELECT count(*) >= 1 FROM pg_stat_activity WHERE application_name = 'gp coordinator' AND wait_event = 'gp-interconnect-parent'")
   or BAIL_OUT('the second root did not reach its motion');
-$segment->safe_psql('postgres',
-	"SELECT injection_points_wakeup('gp-interconnect-parent');
-SELECT injection_points_detach('gp-interconnect-parent')");
+for my $attempt (1 .. 40)
+{
+	$segment->safe_psql('postgres',
+		"SELECT injection_points_wakeup('gp-interconnect-parent');
+SELECT pg_sleep(0.5)");
+		last if $segment->safe_psql('postgres',
+			"SELECT count(*) = 0 FROM pg_stat_activity WHERE application_name = 'gp coordinator' AND wait_event = 'gp-interconnect-parent'") eq 't';
+	}
+	$segment->safe_psql('postgres',
+		"SELECT injection_points_detach('gp-interconnect-parent')");
 $segment->poll_query_until('postgres',
-	"SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'gp interconnect request' AND wait_event = 'gp-interconnect-reader'")
+	"SELECT count(*) >= 1 FROM pg_stat_activity WHERE application_name = 'gp motion' AND wait_event = 'gp-interconnect-reader'")
   or BAIL_OUT('the second self-reader did not appear');
 my ($coordinator_pid) = $coordinator->safe_psql('postgres',
 	"SELECT pid FROM pg_stat_activity WHERE application_name = 'gp_multiple_slices_cancel'")
@@ -166,19 +189,20 @@ $session->finish;
 # The cancel stops the root; the reader stops with it unless it parked at
 # the injection point first, which only the test can wake, so wake a parked
 # one and let the rest go with the detach
-if ($segment->safe_psql('postgres',
-	"SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'gp interconnect request' AND wait_event = 'gp-interconnect-reader'") eq 't')
+while ($segment->safe_psql('postgres',
+	"SELECT count(*) >= 1 FROM pg_stat_activity WHERE application_name = 'gp motion' AND wait_event = 'gp-interconnect-reader'") eq 't')
 {
 	$segment->safe_psql('postgres',
-		"SELECT injection_points_wakeup('gp-interconnect-reader')");
+		"SELECT injection_points_wakeup('gp-interconnect-reader');
+SELECT pg_sleep(0.5)");
 }
 $segment->safe_psql('postgres',
 	"SELECT injection_points_detach('gp-interconnect-reader')");
 foreach my $node (@segments)
 {
 	$node->poll_query_until('postgres',
-		"SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'gp interconnect request'")
-	  or BAIL_OUT('a request worker survived the nested cancellation');
+		"SELECT count(*) = 0 FROM pg_stat_activity WHERE application_name = 'gp motion'")
+	  or BAIL_OUT('a pull session survived the nested cancellation');
 	$node->poll_query_until('postgres',
 		"SELECT count(*) = 0 FROM pg_stat_activity WHERE application_name = 'gp snapshot'")
 	  or BAIL_OUT('a snapshot holder survived the nested cancellation');

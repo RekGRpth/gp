@@ -729,9 +729,9 @@ gp_slice_load_libpq(GpSliceState *state)
 	if (state->only != 0)
 		only = state->only;
 
-	/* A fragment with motions reads its peers through interconnect workers
-	 * that import the statement snapshots; attach the map to the fragment
-	 * itself, so its own scans see the same distributed state */
+	/* A fragment with motions reads its peers through pulls that import
+	 * the statement snapshots; attach the map to the fragment itself, so
+	 * its own scans see the same distributed state */
 	query = gp_query_start(state->sql, only,
 						   state->motion ?
 						   gp_dtx_statement_snapshots(ss->ps.state) : NULL);
@@ -741,6 +741,7 @@ gp_slice_load_libpq(GpSliceState *state)
 	{
 		MemoryContext oldcontext;
 
+		CHECK_FOR_INTERRUPTS();
 		if (PQnfields(res) != natts)
 			ereport(ERROR,
 					errcode(ERRCODE_DATA_CORRUPTED),
@@ -785,67 +786,6 @@ gp_slice_load_libpq(GpSliceState *state)
 	PG_END_TRY();
 }
 
-/* Run a clean immutable fragment in autonomous interconnect workers */
-static bool
-gp_slice_load_interconnect(GpSliceState *state)
-{
-	ScanState  *ss = &state->css.ss;
-	TupleDesc	tupdesc = ss->ss_ScanTupleSlot->tts_tupleDescriptor;
-	GpSegment  *segments;
-	char	   *plan;
-	char	   *db;
-	GpSnapshots *snapshots;
-	const char *user;
-	int			nsegments;
-	int			only = 0;
-
-	if (!state->autonomous || GetUserId() != GetSessionUserId())
-		return false;
-
-	plan = gp_interconnect_plan(state->sql);
-	db = get_database_name(MyDatabaseId);
-	user = GetUserNameFromId(GetUserId(), false);
-	nsegments = gp_segments_get(&segments);
-	if (state->replicated)
-	{
-		if (nsegments == 0)
-			ereport(ERROR,
-					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					errmsg("the cluster has no segments"));
-		only = segments[MyProcPid % nsegments].segment_id;
-	}
-	if (state->only != 0)
-		only = state->only;
-
-	/* A segment whose broker has not reported its port is not ready yet */
-	for (int i = 0; i < nsegments; i++)
-	{
-		if (only != 0 && segments[i].segment_id != only)
-			continue;
-		if (segments[i].interconnect_port == 0)
-			return false;
-	}
-
-	snapshots = gp_dtx_statement_snapshots(ss->ps.state);
-	if (snapshots == NULL)
-		return false;
-	state->store = tuplestore_begin_heap(true, false, work_mem);
-	{
-		GpSegment  *wanted = palloc_array(GpSegment, nsegments);
-		int			nwanted = 0;
-
-		for (int i = 0; i < nsegments; i++)
-		{
-			if (only != 0 && segments[i].segment_id != only)
-				continue;
-			wanted[nwanted++] = segments[i];
-		}
-		gp_interconnect_pulls(state->store, tupdesc, db, user, plan, 0,
-							  snapshots, wanted, nwanted,
-							  gp_segments_refresh);
-	}
-	return true;
-}
 
 static void
 gp_slice_load(GpSliceState *state)
@@ -855,14 +795,8 @@ gp_slice_load(GpSliceState *state)
 	/*
 	 * A slice reads the fragments of other segments through the peers of its
 	 * own query: the deparsed SQL of a motion pulls them with gp.peer_query,
-	 * so the slice runs in an ordinary libpq session of the segment when the
-	 * transport says so, and only the interconnect workers carry it
-	 * otherwise
+	 * and the slice runs in an ordinary libpq session of the segment
 	 */
-	if (!gp_transport_libpq &&
-		XactIsoLevel == XACT_READ_COMMITTED && !gp_dispatch_in_xact() &&
-		gp_slice_load_interconnect(state))
-		return;
 	gp_slice_load_libpq(state);
 }
 
@@ -2895,7 +2829,7 @@ gp_slice_redistribute_rte_keys(Query *remote, GpJoinTable *stay, GpJoinTable *mo
 	peer_query_oid = DatumGetObjectId(DirectFunctionCall1(regprocedurein,
 														  CStringGetDatum("gp.peer_query(text)")));
 	arg = makeConst(TEXTOID, -1, DEFAULT_COLLATION_OID, -1,
-					PointerGetDatum(cstring_to_text(gp_interconnect_plan(sql.data))), false, false);
+					PointerGetDatum(cstring_to_text(gp_fragment_plan(sql.data))), false, false);
 	func = makeNode(FuncExpr);
 	func->funcid = peer_query_oid;
 	func->funcresulttype = RECORDOID;
@@ -4254,7 +4188,7 @@ gp_slice_join_all_same_type(Node *node, JoinType *type)
 /*
  * Whether the motions of a derived join are worth their launches.  A join
  * whose tables are all colocated moves nothing, and joins of six tables or
- * fewer keep the size of their answer from the interconnect launches.  A
+ * fewer keep the size of their answer from the pull launches.  A
  * bigger join that moves tables launches a worker of every moved table on
  * every segment, and one launch costs the time of a local join of about a
  * hundred thousand rows (measured: a tiny eight-table join took 98 seconds
@@ -4777,7 +4711,7 @@ gp_slice_join_query(Query *parse)
  * it makes reads the local rows of that segment.  An init plan that scans
  * a distributed table would answer from one segment only: uncorrelated
  * sublinks become init plans, and nothing wires their scans through the
- * interconnect (TPC-DS q09 keeps its bucket sublinks that way).
+ * the coordinator (TPC-DS q09 keeps its bucket sublinks that way).
  */
 static void
 gp_slice_join_initplans_of(Plan *plan, List **subs)
@@ -6320,7 +6254,7 @@ gp_two_phase_sum_combine(StringInfo cols, StringInfo aggs,
  * combines the groups the hash of the grouping columns assigns to it, so
  * every group is combined exactly once, and the coordinator finishes the
  * aggregate over the per-segment answers.  No row of the table crosses the
- * interconnect: the motion carries the partials only.
+ * the peers: the motion carries the partials only.
  *
  * The fragment is built as text.  The partial aggregate moves as a
  * serialized plan, like the motion of a join, and the combine query reads it
@@ -6534,7 +6468,7 @@ gp_slice_agg_two_phase(Query *parse, Agg *agg, Plan *below)
 					 "OPERATOR(pg_catalog.=) (SELECT current_setting('gp.requester_segment')::int4)",
 					 pg_get_querydef(remote, false), map.data,
 					 policy.nbuckets, keys.data);
-	planned = gp_interconnect_plan(marker.data);
+	planned = gp_fragment_plan(marker.data);
 
 	/* A table pinned to one segment answers there alone */
 	if (policy.nbuckets > 0)
@@ -7731,7 +7665,7 @@ gp_slice_join_redistributed_agg(Query *original, PlannedStmt *stmt, Plan *plan,
 	}
 	appendStringInfoString(&sql,
 		") + 1] OPERATOR(pg_catalog.=) current_setting('gp.requester_segment')::int4");
-	serialized = gp_interconnect_plan(sql.data);
+	serialized = gp_fragment_plan(sql.data);
 
 	/* The original aggregate now reads the moved columns from one function */
 	remote = copyObject(original);

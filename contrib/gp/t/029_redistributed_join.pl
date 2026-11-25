@@ -15,9 +15,6 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 use GpTest qw(start_cluster);
-use IO::Socket::IP;
-use IO::Socket::UNIX;
-use Socket qw(SOCK_STREAM);
 
 my ($coordinator, @segments) = start_cluster();
 
@@ -257,7 +254,6 @@ foreach my $query (
 # The transport of libpq answers the slices in ordinary sessions of the
 # segments: the pull of a motion rides in the query itself as gp.peer_query,
 # so the answers must not change with the transport
-run('ALTER DATABASE postgres SET gp.transport_libpq = on');
 foreach my $query (@queries)
 {
 	my $local = $query;
@@ -282,7 +278,6 @@ foreach my $query (@nway_queries)
 # refuses a command on a connection that has them.  The connection must
 # serve the next statement of the session all the same
 my $drain_session = $coordinator->background_psql('postgres', on_error_stop => 0);
-$drain_session->query_safe('SET gp.transport_libpq = on');
 $drain_session->query('SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a WHERE 1/(100 - t1.a) > 0');
 like($drain_session->{stderr}, qr/division by zero/,
 	'the error of the segment inside a slice reaches the session');
@@ -292,32 +287,6 @@ is($drain_session->query_safe('SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.a'),
 	'the next statement of the session answers after the error of a segment');
 $drain_session->quit;
 
-run('ALTER DATABASE postgres RESET gp.transport_libpq');
-
-# A request without the shared token is not executed
-my $socket;
-if ($segments[0]->host =~ m{^/|^[A-Za-z]:[\\/]})
-{
-	$socket = IO::Socket::UNIX->new(
-		Type => SOCK_STREAM,
-		Peer => $segments[0]->host . '/gp_interconnect_' . ($segments[0]->port + 10000) . '.sock');
-}
-else
-{
-	$socket = IO::Socket::IP->new(
-		PeerHost => $segments[0]->host,
-		PeerPort => $segments[0]->port + 10000,
-		Proto => 'tcp',
-		Timeout => 5);
-}
-ok($socket, 'the interconnect accepts a TCP connection');
-if ($socket)
-{
-	print {$socket} 'GPIC0004', pack('N2', 0, 0), pack('N', 1), '0';
-	my $answer = '';
-	$socket->read($answer, 5);
-	is($answer, 'X' . pack('N', 26), 'an invalid token is refused');
-}
 
 $_->stop foreach (@segments, $coordinator);
 

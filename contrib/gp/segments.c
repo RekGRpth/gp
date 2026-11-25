@@ -146,7 +146,7 @@ gp_segments_load(void)
 	if (strcmp(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1),
 			   "t") == 0)
 	{
-		if (SPI_execute("SELECT segment_id, host, port, interconnect_port "
+		if (SPI_execute("SELECT segment_id, host, port "
 						"FROM gp.segments ORDER BY segment_id", true, 0) != SPI_OK_SELECT)
 			elog(ERROR, "could not read gp.segments");
 		if (SPI_processed > gp_max_segments)
@@ -160,15 +160,11 @@ gp_segments_load(void)
 			HeapTuple	tuple = SPI_tuptable->vals[nsegments];
 			TupleDesc	tupdesc = SPI_tuptable->tupdesc;
 			GpSegment  *segment = &segments[nsegments];
-			char	   *interconnect_port;
 
 			segment->segment_id = pg_strtoint32(SPI_getvalue(tuple, tupdesc, 1));
 			strlcpy(segment->host, SPI_getvalue(tuple, tupdesc, 2),
 					sizeof(segment->host));
 			segment->port = pg_strtoint32(SPI_getvalue(tuple, tupdesc, 3));
-			interconnect_port = SPI_getvalue(tuple, tupdesc, 4);
-			segment->interconnect_port = interconnect_port != NULL ?
-				pg_strtoint32(interconnect_port) : 0;
 		}
 	}
 
@@ -407,16 +403,12 @@ gp_cluster_segments(PG_FUNCTION_ARGS)
 
 	for (int i = 0; i < nsegments; i++)
 	{
-		Datum		values[4];
-		bool		nulls[4] = {0};
+		Datum		values[3];
+		bool		nulls[3] = {0};
 
 		values[0] = Int32GetDatum(segments[i].segment_id);
 		values[1] = CStringGetTextDatum(segments[i].host);
 		values[2] = Int32GetDatum(segments[i].port);
-		if (segments[i].interconnect_port == 0)
-			nulls[3] = true;
-		else
-			values[3] = Int32GetDatum(segments[i].interconnect_port);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 

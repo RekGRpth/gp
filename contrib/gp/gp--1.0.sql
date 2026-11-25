@@ -13,21 +13,11 @@ CREATE TABLE gp.segments (
 	segment_id int PRIMARY KEY CHECK (segment_id > 0),
 	host text NOT NULL CHECK (octet_length(host) < 256),
 	port int NOT NULL CHECK (port BETWEEN 1 AND 65535),
-	interconnect_port int CHECK (interconnect_port IS NULL OR
-		interconnect_port BETWEEN 1 AND 65535),
 	registered timestamptz NOT NULL DEFAULT now(),	-- last registration
 	UNIQUE (host, port)
 );
 
 SELECT pg_catalog.pg_extension_config_dump('gp.segments', '');
-
--- A shared secret of interconnect connections, returned to a segment when it
--- registers.  It is not readable by ordinary users.
-CREATE TABLE gp.interconnect_secret (
-	singleton bool PRIMARY KEY DEFAULT true CHECK (singleton),
-	token bytea NOT NULL
-);
-REVOKE ALL ON gp.interconnect_secret FROM PUBLIC;
 
 -- The coordinator keeps a copy of gp.segments in shared memory, for any
 -- database.  A transaction that changes the table updates the copy when it
@@ -43,37 +33,21 @@ FOR EACH STATEMENT EXECUTE FUNCTION gp.segments_changed();
 
 -- Segments of the cluster as the coordinator knows them, from any database
 CREATE FUNCTION gp.cluster_segments(OUT segment_id int, OUT host text,
-									OUT port int,
-									OUT interconnect_port int)
+									OUT port int)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'gp_cluster_segments'
 LANGUAGE C STRICT;
-
--- Generate a new cluster token; only the first one is kept
-CREATE FUNCTION gp.interconnect_secret()
-RETURNS text
-AS 'MODULE_PATHNAME', 'gp_interconnect_secret'
-LANGUAGE C VOLATILE;
-REVOKE ALL ON FUNCTION gp.interconnect_secret() FROM PUBLIC;
-
--- Keep the token file for interconnect clients on the coordinator too
-CREATE FUNCTION gp.interconnect_token_save(token text)
-RETURNS void
-AS 'MODULE_PATHNAME', 'gp_interconnect_token_save'
-LANGUAGE C STRICT;
-REVOKE ALL ON FUNCTION gp.interconnect_token_save(text) FROM PUBLIC;
 
 -- Register a segment, or confirm the registration of a known one.  A
 -- segment keeps its number and address: a number registered at another
 -- address, or an address registered under another number, is an error.
 CREATE FUNCTION gp.register_segment(segment_id int, host text, port int)
-RETURNS text
+RETURNS void
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
 	known gp.segments;
-	secret text;
 BEGIN
 	IF current_setting('gp.role', true) IS DISTINCT FROM 'coordinator' THEN
 		RAISE EXCEPTION 'segments register on the coordinator only';
@@ -85,11 +59,6 @@ BEGIN
 
 	-- Registrations come one at a time, so the checks below hold
 	LOCK TABLE gp.segments IN SHARE ROW EXCLUSIVE MODE;
-	INSERT INTO gp.interconnect_secret
-	SELECT true, decode(gp.interconnect_secret(), 'hex')
-	ON CONFLICT (singleton) DO NOTHING;
-	SELECT encode(token, 'hex') INTO secret FROM gp.interconnect_secret;
-	PERFORM gp.interconnect_token_save(secret);
 
 	SELECT * INTO known FROM gp.segments s
 	WHERE s.segment_id = register_segment.segment_id;
@@ -99,14 +68,9 @@ BEGIN
 			RAISE EXCEPTION 'segment % is already registered at %:%',
 				known.segment_id, known.host, known.port;
 		END IF;
-		-- The broker of the previous run is gone with the segment: its port
-		-- tells nothing about the broker of this run, which reports its own
-		-- when it listens.  Forget the old one, or a query that comes before
-		-- the report would knock at a door no one is behind
-		UPDATE gp.segments s SET registered = now(),
-			interconnect_port = NULL
+		UPDATE gp.segments s SET registered = now()
 		WHERE s.segment_id = register_segment.segment_id;
-		RETURN secret;
+		RETURN;
 	END IF;
 
 	SELECT * INTO known FROM gp.segments s
@@ -126,40 +90,10 @@ BEGIN
 	INSERT INTO gp.segments (segment_id, host, port)
 	VALUES (register_segment.segment_id, register_segment.host,
 			register_segment.port);
-	RETURN secret;
 END
 $$;
 
 REVOKE ALL ON FUNCTION gp.register_segment(int, text, int) FROM PUBLIC;
-
--- Report the port the interconnect broker of a segment listens on.  The
--- broker takes the port of the segment plus 10000 when it is free, and any
--- free port when it is not; this is how clients learn the address they
--- connect to, instead of a rule of the port.
-CREATE FUNCTION gp.register_interconnect(segment_id int, port int)
-RETURNS void
-LANGUAGE plpgsql
-SET search_path = pg_catalog, pg_temp
-AS $$
-BEGIN
-	IF current_setting('gp.role', true) IS DISTINCT FROM 'coordinator' THEN
-		RAISE EXCEPTION 'interconnect ports register on the coordinator only';
-	END IF;
-	IF current_database() <> current_setting('gp.database') THEN
-		RAISE EXCEPTION 'interconnect ports register in database "%" only',
-			current_setting('gp.database');
-	END IF;
-
-	UPDATE gp.segments s SET interconnect_port = register_interconnect.port
-	WHERE s.segment_id = register_interconnect.segment_id;
-	IF NOT FOUND THEN
-		RAISE EXCEPTION 'segment % is not registered',
-			register_interconnect.segment_id;
-	END IF;
-END
-$$;
-
-REVOKE ALL ON FUNCTION gp.register_interconnect(int, int) FROM PUBLIC;
 
 -- Run a command on all segments at once and return the command status of
 -- each; rows of a query are discarded.  Each segment runs the command in a

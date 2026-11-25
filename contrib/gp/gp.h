@@ -62,14 +62,8 @@ typedef struct GpSegment
 {
 	int			segment_id;
 	int			port;
-	int			interconnect_port;		/* its broker, 0 until reported */
 	char		host[GP_HOST_LEN];
 } GpSegment;
-
-/* interconnect.c: concurrent request workers a broker assigns */
-#define GP_IC_SLOTS 64
-
-/* interconnect.c: concurrent request workers a broker assigns */
 
 /* GUC variables */
 extern const char *gp_coordinator_conninfo(void);
@@ -155,16 +149,9 @@ extern void gp_analyze(VacuumStmt *stmt);
 extern void gp_motion_init(void);
 extern bool gp_is_motion(Plan *plan);
 
-/* interconnect.c */
-extern void gp_interconnect_init(void);
-extern char *gp_interconnect_plan(const char *sql);
-extern GpSnapshots *gp_interconnect_snapshots(void);
-extern void gp_interconnect_pulls(Tuplestorestate *store, TupleDesc tupdesc,
-								  const char *db, const char *user,
-								  const char *sql, int requester,
-								  GpSnapshots *snapshots,
-								  GpSegment *segments, int nsegments,
-								  void (*refresh) (GpSegment *segment));
+/* fragment.c */
+extern char *gp_fragment_plan(const char *sql);
+extern GpSnapshots *gp_fragment_snapshots(void);
 
 /* recovery.c */
 extern void gp_recovery_init(void);
@@ -208,7 +195,6 @@ extern void gp_dispatch_nonxact(const char *sql, const char *oids,
 extern char *gp_dispatch_oids;
 extern bool gp_dispatch_oids_session;
 extern bool gp_allow_local_ddl;
-extern bool gp_transport_libpq;
 extern void gp_oids_init(void);
 extern bool gp_check_dispatch_oids(char **newval, void **extra,
 								   GucSource source);
