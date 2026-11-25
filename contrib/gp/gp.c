@@ -286,9 +286,9 @@ _PG_init(void)
 
 	DefineCustomBoolVariable("gp.transport_libpq",
 							 "Answers the fragments over libpq sessions, without the interconnect workers.",
-							 "The gather and the colocated slice run in ordinary sessions of the segments over libpq; joins that need a motion answer on the coordinator.  Off, the fragments travel over the interconnect workers.",
+							 "The gather, the merge and the slices run in ordinary sessions of the segments over libpq, and the pull of a motion rides in the query itself; the interconnect workers carry the fragments when it is off.  On by default.",
 							 &gp_transport_libpq,
-							 false,
+							 true,
 							 PGC_USERSET,
 							 0,
 							 NULL,

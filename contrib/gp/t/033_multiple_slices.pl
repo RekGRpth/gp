@@ -19,6 +19,11 @@ my ($coordinator, @segments) = start_cluster();
 
 sub run { return $coordinator->safe_psql('postgres', shift); }
 
+# The slices of the transport of libpq run in ordinary sessions and leave no
+# interconnect request behind them: this test asks the workers, so it keeps
+# the interconnect
+run('ALTER DATABASE postgres SET gp.transport_libpq = off');
+
 run('CREATE TABLE t1 (a int, b text)');
 run("SELECT gp.distribute('t1', ARRAY['a'])");
 run('CREATE TABLE t2 (a int, c text)');

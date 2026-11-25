@@ -19,6 +19,12 @@ use GpTest qw(start_cluster);
 
 my ($coordinator, @segments) = start_cluster(segments => 2);
 
+# The transport of libpq answers the fragments in ordinary sessions, whose
+# cancel does not go through the brokers: this test asks the workers, so it
+# keeps the interconnect
+$coordinator->safe_psql('postgres',
+	'ALTER DATABASE postgres SET gp.transport_libpq = off');
+
 $coordinator->safe_psql('postgres', 'CREATE TABLE t (a int)');
 $coordinator->safe_psql('postgres', q{SELECT gp.distribute('t', ARRAY['a'])});
 $coordinator->safe_psql('postgres',
