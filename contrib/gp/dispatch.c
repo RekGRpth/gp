@@ -50,6 +50,7 @@
 #include "libpq/libpq-be-fe-helpers.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "replication/message.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/builtins.h"
@@ -327,6 +328,19 @@ gp_connections_prepare(void)
 	prepared_any = true;
 	snprintf(gid, sizeof(gid), "gp_" UINT64_FORMAT,
 			 U64FromFullTransactionId(GetTopFullTransactionId()));
+
+	/*
+	 * Record the prepare in the WAL before the segments see it: the record
+	 * carries the xid of the transaction, and recovery moves the xid counter
+	 * past every xid it reads, so the xid of a prepared transaction is never
+	 * handed to another one, however the coordinator dies.  Without it, a
+	 * crash between the prepare and the commit could leave the counter
+	 * behind the gid, a later transaction could take the xid and commit,
+	 * and the recovery, reading the clog, would then commit what the
+	 * coordinator never did
+	 */
+	LogLogicalMessage("gp", gid, strlen(gid), true, false);
+
 	command = psprintf("PREPARE TRANSACTION %s", quote_literal_cstr(gid));
 	commands = palloc_array(char *, n);
 

@@ -359,10 +359,20 @@ The rows of a distributed table are on the segments, so a query cannot read
 the table on the coordinator.  The hook of the paths of a relation makes
 the only path to a distributed table a custom scan, `GpGather`, and the
 planner plans the rest, the joins, the aggregates, the sorts and the
-windows, on the coordinator as for any table.  A clean `GpGather` serializes
-an ordinary scan of the table and sends that plan to every segment over the
-interconnect.  Their binary rows go into a tuplestore, from which the rows go
-up the plan; a rescan, as in a nested loop, reads them from the store again.
+windows, on the coordinator as for any table.  A clean `GpGather` answers
+in ordinary libpq sessions of the segments: its remote SQL is an ordinary
+scan of the table (`EXPLAIN (VERBOSE)` shows it), the rows come back in
+the binary format into a tuplestore, from which they go up the plan, and a
+rescan, as in a nested loop, reads them from the store again.  A query
+with an ORDER BY sorts on the segments, and the gather merges their
+sorted answers; the LIMIT of the query rides to the segments only when
+the query has no filter of its own, because the remote SQL carries no
+WHERE and the filters read the answers above the gather.
+`gp.transport_libpq` (on by default) carries the fragments in the ordinary
+sessions of the segments: the gather, its merge, and the slices, whose pull
+of a motion rides in the query itself as `gp.peer_query()`.  Off, the same
+fragments travel over the interconnect workers of the next section, which
+the tests of the interconnect mechanics keep.
 The conditions of the query and the projection run on the coordinator, so the
 result is always correct, if not always cheap: all rows of the table come,
 none is chosen on the segments, and the planner does not yet know how many
@@ -758,6 +768,7 @@ All are set at server start unless noted.
 | `gp.allow_local_ddl` | off | Lets a segment create objects of its own; superuser, for maintenance |
 | `gp.dispatch_ddl` | on | Sends DDL of the coordinator to the segments; superuser, for maintenance |
 | `gp.default_distribution` | `coordinator` | `first_column` distributes new tables by their first column; settable by a user |
+| `gp.transport_libpq` | on | Answers the fragments in ordinary libpq sessions of the segments; off, the interconnect workers carry them; settable by a user |
 
 ### Functions
 
