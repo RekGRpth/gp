@@ -27,6 +27,16 @@ my ($coordinator, @segments) = start_cluster();
 sub run { return $coordinator->safe_psql('postgres', shift); }
 sub plan_for { return $coordinator->safe_psql('postgres', "EXPLAIN (COSTS OFF) $_[0]"); }
 
+# The workers answer the fragments of the interconnect: the test asks them,
+# so it keeps the interconnect on every node, the pull of a motion reads the
+# setting of the segment's own database
+run('ALTER DATABASE postgres SET gp.transport_libpq = off');
+foreach my $segment (@segments)
+{
+	$segment->safe_psql('postgres',
+		'ALTER DATABASE postgres SET gp.transport_libpq = off');
+}
+
 run('CREATE TABLE c (custkey int, nationkey int)');
 run("SELECT gp.distribute('c', ARRAY['custkey'])");
 run('INSERT INTO c SELECT i, i % 5 FROM generate_series(1, 10) i');

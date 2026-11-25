@@ -333,6 +333,16 @@ RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'gp_peer_query'
 LANGUAGE C VOLATILE;
 
+-- Execute the serialized fragment of a query in this session and answer its
+-- rows.  The pull of a motion asks every peer for its fragment with this
+-- call in a session of its own, instead of the workers of the interconnect.
+-- The executor checks the permissions of the caller as for any query, and
+-- only the planner of a peer writes the calls
+CREATE FUNCTION gp.fragment_exec(fragment text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'gp_fragment_exec'
+LANGUAGE C VOLATILE;
+
 -- Attach the exported snapshots of a distributed statement to this backend,
 -- so a fragment dispatched over libpq reads the same state as its nested
 -- motions.  The coordinator's dispatcher calls this on the segments in the

@@ -2847,7 +2847,14 @@ gp_slice_redistribute_rte_keys(Query *remote, GpJoinTable *stay, GpJoinTable *mo
 			return false;
 		}
 		if (needed != NULL && !bms_is_member(att->attnum, needed))
-			appendStringInfo(&cols, "%sNULL AS %s", cols.len > 0 ? ", " : "",
+			/*
+			 * The filler rides as a typed null: a bare NULL comes out of
+			 * the planner as text, and the answer of the fragment would
+			 * then miss the type of the column it stands for
+			 */
+			appendStringInfo(&cols, "%sNULL::%s AS %s", cols.len > 0 ? ", " : "",
+							 format_type_extended(att->atttypid, att->atttypmod,
+												  FORMAT_TYPE_ALLOW_INVALID),
 							 quote_identifier(NameStr(att->attname)));
 		else
 			appendStringInfo(&cols, "%s%s", cols.len > 0 ? ", " : "",
