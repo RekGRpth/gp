@@ -46,8 +46,8 @@ unlike(plan_for('SELECT name, count(*) FROM s JOIN l ON s.suppkey = l.suppkey JO
 	'supplier and customer are not broadcast in one multiway plan: the rewrite is not built yet');
 like(plan_for('SELECT n.name, sum(l.quantity) FROM c JOIN n ON c.nationkey = n.nationkey JOIN o ON c.custkey = o.custkey JOIN l ON l.orderkey = o.orderkey GROUP BY n.name'),
 	qr/GpSlice/, 'a replicated nation needs no additional Motion');
-unlike(plan_for('SELECT c.custkey, sum(l.quantity) FROM c LEFT JOIN o ON c.custkey = o.custkey JOIN l ON l.orderkey = o.orderkey GROUP BY c.custkey'),
-	qr/GpSlice/, 'a multiway outer join keeps the coordinator fallback');
+like(plan_for('SELECT c.custkey, sum(l.quantity) FROM c LEFT JOIN o ON c.custkey = o.custkey JOIN l ON l.orderkey = o.orderkey GROUP BY c.custkey'),
+	qr/GpSlice/, 'a multiway outer join rides to the segments with its first table');
 
 run('SET enable_mergejoin = off');
 my @queries = (

@@ -103,9 +103,11 @@ like(plan_for('SELECT t1.a, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a CROSS JOIN
 	qr/GpSlice/, 'a disconnected join graph uses component broadcast');
 like(plan_for('SELECT t1.a, t2.c, t3.d, t4.e FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.a = t3.a JOIN t4 ON t1.a = t4.a'),
 	qr/GpSlice/, 'a four-way join moves only the other colocation groups');
-unlike(plan_for('SELECT t1.a, t2.c, t3.d FROM t1 LEFT JOIN (t2 JOIN t3 ON t2.a = t3.a) ON t1.a = t2.a'),
-	qr/GpSlice/, 'an outer join of three tables stays on the coordinator');
-foreach my $jointype (qw(LEFT RIGHT FULL))
+like(plan_for('SELECT t1.a, t2.c, t3.d FROM t1 LEFT JOIN (t2 JOIN t3 ON t2.a = t3.a) ON t1.a = t2.a'),
+	qr/GpSlice/, 'an outer join of three tables rides to the segments with its first table');
+like(plan_for('SELECT t1.a, t2.c, t3.d FROM (t1 LEFT JOIN t2 ON t1.a = t2.a) JOIN t3 ON t2.a = t3.a'),
+	qr/GpSlice/, 'a nested LEFT join rides to the segments with its first table');
+foreach my $jointype (qw(RIGHT FULL))
 {
 	unlike(plan_for("SELECT t1.a, t2.c, t3.d FROM (t1 $jointype JOIN t2 ON t1.a = t2.a) JOIN t3 ON t2.a = t3.a"),
 		qr/GpSlice/, "a nested $jointype join stays on the coordinator");

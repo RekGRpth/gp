@@ -4372,6 +4372,99 @@ gp_slice_join_kept_side(Query *original, List *tables)
 }
 
 /*
+ * The table at the leftmost leaf of a join tree, when every join of the
+ * path to it keeps the rows of its left side: an inner join or a LEFT
+ * join.  A FULL or a RIGHT join of the path would keep rows of another
+ * side, which the leftmost leaf does not partition
+ */
+static bool
+gp_slice_join_left_leaf(Node *node, Index *rti)
+{
+	JoinExpr   *join;
+
+	if (IsA(node, RangeTblRef))
+	{
+		*rti = ((RangeTblRef *) node)->rtindex;
+		return true;
+	}
+	if (!IsA(node, JoinExpr))
+		return false;
+	join = (JoinExpr *) node;
+	if (join->jointype != JOIN_INNER && join->jointype != JOIN_LEFT)
+		return false;
+	return gp_slice_join_left_leaf(join->larg, rti);
+}
+
+/* Whether the tree keeps a LEFT join somewhere */
+static bool
+gp_slice_join_has_left(Node *node)
+{
+	JoinExpr   *join;
+
+	if (!IsA(node, JoinExpr))
+		return false;
+	join = (JoinExpr *) node;
+	if (join->jointype == JOIN_LEFT)
+		return true;
+	return gp_slice_join_has_left(join->larg) ||
+		gp_slice_join_has_left(join->rarg);
+}
+
+/*
+ * The kept table of a level of a multiway join: every join of the level
+ * keeps the rows of the leftmost table of the tree -- an inner join keeps
+ * the pairs, a LEFT join keeps its left side, and a semi, an anti or a
+ * scalar sublink filters the rows of the level or hangs a value on them.
+ * The leftmost table partitions the answer and stays; every other table
+ * of the level must be whole on every segment: a null-supplying side of
+ * an outer join cannot join by a key, for rows without a partner are
+ * kept, and a table joined to the null-extended rows of the tree cannot
+ * cut its answer to a share either.  The joins of a whole side of the
+ * tree replay per segment over the broadcast tables the way they ran on
+ * the coordinator
+ */
+static GpJoinTable *
+gp_slice_join_flat_outer(Query *parse, List *tables)
+{
+	Node	   *leaf;
+	Index		rti = 0;
+	ListCell   *lc;
+
+	/*
+	 * The joins of two tables and the levels of inner joins alone keep
+	 * their own paths: the smaller side stays and a component of one
+	 * colocation group keeps its tables
+	 */
+	if (list_length(tables) < 3 || gp_slice_join_derived(parse) ||
+		!IsA(parse->jointree, FromExpr) ||
+		list_length(parse->jointree->fromlist) < 1)
+		return NULL;
+	leaf = linitial(parse->jointree->fromlist);
+	if (!IsA(leaf, JoinExpr))
+		return NULL;
+	if (!gp_slice_join_has_left(leaf))
+		return NULL;
+	if (!gp_slice_join_left_leaf(leaf, &rti))
+		return NULL;
+	for (lc = lnext(parse->jointree->fromlist,
+					list_head(parse->jointree->fromlist));
+		 lc != NULL;
+		 lc = lnext(parse->jointree->fromlist, lc))
+		if (!IsA(lfirst(lc), RangeTblRef))
+			return NULL;
+	foreach(lc, tables)
+	{
+		GpJoinTable *table = lfirst(lc);
+
+		if (table->rti == rti && table->depth == 0 &&
+			!table->policy.replicated &&
+			table->policy.colocation_id != 0)
+			return table;
+	}
+	return NULL;
+}
+
+/*
  * Move the sides of a join of colocation groups.  An inner join moves every
  * table of another group by the hash of its key under the map of the first.
  * An outer join of two tables broadcasts its null-supplying side instead.  A
@@ -4390,6 +4483,7 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 {
 	GpJoinTable *stay = NULL;
 	GpJoinTable *move = NULL;
+	GpJoinTable *flat_stay;
 	List	   *moves = NIL;
 	ListCell   *lc;
 	JoinType	jointype;
@@ -4419,12 +4513,14 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 		list_length(original->jointree->fromlist) == 1 &&
 		gp_slice_join_all_same_type(linitial(original->jointree->fromlist),
 									&jointype);
+	flat_stay = outer_same ? NULL : gp_slice_join_flat_outer(original, tables);
 	if ((list_length(tables) != 2 || original->hasSubLinks ||
 		 gp_slice_join_derived(original)) &&
-		!outer_same &&
+		!outer_same && flat_stay == NULL &&
 		!gp_slice_join_all_inner_levels(tables))
 		return false;
-	stay = gp_slice_join_kept_side(original, tables);
+	stay = flat_stay != NULL ? flat_stay :
+		gp_slice_join_kept_side(original, tables);
 	if (stay != NULL)
 	{
 		*agg_stay = stay;
