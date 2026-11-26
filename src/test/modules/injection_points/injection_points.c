@@ -485,24 +485,29 @@ Datum
 injection_points_wakeup(PG_FUNCTION_ARGS)
 {
 	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int			index = -1;
 
 	if (inj_state == NULL)
 		injection_init_shmem();
 
-	/*
-	 * Bump the wait counter of every slot waiting for this point: several
-	 * backends can wait at one point, and each wakes on its own slot, so a
-	 * single bump to the first match would leave the others asleep.  Stale
-	 * slots of backends that died waiting bump harmlessly into nothing.
-	 */
+	/* Find the injection point then bump its wait counter */
 	SpinLockAcquire(&inj_state->lock);
 	for (int i = 0; i < INJ_MAX_WAIT; i++)
 	{
 		if (strcmp(name, inj_state->name[i]) == 0)
-			pg_atomic_fetch_add_u32(&inj_state->wait_counts[i], 1);
+		{
+			index = i;
+			break;
+		}
+	}
+	if (index < 0)
+	{
+		SpinLockRelease(&inj_state->lock);
+		elog(ERROR, "could not find injection point %s to wake up", name);
 	}
 	SpinLockRelease(&inj_state->lock);
 
+	pg_atomic_fetch_add_u32(&inj_state->wait_counts[index], 1);
 	PG_RETURN_VOID();
 }
 
