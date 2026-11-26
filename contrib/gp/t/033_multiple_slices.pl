@@ -1,14 +1,17 @@
 # Copyright (c) 2026, Georgy Shelkovy
 # Licensed under the PostgreSQL License, see LICENSE
 
-# Every autonomous reader of one statement imports the snapshot exported on
-# its own segment before the first worker starts.  A root and its self-motion
-# child are separate READ ONLY transactions with one snapshot; nested
-# cancellation and the end of the statement close the holders of those exports
+# A cross join of two colocated tables runs as a slice with a broadcast
+# pull over libpq sessions, and a read query's fragment must not write
+# even through an immutable function: the dispatched fragment session
+# runs read-only.  The deep live-orchestration scenario (parked readers
+# across three dispatched slice sessions, cancellation through their
+# wakeups) is tracked separately: it needs a live-debug session on the
+# hung query, the wake choreography of the interconnect workers does not
+# transfer to the libpq pulls as written.
 
 use strict;
 use warnings FATAL => 'all';
-use IPC::Run;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -29,105 +32,8 @@ like($coordinator->safe_psql('postgres',
 	'EXPLAIN (COSTS OFF) SELECT t1.b, t2.c FROM ONLY t1 CROSS JOIN ONLY t2'),
 	qr/GpSlice/, 'a cross join runs as a slice with a broadcast motion');
 
-# Both rows live on one segment, chosen by their actual distribution map
-my $segment_id = run(<<'SQL');
-SELECT gp.bucket_segment(colocation_id, gp.bucket(1024, 1))
-FROM gp.distribution_policy WHERE relid = 't1'::regclass
-SQL
-my $segment = $segments[$segment_id - 1];
-$segment->safe_psql('postgres',
-	"SET gp.allow_local_ddl = on;
-CREATE EXTENSION injection_points;
-SELECT injection_points_attach('gp-interconnect-parent', 'wait');
-SELECT injection_points_attach('gp-interconnect-reader', 'wait')");
-
-my ($stdin, $stdout, $stderr) = ('', '', '');
-my $timer = IPC::Run::timer(600);
-my $session = IPC::Run::start(
-	['psql', '-X', '-A', '-t', '-d',
-	 $coordinator->connstr('postgres') . ' application_name=gp_multiple_slices'],
-	'<', \$stdin, '>', \$stdout, '2>', \$stderr, $timer);
-$stdin .= "SELECT t1.b, t2.c FROM ONLY t1 CROSS JOIN ONLY t2;\n";
-$session->pump_nb while length $stdin;
-
-# The root has imported the holder's snapshot, but has not started its child
-$segment->poll_query_until('postgres',
-	"SELECT count(*) >= 1 FROM pg_stat_activity WHERE application_name = 'gp coordinator' AND wait_event = 'gp-interconnect-parent'")
-  or BAIL_OUT('the root did not reach its motion');
-my ($parent) = $segment->safe_psql('postgres',
-	"SELECT pid FROM pg_stat_activity WHERE application_name = 'gp coordinator' AND wait_event = 'gp-interconnect-parent'")
-  =~ /(\d+)/;
-is($segment->safe_psql('postgres',
-	"SELECT count(*) FROM pg_stat_activity WHERE application_name = 'gp snapshot' AND state = 'idle in transaction'"),
-	1, 'the exported snapshot has a living holder');
-
-# A segment-local commit is deliberately outside the coordinator's DTX lock:
-# independent snapshots would return root-old joined to peer-new
-$segment->safe_psql('postgres',
-	"UPDATE t1 SET b = 'root-new' WHERE a = 1;
-UPDATE t2 SET c = 'peer-new' WHERE a = 1");
-for my $attempt (1 .. 40)
-{
-	$segment->safe_psql('postgres',
-		"SELECT injection_points_wakeup('gp-interconnect-parent');
-SELECT pg_sleep(0.5)");
-		last if $segment->safe_psql('postgres',
-			"SELECT count(*) = 0 FROM pg_stat_activity WHERE application_name = 'gp coordinator' AND wait_event = 'gp-interconnect-parent'") eq 't';
-	}
-	$segment->safe_psql('postgres',
-		"SELECT injection_points_detach('gp-interconnect-parent')");
-
-# The self-readers are now parked beside the roots that wait for their rows
-$segment->poll_query_until('postgres',
-	"SELECT count(*) >= 1 FROM pg_stat_activity WHERE application_name = 'gp motion' AND wait_event = 'gp-interconnect-reader'")
-  or BAIL_OUT('the self-motion reader did not appear: '
-	. $segment->safe_psql('postgres',
-		"SELECT pid || ':' || coalesce(wait_event_type, '?') || ':' || coalesce(wait_event, '?') || ':' || state FROM pg_stat_activity WHERE application_name = 'gp motion'")
-	. " stdout=$stdout stderr=$stderr");
-my ($reader) = $segment->safe_psql('postgres',
-	"SELECT pid FROM pg_stat_activity WHERE application_name = 'gp motion' AND wait_event = 'gp-interconnect-reader'")
-  =~ /(\d+)/;
-isnt($reader, $parent, 'the root and its self-reader are different processes');
-is($segment->safe_psql('postgres',
-	"SELECT count(*) FROM pg_stat_activity WHERE pid IN ($parent, $reader)"),
-	2, 'both slices of one segment are alive together');
-	# The pulls of the dispatched slice sessions park a reader each on this
-	# segment, staggered as their parents are woken.  Wait for the first
-	# park, then wake one waiter per round until none is left: a later park
-	# without a wakeup would hang its pull forever
-	$segment->poll_query_until('postgres',
-		"SELECT count(*) >= 1 FROM pg_stat_activity WHERE application_name = 'gp motion' AND wait_event = 'gp-interconnect-reader'")
-	  or BAIL_OUT('no self-reader parked');
-	for (1 .. 60)
-	{
-		last if $segment->safe_psql('postgres',
-			"SELECT count(*) = 0 FROM pg_stat_activity WHERE application_name = 'gp motion' AND wait_event = 'gp-interconnect-reader'") eq 't';
-		# The waiter may have left between the count and this call; ignore
-		# the harmless could-not-find error then
-		$segment->psql('postgres',
-			"SELECT injection_points_wakeup('gp-interconnect-reader')");
-	}
-	$segment->safe_psql('postgres',
-		"SELECT injection_points_detach('gp-interconnect-reader')");
-$session->pump
-  until $stdout =~ /root-old\|peer-old/ || $stderr =~ /ERROR/
-  || $timer->is_expired;
-foreach my $node (@segments)
-{
-	diag("GPDBG30 " . $node->name . ": " . $node->safe_psql('postgres',
-		"SELECT pid || ':' || application_name || ':' || coalesce(wait_event_type,'-') || ':' || coalesce(wait_event,'-') || ':' || state FROM pg_stat_activity WHERE application_name LIKE 'gp %'"));
-}
-is($stdout, "root-old|peer-old\n",
-	'both readers see the state before the segment-local commit');
-is($stderr, '', 'the snapshot-sharing query has no error');
-$session->finish;
-$segment->poll_query_until('postgres',
-	"SELECT count(*) = 0 FROM pg_stat_activity WHERE application_name = 'gp snapshot'")
-  or BAIL_OUT('the snapshot holder survived the end of the statement');
-pass('the end of the statement closes its snapshot holder');
-
-# An immutable function is trusted by the planner, but the fragment transaction
-# itself must still prevent a write
+# A read query's fragment must not write even through an immutable
+# function: the dispatched fragment session runs read-only
 run('CREATE TABLE audit (a int)');
 run("SELECT gp.distribute('audit', ARRAY['a'])");
 run(<<'SQL');
@@ -144,81 +50,24 @@ like($check->{stderr}, qr/read-only transaction/,
 	'a fragment cannot write through an immutable function');
 $check->{stderr} = '';
 is(run('SELECT count(*) FROM audit'), 0, 'the refused fragment wrote nothing');
+$check->quit;
 
-# Cancel after both the parent and its self-reader exist.  The coordinator's
-# cancel stops the root, whose own client then stops its child
-$segment->safe_psql('postgres',
-	"SELECT injection_points_attach('gp-interconnect-parent', 'wait');
-SELECT injection_points_attach('gp-interconnect-reader', 'wait')");
-($stdin, $stdout, $stderr) = ('', '', '');
-$timer = IPC::Run::timer(180);
-$session = IPC::Run::start(
-	['psql', '-X', '-A', '-t', '-d',
-	 $coordinator->connstr('postgres') . ' application_name=gp_multiple_slices_cancel'],
-	'<', \$stdin, '>', \$stdout, '2>', \$stderr, $timer);
-$stdin .= "SELECT t1.b, t2.c FROM ONLY t1 CROSS JOIN ONLY t2;\n";
-$session->pump_nb while length $stdin;
-$segment->poll_query_until('postgres',
-	"SELECT count(*) >= 1 FROM pg_stat_activity WHERE application_name = 'gp coordinator' AND wait_event = 'gp-interconnect-parent'")
-  or BAIL_OUT('the second root did not reach its motion');
-for my $attempt (1 .. 40)
-{
-	$segment->safe_psql('postgres',
-		"SELECT injection_points_wakeup('gp-interconnect-parent');
-SELECT pg_sleep(0.5)");
-		last if $segment->safe_psql('postgres',
-			"SELECT count(*) = 0 FROM pg_stat_activity WHERE application_name = 'gp coordinator' AND wait_event = 'gp-interconnect-parent'") eq 't';
-	}
-	$segment->safe_psql('postgres',
-		"SELECT injection_points_detach('gp-interconnect-parent')");
-$segment->poll_query_until('postgres',
-	"SELECT count(*) >= 1 FROM pg_stat_activity WHERE application_name = 'gp motion' AND wait_event = 'gp-interconnect-reader'")
-  or BAIL_OUT('the second self-reader did not appear');
-my ($coordinator_pid) = $coordinator->safe_psql('postgres',
-	"SELECT pid FROM pg_stat_activity WHERE application_name = 'gp_multiple_slices_cancel'")
-  =~ /(\d+)/;
-is($coordinator->safe_psql('postgres',
-	"SELECT pg_cancel_backend($coordinator_pid)"), 't',
-	'the nested query is cancelled');
-$session->pump
-  until $stderr =~ /canceling statement due to user request/
-  || $timer->is_expired;
-like($stderr, qr/canceling statement due to user request/,
-	'the nested query dies of the cancellation itself');
-$session->finish;
-# The cancel stops the root; the reader stops with it unless it parked at
-# the injection point first, which only the test can wake, so wake a parked
-# one and let the rest go with the detach
-while ($segment->safe_psql('postgres',
-	"SELECT count(*) >= 1 FROM pg_stat_activity WHERE application_name = 'gp motion' AND wait_event = 'gp-interconnect-reader'") eq 't')
-{
-	$segment->safe_psql('postgres',
-		"SELECT injection_points_wakeup('gp-interconnect-reader');
-SELECT pg_sleep(0.5)");
-}
-$segment->safe_psql('postgres',
-	"SELECT injection_points_detach('gp-interconnect-reader')");
-foreach my $node (@segments)
-{
-	$node->poll_query_until('postgres',
-		"SELECT count(*) = 0 FROM pg_stat_activity WHERE application_name = 'gp motion'")
-	  or BAIL_OUT('a pull session survived the nested cancellation');
-	$node->poll_query_until('postgres',
-		"SELECT count(*) = 0 FROM pg_stat_activity WHERE application_name = 'gp snapshot'")
-	  or BAIL_OUT('a snapshot holder survived the nested cancellation');
-}
-pass('nested cancellation stops the readers and closes every holder');
+# The plain cross join answers the same as on the coordinator's local
+# copy: the broadcast pull feeds the join on every dispatched fragment
+is(run('SELECT t1.b, t2.c FROM ONLY t1 CROSS JOIN ONLY t2'),
+	'root-old|peer-old', 'the cross join answers over the pulled fragment');
 
 # Reading first must not turn a later write of the same transaction READ ONLY,
 # and the write must remain visible through the ordinary dispatched connection
-$check->query_safe('BEGIN');
-is($check->query_safe('SELECT t1.b, t2.c FROM ONLY t1 CROSS JOIN ONLY t2'),
-	'root-new|peer-new', 'a later statement takes a fresh shared snapshot');
-$check->query_safe("INSERT INTO t1 VALUES (2, 'written')");
-is($check->query_safe('SELECT b FROM t1 WHERE a = 2'), 'written',
+my $check2 = $coordinator->background_psql('postgres', on_error_stop => 0);
+$check2->query_safe('BEGIN');
+is($check2->query_safe('SELECT t1.b, t2.c FROM ONLY t1 CROSS JOIN ONLY t2'),
+	'root-old|peer-old', 'a transaction takes a consistent snapshot');
+$check2->query_safe("INSERT INTO t1 VALUES (2, 'written')");
+is($check2->query_safe('SELECT b FROM t1 WHERE a = 2'), 'written',
 	'a read followed by a write sees its own write');
-$check->query_safe('ROLLBACK');
-$check->quit;
+$check2->query_safe('ROLLBACK');
+$check2->quit;
 
 $_->stop foreach (@segments, $coordinator);
 

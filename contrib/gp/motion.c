@@ -201,7 +201,6 @@ gp_motion_fetch_libpq(Tuplestorestate *store, TupleDesc tupdesc,
 		{
 			const char *values[6];
 
-			elog(LOG, "GPDBG20 peer %d connect", wanted[i].segment_id);
 			snprintf(port, sizeof(port), "%d", wanted[i].port);
 			values[0] = wanted[i].host;
 			values[1] = port;
@@ -246,7 +245,6 @@ gp_motion_fetch_libpq(Tuplestorestate *store, TupleDesc tupdesc,
 					PQclear(res);
 				}
 			}
-			elog(LOG, "GPDBG20 peer %d setup done, sending fragment", wanted[i].segment_id);
 			if (!PQsendQueryParams(conns[i], sql.data, 1,
 								   NULL, &serialized, NULL, NULL, 1) ||
 				!PQsetSingleRowMode(conns[i]))
@@ -259,7 +257,6 @@ gp_motion_fetch_libpq(Tuplestorestate *store, TupleDesc tupdesc,
 										   pchomp(PQerrorMessage(conns[i]))));
 		}
 
-		elog(LOG, "GPDBG20 all fragments sent, reading rows");
 		rowcxt = AllocSetContextCreate(CurrentMemoryContext, "motion row",
 									   ALLOCSET_DEFAULT_SIZES);
 		loadslot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsVirtual);
@@ -283,7 +280,6 @@ gp_motion_fetch_libpq(Tuplestorestate *store, TupleDesc tupdesc,
 								   wanted[i].segment_id),
 							errdetail_internal("%s",
 											   pchomp(PQresultErrorMessage(res))));
-
 				ExecClearTuple(loadslot);
 				oldcontext = MemoryContextSwitchTo(rowcxt);
 				for (int a = 0; a < natts; a++)
@@ -313,7 +309,6 @@ gp_motion_fetch_libpq(Tuplestorestate *store, TupleDesc tupdesc,
 				PQclear(res);
 			}
 		}
-		elog(LOG, "GPDBG20 all rows read");
 		ExecDropSingleTupleTableSlot(loadslot);
 		MemoryContextDelete(rowcxt);
 	}
