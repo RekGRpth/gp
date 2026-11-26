@@ -69,6 +69,44 @@ is($check2->query_safe('SELECT b FROM t1 WHERE a = 2'), 'written',
 $check2->query_safe('ROLLBACK');
 $check2->quit;
 
+# A literal limit of an unordered query rides into the SQL of the slice:
+# every dispatched session cuts its own share, and the limit of the plan
+# cuts the union on the coordinator, so the answers stay the ones of a
+# single node.  A sorted query, a compound one and a limit that is not a
+# literal keep their limit above the slice
+run("INSERT INTO t1 VALUES (2, 'root-2'), (3, 'root-3')");
+run("INSERT INTO t2 VALUES (2, 'peer-2'), (3, 'peer-3')");
+my $cross = 'SELECT t1.b, t2.c FROM ONLY t1 CROSS JOIN ONLY t2';
+like($coordinator->safe_psql('postgres',
+		"EXPLAIN (VERBOSE, COSTS OFF) $cross LIMIT 3"),
+	qr/LIMIT 3/, 'the literal limit rides in the SQL of the slice');
+like($coordinator->safe_psql('postgres',
+		"EXPLAIN (VERBOSE, COSTS OFF) $cross LIMIT 3 OFFSET 1"),
+	qr/LIMIT 4/, 'the offset rides added to the limit');
+unlike($coordinator->safe_psql('postgres',
+		"EXPLAIN (VERBOSE, COSTS OFF) $cross ORDER BY 1, 2 LIMIT 3"),
+	qr/LIMIT 3/, 'a sorted query keeps its limit above the slice');
+unlike($coordinator->safe_psql('postgres',
+		"EXPLAIN (VERBOSE, COSTS OFF) $cross LIMIT (SELECT 3)"), qr/LIMIT 3/,
+	'a limit that is not a literal keeps the whole answers');
+is(run("SELECT count(*) FROM ($cross LIMIT 3) s"), 3,
+	'the segments answer a cut share and the coordinator cuts again');
+is(run("SELECT count(*) FROM ($cross LIMIT 3 OFFSET 1) s"), 3,
+	'the offset skips its rows on the coordinator');
+is(run("SELECT count(*) FROM ($cross LIMIT 0) s"), 0,
+	'a zero limit answers nothing');
+is(run("SELECT count(*) FROM ($cross LIMIT 100 OFFSET 9) s"), 0,
+	'an offset past the answer answers nothing');
+is(run("SELECT count(*) FROM ($cross LIMIT 9223372036854775807 OFFSET 2) s"),
+	7, 'an offset by the largest limit answers the rest');
+is(run("SELECT count(*) FROM (SELECT b FROM ONLY t1 UNION SELECT c FROM ONLY t2 LIMIT 3) s"),
+	3, 'a compound query cuts the union of its arms');
+is(run("SELECT b || '|' || c FROM ONLY t1 CROSS JOIN ONLY t2 WHERE b = 'root-2' LIMIT 1"),
+	'root-2|peer-2', 'the filter rides before the limit of the fragment');
+is(run("SELECT b, c FROM ($cross ORDER BY 1, 2 LIMIT 3) s"),
+	"root-2|peer-2\nroot-2|peer-3\nroot-2|peer-old",
+	'a sorted query answers the first rows of its order');
+
 $_->stop foreach (@segments, $coordinator);
 
 done_testing();
