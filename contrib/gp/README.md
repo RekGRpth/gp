@@ -54,10 +54,8 @@ part of `gp` in `gp.database`, connects to `gp.coordinator`, calls
 coordinator is down or has no extension, the worker retries every
 `gp.register_retry_interval`, so segments may start before the coordinator.
 A number registered at another address, or an address under another number,
-is refused.  The interconnect broker of the segment then reports the port it
-listens on in the same way, with `gp.register_interconnect(segment_id, port)`,
-so the row of a segment in `gp.segments` carries both its server port and its
-broker port.
+is refused.  The row of a segment in `gp.segments` carries its number,
+address and server port, and nothing else.
 
 ### Connections and commands (`dispatch.c`)
 
@@ -368,11 +366,9 @@ with an ORDER BY sorts on the segments, and the gather merges their
 sorted answers; the LIMIT of the query rides to the segments only when
 the query has no filter of its own, because the remote SQL carries no
 WHERE and the filters read the answers above the gather.
-`gp.transport_libpq` (on by default) carries the fragments in the ordinary
-sessions of the segments: the gather, its merge, and the slices, whose pull
-of a motion rides in the query itself as `gp.peer_query()`.  Off, the same
-fragments travel over the interconnect workers of the next section, which
-the tests of the interconnect mechanics keep.
+The fragments travel in ordinary sessions of the segments: the gather, its
+merge, and the slices, whose pull of a motion rides in the query itself as
+`gp.peer_query()`.
 The conditions of the query and the projection run on the coordinator, so the
 result is always correct, if not always cheap: all rows of the table come,
 none is chosen on the segments, and the planner does not yet know how many
@@ -395,7 +391,7 @@ transactions use the same isolation level.  All remote scans of one statement
 share a commit-exclusion lock until `ExecutorEnd`, so a distributed commit is
 visible everywhere or nowhere and cannot appear between two inputs of the
 statement.  A caught subtransaction restores those locks on its abort path.
-READ COMMITTED can use the interconnect.  `FOR UPDATE` and `TABLESAMPLE` on a
+`FOR UPDATE` and `TABLESAMPLE` on a
 distributed table are refused.  `TRUNCATE` goes to the segments with the other
 DDL.
 
@@ -403,43 +399,24 @@ The policy of a table is read once, by a session, from `gp.distribution_policy`,
 and kept; `gp.distribute()` and the drop of a table invalidate it through
 the relcache entry of the table, and a change of an extension drops it.
 
-### Interconnect (`interconnect.c`, `motion.c`)
+### Fragments (`fragment.c`, `motion.c`)
 
-`GpMotion`, a clean `GpGather` and a clean immutable `GpSlice` receive a
+`GpMotion`, a clean `GpGather` and a clean immutable `GpSlice` carry a
 serialized `PlannedStmt`, not SQL text.  The coordinator leaves
 `gp.peer_query()` in a query as the marker of a moving table; its planner hook
 replaces the function by the `GpMotion` custom scan, whose scan tuple keeps all
 columns of the source.  The SQL function remains as a compatibility wrapper,
 but a fragment contains no `FunctionScan` for it.  While the coordinator builds
 that fragment, `GpGather` is disabled so that the fragment contains an ordinary
-scan.  A `gp interconnect`
-broker on each segment takes any free TCP port — the port of its server
-says nothing about what a bind may take, for on Windows two sockets can
-hold the same port unless one of them refuses — and reports the port to
-the coordinator with `gp.register_interconnect()`.  Clients connect to
-the port each segment reported and to no other address; until the report
-arrives, a gather falls back to its dispatched connections, and a motion
-waits the way it waits for an unreachable broker.  A broker on a
-Unix-domain socket keeps its usual path in the directory of its own
-segment, where no other process competes for it.  The broker assigns the
-request a dynamic background worker.  The worker creates its own ephemeral TCP
-listener, or a per-slot Unix-domain socket, and the broker returns its port.
-The client connects there and sends the serialized plan again; no plan or
-accepted socket has to be passed between processes.  The worker authenticates
-the request with the cluster token, connects to the requested database and
-role, deserializes the plan, locks the range table and runs the executor.  It
-returns binary tuples followed by EOS, or an error message, and exits.  Each
-row carries a connection-local sequence number, which the receiver checks to
-catch a duplicated or missing protocol message.  Shared slots pass through
-STARTING, READY, ASSIGNED and BUSY back to FREE, and the broker reaps stopped
-workers.  Nested Motion to the same segment therefore gets another worker
-instead of waiting for a busy single listener.
+scan.
 
-A motion asks every segment at once.  The client opens a pull on each
-segment — the broker handshake through the READY of the worker —, starts
-every worker with GO, and reads the answers as they come on one wait
-set, disabling the sockets of the pulls that reached their end, so the
-segments of an answer and the sources of a moving table run at once.
+The peers execute their fragments with `gp.fragment_exec(plan)`: the
+deserialized plan is locked by its range table and run by the executor of an
+ordinary session of the segment, opened as the user of the query, and its
+rows stream back to the asker in the binary format.  A session of a pull
+opens with who the rows are for, by the setting `gp.requester_segment`,
+which the filter of a redistribution reads, and with the snapshots of the
+statement attached.
 
 All readers of one statement share one snapshot per segment.  Before the
 first of them starts, and under the statement's distributed commit-exclusion
@@ -451,53 +428,8 @@ change its write state, and close at the end of the statement, its abort and
 its cancellation.  The existing lock keeps distributed commits from appearing
 between the exports of different segments.
 
-An autonomous worker makes its transaction READ ONLY, imports the export of
-its own segment before its first snapshot, and forwards the mapping to its
-children; the request carries the whole segment-to-export mapping, for a root
-worker must pass it to its nested motions.  A fragment on the libpq path
-receives the mapping in its transaction instead: the dispatcher attaches it
-with `gp.attach_statement_snapshots()` before the fragment, importing the
-export of the segment unless the transaction has read already (a transaction
-snapshot of the coordinator has fixed the state anyway), and a fragment with
-a local transaction of its own commits it at the end.  The mapping lives in
-the backend until the end of the transaction, so a stale export is never
-read.  DML fragments that move rows attach the mapping the same way, in the
-same batch as their `INSERT`.  Thus a root, its sibling and self-motion
-readers, and the scans of a dispatched fragment see exactly the same rows.
-
-A cancelled query takes its fragments with it.  A client reads and writes
-its socket over waits on its latch, for no signal handler of `pqsignal`
-interrupts a blocking `recv`, and neither does the timer of a statement
-timeout; while it waits, the lock of the distributed snapshot holds its
-interrupts back, so the wait lets them through for the moment.  A client
-that dies, or fails, or is cancelled then names the worker of its request
-— the broker answers an assignment with the port of the worker and its
-slot and generation — and the broker stops that worker with a signal, from
-the middle of a fragment long between two rows as well as between them.
-The receiver materializes the rows,
-so a writer never waits for a reader of another motion while blocked on this
-one.  A direct Gather or Slice shares the distributed commit-exclusion lock
-with the other remote scans of its statement.  The executor starts only after a
-READY/GO handshake.  A transport failure before that confirmation is retried,
-including a connection reset left by an old listener's backlog.  A failure
-after GO is an error, never a retry that could repeat a volatile function of
-the fragment.  Error and retry responses finish with a bounded graceful close,
-so Windows cannot turn them into an undelivered connection reset.
-
-A Slice with a mutable expression, RLS, inheritance or a changed session
-identity stays on the synchronized dispatched connections, as does any Slice
-outside READ COMMITTED or after a write in its transaction.  A connection
-failure before GO discards any rows already received from other segments and
-uses that same fallback.  Nested Motion can connect to its own segment because
-the broker assigns every such request a separate worker.
-
-At the first registration the coordinator generates a 32-byte token and
-returns it as hex.  The coordinator and the registering segment each store it
-in `gp_interconnect.token` in their data directories with mode 0600.
-Ordinary users cannot read the coordinator's `gp.interconnect_secret` table.  The token protects the endpoint; it is not a
-replacement for the distributed transaction.  Motion is still refused after
-a write in the current transaction because the peer execution has no shared
-snapshot with it.
+A pull makes its transaction import the export of its own segment before its
+first snapshot, and carries the mapping with it.
 
 The actual OIDs of `gp` are saved by `CREATE EXTENSION` in the coordinator's
 data directory.  `gp.extension_oids()` returns them to a registering segment,
@@ -673,7 +605,7 @@ partials of all the segments answer one combine query in which every
 segment combines the groups the hash of the grouping columns assigns to
 it — the fragment reads its own number from `gp.segment_id` — and the
 coordinator finishes the aggregate over the per-segment answers, so no
-row of the table crosses the interconnect.  The fragment is built as
+row of the table crosses a session boundary.  The fragment is built as
 text: the partial aggregate moves as a serialized plan through
 `gp.peer_query()`, like the motion of a join, and the combine query
 groups and aggregates its columns.  The marker of the partial aggregate
@@ -768,14 +700,13 @@ All are set at server start unless noted.
 | `gp.allow_local_ddl` | off | Lets a segment create objects of its own; superuser, for maintenance |
 | `gp.dispatch_ddl` | on | Sends DDL of the coordinator to the segments; superuser, for maintenance |
 | `gp.default_distribution` | `coordinator` | `first_column` distributes new tables by their first column; settable by a user |
-| `gp.transport_libpq` | on | Answers the fragments in ordinary libpq sessions of the segments; off, the interconnect workers carry them; settable by a user |
 
 ### Functions
 
 | Function | What it does |
 |---|---|
 | `gp.register_segment(segment_id, host, port)` | Register a segment; called by the segment itself |
-| `gp.cluster_segments()` | Segments as the coordinator knows them, with the port of each interconnect broker, from any database |
+| `gp.cluster_segments()` | Segments as the coordinator knows them, from any database |
 | `gp.node_state()` | The state of the nodes of the cluster: a short connection of the coordinator tells a live segment from a dead one, with the reason; open to anyone |
 | `gp.stop_node()` | Stop the server of the node the function runs on, the way `pg_ctl -m fast` does; the node is expected back with its own start |
 | `gp.stop_segment(segment_id)` | The stop of `gp.stop_node()`, dispatched to a segment from the coordinator |
@@ -807,10 +738,7 @@ the segments with these settings, and `GpTest::same_answers()` compares the answ
 distributed query with the answer of its local copy and, on a mismatch, leaves
 the facts in the log before the cluster goes away: the two answers, a fresh
 repeat, the answer of every segment over its own rows, the state of the nodes
-and the dispatch counters.  Every interconnect request carries the number of
-its backend, so the client and worker logs of one request correlate, which a
-sieve in CI (`gp-flake-sieve.yml`, four rounds of the suite on a small
-runner) turns into the evidence of a racing slice.
+and the dispatch counters.
 
 | Test | What it checks |
 |---|---|
@@ -842,8 +770,6 @@ runner) turns into the evidence of a racing slice.
 | `026_join_pushdown.pl` | Joins and aggregates over them on the segments: one colocation group joined by the key, replicated tables, outer joins, joins of three and more tables, what is not pushed, the same answers as on the coordinator |
 | `027_subquery_pushdown.pl` | Aggregates and colocated joins inside a subquery of a non-colocated query run on the segments; projections, conditions, sorts and limits keep that locus and renumber hash keys, including pushed `HAVING`, pruned outputs and compound keys; equal hash keys prove colocation without Motion; a derived all-inner level can join a base table and feed a redistributed aggregate, and a derived left join of two hashed tables can feed one too; limits and full-join derived shapes keep their fallbacks |
 | `029_redistributed_join.pl` | `GpMotion` replaces the peer-query marker; inner joins of two and more colocation groups redistribute by the whole key; without one, a two-table join broadcasts the second table under any condition, outer joins broadcast the null-supplying side, and full joins broadcast both sides to one segment; expressions, cross joins, aggregates, subqueries, writes and dropped columns are checked |
-| `030_interconnect_port.pl` | A broker takes any free TCP port and reports it, and clients connect to the reported port alone; a server sits on the port a rule would compute, and nothing of the cluster ever goes there |
-| `031_interconnect_cancel.pl` | A query that dies of its statement timeout stops the workers of its fragments on the segments, though no row ever came to tell them so, and a next query reads the same rows |
 | `032_gp_manifest.pl` | The manifest of the answers of our own: a base answer changed upstream is caught before the tests turn red, and an answer that equals its base again is asked for removal |
 | `033_multiple_slices.pl` | A root and its self-motion reader are separate READ ONLY transactions with one exported snapshot per segment; a segment-local commit between their starts changes nothing, nested cancellation and statement end close every snapshot holder, and a later write still sees itself |
 | `034_union_locus.pl` | `UNION ALL` and `Append`: compatible hash keys, reversed and compound projections, different hash maps, replicated inputs, sort and limit, a parallel `Gather` removed, `UNION DISTINCT`, `INTERSECT` and `EXCEPT` when equal rows share a hashed locus; mixed replicated/hash and `UNION DISTINCT` without it stay on the coordinator |
@@ -910,18 +836,17 @@ by the patch and `contrib/gp`.
    joins whose graph is not connected by keys, mixed outer and inner levels
    of one fromlist, and queries the rules cannot prove safe — the fallback
    always gives a right answer.
-6. **Interconnect** — in progress: a `GpMotion` custom scan moves tables by
+6. **Motions** — done: a `GpMotion` custom scan moves tables by
    redistribution or broadcast over a serialized-plan transport with binary
    tuples; clean
    gathers and immutable slices use the same transport, while mutable plans,
    special session semantics and a transaction's writes stay on its dispatched
-   connections; the broker of a segment reports its port to the coordinator,
-   so no client computes the address by a rule; multiple slices of one statement
-   on a segment are READ ONLY readers of one exported snapshot, and cancellation
-   follows the whole reader tree; an outer join broadcasts the null-supplying
-   side — in chains of one kind of an outer join as well: a chain of left
-   joins keeps its first table on the segments and broadcasts the rest, and
-   a chain of full joins broadcasts every table to one segment.
+   connections; multiple slices of one statement
+   on a segment are READ ONLY readers of one exported snapshot; an outer join
+   broadcasts the null-supplying side — in chains of one kind of an outer join
+   as well: a chain of left joins keeps its first table on the segments and
+   broadcasts the rest, and a chain of full joins broadcasts every table to
+   one segment.
 7. **Statistics** — implemented for manual `ANALYZE`: relation sizes are
    summed over the segments, attribute statistics are sampled from the first
    segment, and the planner uses the imported cluster sizes.

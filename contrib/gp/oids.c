@@ -68,7 +68,6 @@ typedef struct GpOidList
 char	   *gp_dispatch_oids = NULL;
 bool		gp_dispatch_oids_session = false;
 bool		gp_allow_local_ddl = false;
-bool		gp_transport_libpq = true;
 
 /*
  * Coordinator: OIDs of the current transaction, in TopTransactionContext,
@@ -403,22 +402,6 @@ gp_oids_save_extension(int mark)
 				errmsg("could not install the extension OID file: %m"));
 }
 
-PG_FUNCTION_INFO_V1(gp_interconnect_secret);
-
-Datum
-gp_interconnect_secret(PG_FUNCTION_ARGS)
-{
-	unsigned char bytes[32];
-	char		hex[65];
-
-	if (!pg_strong_random(bytes, sizeof(bytes)))
-		ereport(ERROR,
-				errcode(ERRCODE_INTERNAL_ERROR),
-				errmsg("could not generate the interconnect token"));
-	hex_encode((const char *) bytes, sizeof(bytes), hex);
-	hex[64] = '\0';
-	PG_RETURN_TEXT_P(cstring_to_text(hex));
-}
 
 PG_FUNCTION_INFO_V1(gp_extension_oids);
 

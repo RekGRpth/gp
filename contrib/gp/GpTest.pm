@@ -70,8 +70,8 @@ max_prepared_transactions = 10
 		push @segments, $node;
 	}
 	$coordinator->poll_query_until('postgres',
-		"SELECT count(*) = $nsegments FROM gp.cluster_segments() WHERE interconnect_port IS NOT NULL"
-	  ) or die 'the segments did not report their interconnect ports';
+		"SELECT count(*) = $nsegments FROM gp.cluster_segments()"
+	  ) or die 'the segments did not register';
 	return ($coordinator, @segments);
 }
 

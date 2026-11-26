@@ -72,7 +72,6 @@ like(run('SELECT a FROM t WHERE b IS NULL ORDER BY a LIMIT 3'),
 # the answers above the gather, so the segments must not cut their answers
 # to the limit of the query, or the filters would read rows that were
 # dropped before they saw them
-run('ALTER DATABASE postgres SET gp.transport_libpq = on');
 
 my $filtered = remote_sql('SELECT a FROM t WHERE b IS NULL ORDER BY a LIMIT 3');
 like($filtered, qr/ORDER BY a/, 'the filtered ordered query still sorts remotely');
@@ -100,7 +99,6 @@ is(run('SELECT a, (SELECT t2.c FROM t t2 WHERE t2.a = t.a AND t2.c IS NOT NULL O
 	run('SELECT a, (SELECT l2.c FROM l l2 WHERE l2.a = l.a AND l2.c IS NOT NULL ORDER BY l2.c DESC LIMIT 1) FROM l ORDER BY a LIMIT 15'),
 	'a correlated minmax without an aggregate answers over the libpq merge');
 
-run('ALTER DATABASE postgres RESET gp.transport_libpq');
 
 $_->stop foreach (@segments, $coordinator);
 

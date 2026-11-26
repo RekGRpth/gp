@@ -27,16 +27,6 @@ my ($coordinator, @segments) = start_cluster();
 sub run { return $coordinator->safe_psql('postgres', shift); }
 sub plan_for { return $coordinator->safe_psql('postgres', "EXPLAIN (COSTS OFF) $_[0]"); }
 
-# The workers answer the fragments of the interconnect: the test asks them,
-# so it keeps the interconnect on every node, the pull of a motion reads the
-# setting of the segment's own database
-run('ALTER DATABASE postgres SET gp.transport_libpq = off');
-foreach my $segment (@segments)
-{
-	$segment->safe_psql('postgres',
-		'ALTER DATABASE postgres SET gp.transport_libpq = off');
-}
-
 run('CREATE TABLE c (custkey int, nationkey int)');
 run("SELECT gp.distribute('c', ARRAY['custkey'])");
 run('INSERT INTO c SELECT i, i % 5 FROM generate_series(1, 10) i');
@@ -65,7 +55,7 @@ CREATE EXTENSION injection_points");
 
 my $expected_before = run($query);
 
-# Park every pull worker of this segment before it opens its transaction
+# Park every pull session of this segment before it reads
 $segment->safe_psql('postgres',
 	"SELECT injection_points_attach('gp-interconnect-fragment', 'wait')");
 
@@ -79,12 +69,12 @@ $stdin .= "$query;\n";
 $session->pump_nb while length $stdin;
 $session->pump_nb for 1 .. 50;
 
-# Three parents move the table, so wait for all three workers to park: a
-# worker that reaches the point after the wakeups but before the detach
+# Three parents move the table, so wait for all three pulls to park: a
+# pull that reaches the point after the wakeups but before the detach
 # parks forever
 $segment->poll_query_until('postgres',
-	"SELECT count(*) >= 3 FROM pg_stat_activity WHERE backend_type = 'gp interconnect request' AND wait_event = 'gp-interconnect-fragment'")
-  or BAIL_OUT('three fragment workers did not park: '
+	"SELECT count(*) >= 3 FROM pg_stat_activity WHERE application_name = 'gp motion' AND wait_event = 'gp-interconnect-fragment'")
+  or BAIL_OUT('three fragment pulls did not park: '
 	. $segment->safe_psql('postgres',
 		"SELECT pid || ':' || coalesce(wait_event,'?') || ':' || state FROM pg_stat_activity")
 	. " stdout=$stdout stderr=$stderr");
@@ -100,7 +90,7 @@ UPDATE l SET quantity = quantity + 1000 WHERE orderkey = 1");
 for my $attempt (1 .. 20)
 {
 	my $parked = $segment->safe_psql('postgres',
-		"SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'gp interconnect request' AND wait_event = 'gp-interconnect-fragment'");
+		"SELECT count(*) FROM pg_stat_activity WHERE application_name = 'gp motion' AND wait_event = 'gp-interconnect-fragment'");
 	last if $parked == 0;
 	$segment->safe_psql('postgres',
 		"SELECT injection_points_wakeup('gp-interconnect-fragment');

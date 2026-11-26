@@ -110,59 +110,12 @@ gp_motion_event(void)
 	return gp_motion_wait_event;
 }
 
-/* The connection of the current fetch, for gp_motion_refresh() below */
-static PGconn  *gp_motion_refresh_conn;
-
-/*
- * The registry again: the pull may have taken the port of the broker of the
- * previous run, and the fresh one may have arrived while it waited.  A
- * failure leaves the address as it is, and the pull keeps its answer
- */
-static void
-gp_motion_refresh(GpSegment *segment)
-{
-	PGresult   *res;
-
-	if (gp_motion_refresh_conn == NULL)
-		return;
-	PG_TRY();
-	{
-		res = libpqsrv_exec_params(gp_motion_refresh_conn,
-								   "SELECT segment_id, host, port, interconnect_port FROM gp.cluster_segments()",
-								   0, NULL, NULL, NULL, NULL, 0,
-								   gp_motion_event());
-	}
-	PG_CATCH();
-	{
-		FlushErrorState();
-		gp_motion_refresh_conn = NULL;
-		return;
-	}
-	PG_END_TRY();
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		PQclear(res);
-		return;
-	}
-	for (int i = 0; i < PQntuples(res); i++)
-	{
-		if (atoi(PQgetvalue(res, i, 0)) != segment->segment_id)
-			continue;
-		strlcpy(segment->host, PQgetvalue(res, i, 1), sizeof(segment->host));
-		segment->port = atoi(PQgetvalue(res, i, 2));
-		segment->interconnect_port = PQgetisnull(res, i, 3) ? 0 :
-			atoi(PQgetvalue(res, i, 3));
-		break;
-	}
-	PQclear(res);
-}
-
 /*
  * Read the fragment of every peer in a session of its own: the call of
- * gp.fragment_exec carries the same serialized plan the workers of the
- * interconnect answer, and the peer executes it in an ordinary session,
- * which the snapshots of the statement were attached to.  A failure of one
- * peer cancels what the others still run and fails the pull
+ * gp.fragment_exec carries the same serialized plan the workers answered,
+ * and the peer executes it in an ordinary session, which the snapshots of
+ * the statement were attached to.  A failure of one peer cancels what the
+ * others still run and fails the pull
  */
 static void
 gp_motion_fetch_libpq(Tuplestorestate *store, TupleDesc tupdesc,
@@ -229,13 +182,18 @@ gp_motion_fetch_libpq(Tuplestorestate *store, TupleDesc tupdesc,
 	 * interconnect read it from their request.  The snapshots of the
 	 * statement ride in the same transaction
 	 */
+	/*
+	 * The fragments of one statement are read-only, the way the dispatched
+	 * queries are: an immutable function that hides a write must not write
+	 */
 	if (snapshots != NULL)
-		setup = psprintf("BEGIN; SET gp.requester_segment = %d; %s",
+		setup = psprintf("BEGIN READ ONLY; SET gp.requester_segment = %d; %s",
 						 gp_segment_id,
 						 psprintf("SELECT gp.attach_statement_snapshots('%s')",
 								  gp_snapshots_serialize(snapshots)));
 	else
-		setup = psprintf("SET gp.requester_segment = %d", gp_segment_id);
+		setup = psprintf("SET default_transaction_read_only = on; "
+						 "SET gp.requester_segment = %d", gp_segment_id);
 
 	PG_TRY();
 	{
@@ -280,7 +238,7 @@ gp_motion_fetch_libpq(Tuplestorestate *store, TupleDesc tupdesc,
 						PQresultStatus(res) != PGRES_TUPLES_OK)
 						ereport(ERROR,
 								errcode(ERRCODE_CONNECTION_FAILURE),
-								errmsg("could not attach the statement snapshots on segment %d",
+								errmsg("could not set the session of segment %d up",
 									   wanted[i].segment_id),
 								errdetail_internal("%s",
 												   pchomp(PQresultErrorMessage(res))));
@@ -308,6 +266,8 @@ gp_motion_fetch_libpq(Tuplestorestate *store, TupleDesc tupdesc,
 			{
 				MemoryContext oldcontext;
 
+				CHECK_FOR_INTERRUPTS();
+
 				if (PQresultStatus(res) == PGRES_TUPLES_OK)
 				{
 					PQclear(res);
@@ -320,7 +280,6 @@ gp_motion_fetch_libpq(Tuplestorestate *store, TupleDesc tupdesc,
 								   wanted[i].segment_id),
 							errdetail_internal("%s",
 											   pchomp(PQresultErrorMessage(res))));
-
 				ExecClearTuple(loadslot);
 				oldcontext = MemoryContextSwitchTo(rowcxt);
 				for (int a = 0; a < natts; a++)
@@ -384,7 +343,7 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 	NULL};
 	const char *coord_values[3];
 	char	   *db;
-	GpSnapshots *snapshots = gp_interconnect_snapshots();
+	GpSnapshots *snapshots = gp_fragment_snapshots();
 	PGconn	   *conn;
 	PGresult   *segments;
 
@@ -416,13 +375,10 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 	{
 		bool		reported = true;
 
-		/* The pull of libpq needs no port of a broker, only the peers */
-		bool		need_ports = !gp_transport_libpq;
-
 		if (segments != NULL)
 			PQclear(segments);
 		segments = libpqsrv_exec_params(conn,
-										"SELECT segment_id, host, port, interconnect_port FROM gp.cluster_segments()",
+										"SELECT segment_id, host, port FROM gp.cluster_segments()",
 										0, NULL, NULL, NULL, NULL, 0,
 										gp_motion_event());
 		if (PQresultStatus(segments) != PGRES_TUPLES_OK)
@@ -436,9 +392,7 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 					errmsg("could not read the segments of the cluster"),
 					errdetail("%s", err));
 		}
-		for (int i = 0; i < PQntuples(segments); i++)
-			if (need_ports && PQgetisnull(segments, i, 3))
-				reported = false;
+
 		if (reported || attempt >= 59)
 			break;
 		CHECK_FOR_INTERRUPTS();
@@ -459,27 +413,13 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 			strlcpy(wanted[i].host, PQgetvalue(segments, i, 1),
 					sizeof(wanted[i].host));
 			wanted[i].port = atoi(PQgetvalue(segments, i, 2));
-			wanted[i].interconnect_port = PQgetisnull(segments, i, 3) ? 0 :
-				atoi(PQgetvalue(segments, i, 3));
-			if (!gp_transport_libpq && wanted[i].interconnect_port == 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("segment %d has not reported its interconnect port yet",
-								wanted[i].segment_id)));
+
 		}
-		gp_motion_refresh_conn = conn;
-		if (gp_transport_libpq)
-			gp_motion_fetch_libpq(store, tupdesc, serialized, snapshots,
-								  wanted, nsegments, db,
-								  GetUserNameFromId(GetUserId(), false));
-		else
-			gp_interconnect_pulls(store, tupdesc, db,
-								  GetUserNameFromId(GetUserId(), false),
-								  serialized, gp_segment_id, snapshots,
-								  wanted, nsegments, gp_motion_refresh);
+		gp_motion_fetch_libpq(store, tupdesc, serialized, snapshots,
+							  wanted, nsegments, db,
+							  GetUserNameFromId(GetUserId(), false));
 	}
 
-	gp_motion_refresh_conn = NULL;
 	PQclear(segments);
 	libpqsrv_disconnect(conn);
 }
@@ -739,8 +679,7 @@ gp_peer_query(PG_FUNCTION_ARGS)
 /*
  * Execute the serialized fragment of a query in this session and answer its
  * rows.  The pull of a motion asks every peer for its fragment with this
- * call, in a session of its own, where the workers of the interconnect
- * stood: the guards are the ones the workers kept, and the executor checks
+ * call, in a session of its own: the guards are the ones the workers kept, and the executor checks
  * the permissions of the caller as for any query
  */
 PG_FUNCTION_INFO_V1(gp_fragment_exec);
@@ -776,6 +715,8 @@ gp_fragment_exec(PG_FUNCTION_ARGS)
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				errmsg("the fragment is required"));
 
+	INJECTION_POINT("gp-interconnect-fragment", NULL);
+
 	stmt = (PlannedStmt *) stringToNode(text_to_cstring(PG_GETARG_TEXT_PP(0)));
 	if (!IsA(stmt, PlannedStmt) || stmt->commandType != CMD_SELECT)
 		ereport(ERROR,
@@ -801,6 +742,7 @@ gp_fragment_exec(PG_FUNCTION_ARGS)
 	query = CreateQueryDesc(stmt, "gp.fragment_exec", GetActiveSnapshot(),
 							NULL, dest, NULL, NULL, 0);
 	ExecutorStart(query, 0);
+	INJECTION_POINT("gp-interconnect-reader", NULL);
 	ExecutorRun(query, ForwardScanDirection, 0L);
 	ExecutorFinish(query);
 	ExecutorEnd(query);

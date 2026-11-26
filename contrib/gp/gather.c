@@ -94,10 +94,6 @@ typedef struct GpGatherState
 
 static void gp_gather_append_order(StringInfoData *sql, List *sortkeys,
 								   Oid relid);
-static bool gp_gather_load_one(GpGatherState *state, GpSegment *segment,
-							   int i, GpSnapshots *snapshots, const char *db,
-							   const char *user, TupleDesc tupdesc,
-							   char *plan);
 static int	gp_gather_merge_heap_cmp(Datum a, Datum b, void *arg);
 
 static Node *gp_gather_create_state(CustomScan *cscan);
@@ -107,133 +103,6 @@ static const CustomScanMethods gp_gather_plan_methods = {
 	.CreateCustomScanState = gp_gather_create_state,
 };
 
-/*
- * Read a clean query over the interconnect.  Dropped columns are explicit
- * typed nulls in the fragment, so its answer has the table's full tupledesc.
- * The statement's commit lock covers every remote scan, and every worker
- * imports the snapshot exported for this statement on its own segment.
- */
-static bool
-gp_gather_load_interconnect(GpGatherState *state)
-{
-	ScanState  *ss = &state->css.ss;
-	Relation	rel = ss->ss_currentRelation;
-	TupleDesc	tupdesc = RelationGetDescr(rel);
-	StringInfoData cols;
-	StringInfoData sql;
-	GpSegment  *segments;
-	char	   *plan;
-	char	   *db;
-	GpSnapshots *snapshots;
-	const char *user;
-	int			nsegments;
-	int			only = 0;
-
-	/* The listener does not carry session_user or the session's RLS settings */
-	if (GetUserId() != GetSessionUserId() || rel->rd_rel->relrowsecurity ||
-		rel->rd_rel->relforcerowsecurity)
-		return false;
-
-	initStringInfo(&cols);
-	for (int i = 0; i < tupdesc->natts; i++)
-	{
-		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
-
-		appendStringInfo(&cols, "%s", cols.len > 0 ? ", " : "");
-		if (att->attisdropped)
-			appendStringInfo(&cols, "NULL::pg_catalog.int4 AS %s",
-							 quote_identifier(NameStr(att->attname)));
-		else
-			appendStringInfoString(&cols, quote_identifier(NameStr(att->attname)));
-	}
-	initStringInfo(&sql);
-	appendStringInfo(&sql, "SELECT %s FROM %s%s", cols.data,
-					 state->inherit ? "" : "ONLY ",
-					 quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
-											  RelationGetRelationName(rel)));
-	if (state->sortkeys != NIL)
-		gp_gather_append_order(&sql, state->sortkeys, rel->rd_id);
-	plan = gp_interconnect_plan(sql.data);
-	db = get_database_name(MyDatabaseId);
-	user = GetUserNameFromId(GetUserId(), false);
-	nsegments = gp_segments_get(&segments);
-	if (state->replicated)
-	{
-		if (nsegments == 0)
-			ereport(ERROR,
-					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					errmsg("the cluster has no segments"));
-		only = segments[MyProcPid % nsegments].segment_id;
-	}
-	else if (state->only != 0)
-		only = state->only;
-
-	/* A segment whose broker has not reported its port is not ready yet */
-	for (int i = 0; i < nsegments; i++)
-	{
-		if (only != 0 && segments[i].segment_id != only)
-			continue;
-		if (segments[i].interconnect_port == 0)
-			return false;
-	}
-
-	snapshots = gp_dtx_statement_snapshots(ss->ps.state);
-	if (snapshots == NULL)
-		return false;
-
-	/*
-	 * The merge reads one sorted segment after another: every store holds
-	 * the sorted answer of its segment, and the gather hands out the rows
-	 * in the order of the query without sorting anything here
-	 */
-	if (state->sortkeys != NIL)
-	{
-		state->nstores = 0;
-		state->stores = palloc_array(Tuplestorestate *, nsegments);
-		state->peeks = palloc_array(TupleTableSlot *, nsegments);
-		for (int i = 0; i < nsegments; i++)
-		{
-			if (only != 0 && segments[i].segment_id != only)
-				continue;
-			gp_gather_load_one(state, &segments[i], state->nstores,
-							   snapshots, db, user, tupdesc, plan);
-			state->peeks[state->nstores] =
-				MakeSingleTupleTableSlot(tupdesc, &TTSOpsMinimalTuple);
-			if (tuplestore_gettupleslot(state->stores[state->nstores], true,
-										true, state->peeks[state->nstores]))
-				state->nstores++;
-			else
-				tuplestore_end(state->stores[state->nstores]);
-		}
-		if (state->nstores == 0)
-			state->stores = NULL;
-		else
-		{
-			state->heap = binaryheap_allocate(state->nstores,
-											  gp_gather_merge_heap_cmp, state);
-			for (int i = 0; i < state->nstores; i++)
-				binaryheap_add(state->heap, Int32GetDatum(i));
-		}
-		return true;
-	}
-
-	state->store = tuplestore_begin_heap(true, false, work_mem);
-	{
-		GpSegment  *wanted = palloc_array(GpSegment, nsegments);
-		int			nwanted = 0;
-
-		for (int i = 0; i < nsegments; i++)
-		{
-			if (only != 0 && segments[i].segment_id != only)
-				continue;
-			wanted[nwanted++] = segments[i];
-		}
-		gp_interconnect_pulls(state->store, tupdesc, db, user, plan, 0,
-							  snapshots, wanted, nwanted,
-							  gp_segments_refresh);
-	}
-	return true;
-}
 
 /*
  * A dispatched connection is still needed to see this transaction's writes.
@@ -395,6 +264,8 @@ gp_gather_load_libpq(GpGatherState *state)
 	{
 		MemoryContext oldcontext;
 
+		CHECK_FOR_INTERRUPTS();
+
 		if (PQnfields(res) != ncols)
 			ereport(ERROR,
 					errcode(ERRCODE_DATA_CORRUPTED),
@@ -443,19 +314,6 @@ static void
 gp_gather_load(GpGatherState *state)
 {
 	gp_dtx_statement_start(state->css.ss.ps.state);
-	if (!gp_transport_libpq &&
-		XactIsoLevel == XACT_READ_COMMITTED && !gp_dispatch_in_xact() &&
-		gp_gather_load_interconnect(state))
-		return;
-	if (state->sortkeys != NIL && !gp_transport_libpq)
-		/*
-		 * The order of the query is promised by the merge of the segments'
-		 * sorted answers, and over libpq the gather merges them only under
-		 * gp.transport_libpq
-		 */
-		ereport(ERROR,
-				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				errmsg("the sorted gather needs the interconnect"));
 	gp_gather_load_libpq(state);
 }
 
@@ -530,17 +388,6 @@ gp_gather_merge_heap_cmp(Datum a, Datum b, void *arg)
 	return cmp == 0 ? 0 : -cmp;
 }
 
-/* Load one segment into its own sorted store */
-static bool
-gp_gather_load_one(GpGatherState *state, GpSegment *segment, int i,
-				   GpSnapshots *snapshots, const char *db, const char *user,
-				   TupleDesc tupdesc, char *plan)
-{
-	state->stores[i] = tuplestore_begin_heap(true, false, work_mem);
-	gp_interconnect_pulls(state->stores[i], tupdesc, db, user, plan, 0,
-						  snapshots, segment, 1, gp_segments_refresh);
-	return true;
-}
 
 /*
  * The answer of the gather is the merge of the segments' sorted stores: the

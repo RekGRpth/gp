@@ -305,7 +305,7 @@ $_->restart foreach @segments;
 $seg1->wait_for_log(qr/registered as segment 1/);
 $seg2->wait_for_log(qr/registered as segment 2/);
 is(run('SET ROLE app; SELECT count(*) FROM d'), 510,
-	'a NOLOGIN role can execute the first interconnect request');
+	'a NOLOGIN role can execute the first distributed query');
 
 $_->stop foreach (@segments, $coordinator);
 

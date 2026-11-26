@@ -1576,7 +1576,13 @@ gp_query_start(const char *sql, int only, GpSnapshots *snapshots)
 
 			if (!entries[i]->in_xact)
 			{
-				command = psprintf("BEGIN; %s", attach);
+				/*
+				 * The fragment of a read query runs read-only, the way
+				 * the interconnect workers ran their fragments: a write
+				 * hidden behind an immutable function must not slip
+				 * through
+				 */
+				command = psprintf("BEGIN READ ONLY; %s", attach);
 				query->local[i] = true;
 			}
 			if (!PQsendQuery(conn, command))
