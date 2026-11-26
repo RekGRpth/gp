@@ -9,9 +9,9 @@ OBJS = \
 	dispatch.o \
 	distribution.o \
 	gather.o \
+	fragment.o \
 	gp.o \
 	insert.o \
-	interconnect.o \
 	logs.o \
 	motion.o \
 	oids.o \
