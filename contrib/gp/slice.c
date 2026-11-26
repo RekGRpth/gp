@@ -6021,6 +6021,44 @@ gp_slice_extern_param_walker(Node *node, void *context)
 	return expression_tree_walker(node, gp_slice_extern_param_walker, context);
 }
 
+/* The checker of contain_mutable_functions(): a function of no immutability */
+static bool
+gp_partial_mutable_checker(Oid func_id, void *context)
+{
+	return func_volatile(func_id) != PROVOLATILE_IMMUTABLE;
+}
+
+/* The checker of contain_mutable_functions(), over a part of the query */
+static bool
+gp_partial_mutable_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+
+	/*
+	 * The segment of the row is the value of one server: it answers the
+	 * same on every row of the server, and the SQL of the fragment keeps
+	 * it as it is
+	 */
+	if (IsA(node, FuncExpr) &&
+		((FuncExpr *) node)->funcid == *(Oid *) context)
+		return false;
+	if (check_functions_in_node(node, gp_partial_mutable_checker, NULL))
+		return true;
+
+	/* These nodes need the rules of contain_mutable_functions() too.  Be
+	 * conservative rather than duplicate its detailed JSON and XML rules. */
+	if (IsA(node, SQLValueFunction) || IsA(node, NextValueExpr) ||
+		IsA(node, JsonConstructorExpr) || IsA(node, JsonExpr) ||
+		IsA(node, XmlExpr))
+		return true;
+
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, gp_partial_mutable_walker,
+								 context, 0);
+	return expression_tree_walker(node, gp_partial_mutable_walker, context);
+}
+
 /*
  * Whether the parts of the query that move to the segments verbatim answer
  * differently there: volatile functions read the state of the server they
@@ -6029,23 +6067,27 @@ gp_slice_extern_param_walker(Node *node, void *context)
 static bool
 gp_partial_mutable_parts(Query *parse, GpPartialState *state)
 {
+	Oid			segment_fn;
 	ListCell   *lc;
 
+	segment_fn = DatumGetObjectId(DirectFunctionCall1(regprocedurein,
+			CStringGetDatum("gp.segment_id()")));
 	if (parse->jointree->quals != NULL &&
-		contain_mutable_functions(parse->jointree->quals))
+		gp_partial_mutable_walker(parse->jointree->quals, &segment_fn))
 		return true;
 	foreach(lc, state->aggs)
 	{
 		GpPartialAgg *partial = lfirst(lc);
 
-		if (contain_mutable_functions((Node *) partial->aggref->args))
+		if (gp_partial_mutable_walker((Node *) partial->aggref->args,
+									  &segment_fn))
 			return true;
 	}
 	foreach(lc, state->avgs)
 	{
 		GpPartialAvg *pa = lfirst(lc);
 
-		if (contain_mutable_functions((Node *) pa->aggref->args))
+		if (gp_partial_mutable_walker((Node *) pa->aggref->args, &segment_fn))
 			return true;
 	}
 	return false;
@@ -6754,6 +6796,48 @@ gp_slice_agg_two_phase(Query *parse, Agg *agg, Plan *below)
 }
 
 /*
+ * Whether a grouping key of the query is, or reads, the segment itself:
+ * gp.segment_id() is the value of one server, so a group keyed by it keeps
+ * whole on that server, whatever the rest of the key is
+ */
+static bool
+gp_slice_segment_fn_checker(Oid func_id, void *context)
+{
+	return func_id == *(Oid *) context;
+}
+
+static bool
+gp_slice_segment_key(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (check_functions_in_node(node, gp_slice_segment_fn_checker, context))
+		return true;
+	return expression_tree_walker(node, gp_slice_segment_key, context);
+}
+
+static bool
+gp_slice_segment_keys(Query *parse)
+{
+	Oid			fn;
+	ListCell   *lc;
+
+	if (parse->groupClause == NIL)
+		return false;
+	fn = DatumGetObjectId(DirectFunctionCall1(regprocedurein,
+											  CStringGetDatum("gp.segment_id()")));
+	foreach(lc, parse->groupClause)
+	{
+		TargetEntry *tle = get_sortgroupclause_tle(lfirst_node(SortGroupClause, lc),
+												   parse->targetList);
+
+		if (tle != NULL && gp_slice_segment_key((Node *) tle->expr, &fn))
+			return true;
+	}
+	return false;
+}
+
+/*
  * Answer an aggregate query in two steps, when the whole of it cannot run
  * on the segments: the segments aggregate their own rows — grouped by the
  * grouping of the query, or all rows together when there is none — and the
@@ -6776,7 +6860,11 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 	GpPartialState state;
 	RangeTblRef *ref;
 	ListCell   *lc;
+	Plan	   *parent = NULL;
+	bool		sort_above = false;
+	bool		hashable = true;
 	Agg		   *agg;
+	Plan	   *below;
 	Query	   *remote;
 
 	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
@@ -6836,11 +6924,33 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 	/* Find the aggregate of the plan, below the sort and the limit of it */
 	while (plan != NULL && (IsA(plan, Sort) || IsA(plan, Limit) ||
 							IsA(plan, Result)))
+	{
+		if (IsA(plan, Sort))
+			sort_above = true;
+		parent = plan;
 		plan = plan->lefttree;
+	}
 	if (plan == NULL || !IsA(plan, Agg))
 		return;
 	agg = (Agg *) plan;
-	if (!gp_is_gather(agg->plan.lefttree))
+
+	/*
+	 * A sorted aggregate (answering the ORDER BY of the query by its own
+	 * grouping) sorts its input before the gather.  A group of it may live
+	 * on several segments, whose partials arrive apart, and the combine
+	 * merge of such an aggregate joins neighbors, not the whole group.
+	 * Only a grouping that keeps every group on one segment can take the
+	 * shape: the grouping by the segment itself does, for the partials of
+	 * its groups arrive together
+	 */
+	below = agg->plan.lefttree;
+	if (gp_slice_segment_keys(parse))
+	{
+		while (below != NULL && (IsA(below, Sort) ||
+								 IsA(below, IncrementalSort)))
+			below = below->lefttree;
+	}
+	if (below == NULL || !gp_is_gather(below))
 		return;
 	if (agg->numCols != list_length(parse->groupClause))
 		return;
@@ -6955,9 +7065,43 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 			if (uniform)
 				only = policy.map[0];
 		}
-		(void) gp_slice_partial_finish(agg, &state, remote, false,
-									  parse->targetList,
-									  (List *) parse->havingQual, only);
+		if (!gp_slice_partial_finish(agg, &state, remote, false,
+									 parse->targetList,
+									 (List *) parse->havingQual, only))
+			return;
+
+		/*
+		 * Partial groups of one key arrive from different segments in the
+		 * order of their answers: a hash aggregate takes them in any
+		 * order, a sorted one joins neighbors only.  The grouping by the
+		 * segment keeps every group on one segment, whose partials arrive
+		 * together.  The keys of a hashed type take the hash aggregate;
+		 * the rest keep the sorted one of the planner
+		 */
+		foreach(lc, state.keys)
+		{
+			GpPartialKey *key = lfirst(lc);
+
+			if (!gp_slice_hashable(exprType((Node *) key->expr)))
+			{
+				hashable = false;
+				break;
+			}
+		}
+		if (hashable)
+			agg->aggstrategy = AGG_HASHED;
+		if (parse->sortClause != NIL && !sort_above)
+		{
+			Sort	   *sort = make_sort_from_sortclauses(parse->sortClause,
+														  &agg->plan);
+
+			gp_slice_sort_target(parse, sort);
+
+			if (parent == NULL)
+				stmt->planTree = &sort->plan;
+			else
+				parent->lefttree = &sort->plan;
+		}
 	}
 }
 

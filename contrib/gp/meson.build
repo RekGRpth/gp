@@ -117,6 +117,7 @@ tests += {
       't/057_merge_gather.pl',
       't/058_qgen.pl',
       't/059_slices_cancel.pl',
+      't/060_segment_id.pl',
     ],
   },
 }
