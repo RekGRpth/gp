@@ -1724,8 +1724,42 @@ gp_slice_union_plan(Query *original, PlannedStmt *stmt)
 }
 
 /*
+ * The literal value of a limit or an offset expression, or 0 with *ok false
+ * when the expression is not a literal: a Const of int8 or int4, or the
+ * parser's int8(int4) coercion call over such a Const (the shape
+ * transformLimitOffset builds for an untyped literal)
+ */
+static int64
+gp_limit_value(const Node *node, bool *ok)
+{
+	const Const *c = NULL;
+
+	*ok = false;
+	if (node != NULL && IsA(node, Const))
+		c = (const Const *) node;
+	else if (node != NULL && IsA(node, FuncExpr))
+	{
+		const FuncExpr *func = (const FuncExpr *) node;
+
+		if (func->funcformat == COERCE_IMPLICIT_CAST &&
+			func->funcresulttype == INT8OID &&
+			list_length(func->args) == 1 &&
+			IsA(linitial(func->args), Const))
+			c = (const Const *) linitial(func->args);
+	}
+	if (c == NULL || c->constisnull ||
+		(c->consttype != INT8OID && c->consttype != INT4OID))
+		return 0;
+	*ok = true;
+	return c->consttype == INT8OID ?
+		DatumGetInt64(c->constvalue) :
+		(int64) DatumGetInt32(c->constvalue);
+}
+
+/*
  * A scan that runs a query on the segments: its target list is that of the
- * plan it replaces, and its SQL is the query without its sort and limit
+ * plan it replaces, and its SQL is the query without its sort; a literal
+ * limit of the query rides along
  */
 static CustomScan *
 gp_slice_make(Plan *src, Query *original, bool replicated, bool motion,
@@ -1738,6 +1772,7 @@ gp_slice_make(Plan *src, Query *original, bool replicated, bool motion,
 	List	   *tlist = NIL;
 	ListCell   *lc;
 	int			pos = 0;
+	char	   *limits = NULL;
 
 	/*
 	 * A junk column is a grouping or a sort key that is not selected.  With
@@ -1780,6 +1815,34 @@ gp_slice_make(Plan *src, Query *original, bool replicated, bool motion,
 	remote->limitCount = NULL;
 	remote->limitOffset = NULL;
 
+	/*
+	 * A literal LIMIT of the query rides to the slice: every dispatched
+	 * session streams the top rows of its own share of the join, and the
+	 * coordinator's limit cuts the union, instead of decoding the whole
+	 * product of the join into the store first.  The limit of the plan
+	 * stays above the slice, so the union is cut again on the coordinator:
+	 * without an ORDER BY any rows satisfy the limit, so the earlier cut
+	 * stays correct; with one the sort stays above and the per-segment cut
+	 * would break it, so the limit rides only for a query without a sort.
+	 * A compound query needs its limit inside the arms, not after the last
+	 * one, so it keeps the limit above as well.  The offset adds to the
+	 * count: the coordinator cuts the offset off the union after the limit.
+	 */
+	if (sortClause == NIL && original->setOperations == NULL)
+	{
+		bool		limit_ok = false;
+		bool		offset_ok = false;
+		int64		count = gp_limit_value(original->limitCount, &limit_ok);
+		int64		offset = gp_limit_value(original->limitOffset, &offset_ok);
+
+		/* A negative limit is no limit, a negative offset skips nothing */
+		if (limit_ok && count > 0 && (!original->limitOffset ||
+									  (offset_ok && offset >= 0)) &&
+			offset <= PG_INT64_MAX - count)
+			limits = psprintf(" LIMIT %lld",
+							  (long long) (offset + count));
+	}
+
 	foreach(lc, srctlist)
 	{
 		TargetEntry *tle = lfirst_node(TargetEntry, lc);
@@ -1806,7 +1869,9 @@ gp_slice_make(Plan *src, Query *original, bool replicated, bool motion,
 	cscan->scan.plan.plan_rows = src->plan_rows;
 	cscan->scan.plan.plan_width = src->plan_width;
 	cscan->custom_scan_tlist = copyObject(origtlist);
-	cscan->custom_private = list_make4(makeString(pg_get_querydef(remote, false)),
+	cscan->custom_private = list_make4(makeString(psprintf("%s%s",
+														   pg_get_querydef(remote, false),
+														   limits ? limits : "")),
 									   makeBoolean(replicated),
 									   makeBoolean(motion),
 									   makeBoolean(gp_slice_autonomous(remote)));
