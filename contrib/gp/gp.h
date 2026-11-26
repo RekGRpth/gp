@@ -204,6 +204,7 @@ extern void gp_oids_keep(bool keep);
 extern char *gp_oids_since(int mark);
 extern void gp_oids_save_extension(int mark);
 extern bool gp_oids_depend_on_local(int mark);
+extern Oid	gp_oids_extension_oid(const char *list, Oid extcatalog);
 
 /* ddl.c */
 extern bool gp_dispatch_ddl;

@@ -82,6 +82,33 @@ $coordinator->poll_query_until('postgres',
   or die 'segment 1 did not register again';
 pass('a restarted segment registers again');
 
+# The extension of the coordinator is recreated: a restarting segment
+# drops its copy with the OIDs of the older creation and creates it again
+# with the OIDs the coordinator has now
+$coordinator->safe_psql('postgres', 'DROP EXTENSION gp');
+$coordinator->safe_psql('postgres', 'CREATE EXTENSION gp');
+my $coordinator_ext_oid = $coordinator->safe_psql('postgres',
+	'SELECT oid FROM pg_extension WHERE extname = \'gp\'');
+my $stale_ext_oid = $seg1->safe_psql('postgres',
+	'SELECT oid FROM pg_extension WHERE extname = \'gp\'');
+isnt($stale_ext_oid, $coordinator_ext_oid,
+	'the recreation left the segment with stale OIDs');
+$_->restart foreach @segments;
+foreach my $segment (@segments)
+{
+	$segment->poll_query_until('postgres',
+		"SELECT oid = $coordinator_ext_oid FROM pg_extension WHERE extname = 'gp'")
+	  or die 'the segment did not reconcile its extension';
+}
+pass('a restarting segment recreates its extension with the OIDs of the coordinator');
+is( $seg1->safe_psql('postgres', "SELECT 'gp.segments'::regclass::oid"),
+	$coordinator->safe_psql('postgres', "SELECT 'gp.segments'::regclass::oid"),
+	'the tables of the extension share the OIDs of the coordinator');
+$coordinator->poll_query_until('postgres',
+	'SELECT count(*) = 2 FROM gp.segments')
+  or die 'the reconciled segments did not register again';
+pass('a reconciled segment registers again');
+
 # The coordinator has gp, but its OID file was lost: do not register a
 # segment that would have no SQL functions with matching OIDs
 my $oidfile = $coordinator->data_dir . '/gp_extension_oids';
