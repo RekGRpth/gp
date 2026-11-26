@@ -115,6 +115,7 @@ tests += {
       't/055_two_phase_agg.pl',
       't/056_tpcds.pl',
       't/057_merge_gather.pl',
+      't/058_qgen.pl',
     ],
   },
 }
