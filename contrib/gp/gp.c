@@ -16,6 +16,8 @@
 #include <limits.h>
 
 #include "catalog/catalog.h"
+#include "catalog/pg_extension_d.h"
+#include "catalog/pg_namespace_d.h"
 #include "access/xact.h"
 #include "executor/spi.h"
 #include "fmgr.h"
@@ -342,6 +344,22 @@ gp_coordinator_conninfo(void)
 }
 
 /*
+ * Create the SQL part of the extension, with the OIDs the coordinator
+ * recorded at its creation
+ */
+static void
+gp_segment_extension_create(const char *oids)
+{
+	if (SPI_execute("SET gp.dispatch_oids_session = on", false, 0) != SPI_OK_UTILITY ||
+		SPI_execute(psprintf("SET gp.dispatch_oids = %s",
+							 quote_literal_cstr(oids)), false, 0) != SPI_OK_UTILITY ||
+		SPI_execute("CREATE EXTENSION gp", false, 0) != SPI_OK_UTILITY)
+		ereport(ERROR,
+				errmsg("could not create extension gp on segment %d",
+					   gp_segment_id));
+}
+
+/*
  * Create the SQL part of the extension on a segment, with the actual OIDs
  * recorded by the coordinator at its creation
  */
@@ -350,13 +368,15 @@ gp_segment_extension(PGconn *conn)
 {
 	PGresult   *res;
 	char	   *oids;
+	bool		isnull;
+	Datum		extoid;
 
 	BackgroundWorkerInitializeConnection(gp_database, NULL, 0);
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
-	if (SPI_execute("SELECT 1 FROM pg_extension WHERE extname = 'gp'",
+	if (SPI_execute("SELECT oid FROM pg_extension WHERE extname = 'gp'",
 					true, 1) != SPI_OK_SELECT)
 		ereport(ERROR,
 				errmsg("could not look for extension gp on segment %d",
@@ -378,21 +398,66 @@ gp_segment_extension(PGconn *conn)
 			return;
 		}
 		PQclear(res);
-		res = libpqsrv_exec_params(conn, "SELECT gp.extension_oids()",
+		res = libpqsrv_exec_params(conn,
+								   "SELECT gp.extension_oids(), extnamespace "
+								   "FROM pg_extension WHERE extname = 'gp'",
 								   0, NULL, NULL, NULL, NULL, 0, 0);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1 ||
 			PQgetisnull(res, 0, 0))
 			ereport(ERROR,
 					errmsg("could not read extension OIDs on the coordinator"));
 		oids = pstrdup(PQgetvalue(res, 0, 0));
+
+		/*
+		 * The schema of the control file depends on the extension but is
+		 * not a member of it: DROP EXTENSION leaves it on the coordinator,
+		 * and a recreate of the extension there records no OID of it.  A
+		 * segment without the schema takes the OID of the schema of the
+		 * coordinator, so the replay of a fresh segment agrees with the
+		 * replay of a recreated one
+		 */
+		if (gp_oids_extension_oid(oids, NamespaceRelationId) == InvalidOid &&
+			!PQgetisnull(res, 0, 1))
+			oids = psprintf("%u:%u,%s", (unsigned) NamespaceRelationId,
+							(unsigned) strtoul(PQgetvalue(res, 0, 1), NULL, 10),
+							oids);
 		PQclear(res);
-		if (SPI_execute("SET gp.dispatch_oids_session = on", false, 0) != SPI_OK_UTILITY ||
-			SPI_execute(psprintf("SET gp.dispatch_oids = %s",
-								 quote_literal_cstr(oids)), false, 0) != SPI_OK_UTILITY ||
-			SPI_execute("CREATE EXTENSION gp", false, 0) != SPI_OK_UTILITY)
+		gp_segment_extension_create(oids);
+	}
+	else
+	{
+		/*
+		 * The extension is here already.  Its OIDs must be the ones the
+		 * coordinator has now: a recreate of the extension there left the
+		 * copy of the segment with the OIDs of the older creation, so it
+		 * is dropped and created again with the list of the coordinator,
+		 * in one transaction: a failure puts the old copy back
+		 */
+		extoid = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+							   1, &isnull);
+		res = libpqsrv_exec_params(conn, "SELECT gp.extension_oids()",
+								   0, NULL, NULL, NULL, NULL, 0, 0);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1)
 			ereport(ERROR,
-					errmsg("could not create extension gp on segment %d",
-						   gp_segment_id));
+					errmsg("could not read extension OIDs on the coordinator"));
+		if (!PQgetisnull(res, 0, 0))
+		{
+			oids = pstrdup(PQgetvalue(res, 0, 0));
+			if (gp_oids_extension_oid(oids, ExtensionRelationId) !=
+				DatumGetObjectId(extoid))
+			{
+				ereport(LOG,
+						errmsg("the extension gp of segment %d has the OIDs of an older creation",
+							   gp_segment_id),
+						errdetail("The coordinator has recreated the extension; the segment creates it again."));
+				if (SPI_execute("DROP EXTENSION gp", false, 0) != SPI_OK_UTILITY)
+					ereport(ERROR,
+							errmsg("could not drop extension gp on segment %d",
+								   gp_segment_id));
+				gp_segment_extension_create(oids);
+			}
+		}
+		PQclear(res);
 	}
 	PopActiveSnapshot();
 	SPI_finish();

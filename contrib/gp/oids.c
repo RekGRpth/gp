@@ -505,3 +505,36 @@ gp_recorded_oids(PG_FUNCTION_ARGS)
 
 	PG_RETURN_TEXT_P(cstring_to_text(gp_oids_since(0)));
 }
+
+/*
+ * The OID of the extension row in a list of gp.extension_oids(): the pair
+ * whose catalog is the given one.  InvalidOid when the list does not hold
+ * such a pair, or is not a list of pairs at all
+ */
+Oid
+gp_oids_extension_oid(const char *list, Oid extcatalog)
+{
+	const char *p = list;
+
+	while (*p != '\0')
+	{
+		char	   *end;
+		unsigned long catalog;
+		unsigned long oid;
+
+		errno = 0;
+		catalog = strtoul(p, &end, 10);
+		if (end == p || *end != ':' || errno != 0 ||
+			catalog > PG_UINT32_MAX)
+			return InvalidOid;
+		p = end + 1;
+		oid = strtoul(p, &end, 10);
+		if (end == p || (*end != ',' && *end != '\0') || errno != 0 ||
+			oid > PG_UINT32_MAX)
+			return InvalidOid;
+		if ((Oid) catalog == extcatalog)
+			return (Oid) oid;
+		p = *end == ',' ? end + 1 : end;
+	}
+	return InvalidOid;
+}
