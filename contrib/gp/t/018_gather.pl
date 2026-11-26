@@ -157,7 +157,7 @@ sub insert_blocked
 		"\\echo start\nINSERT INTO d (a) VALUES ($value);\n");
 	$coordinator->poll_query_until('postgres',
 		"SELECT count(*) = 1 FROM pg_stat_activity
-		 WHERE wait_event = 'gp dtx' AND backend_type = 'client backend'")
+		 WHERE wait_event = 'GpDtxGate' AND backend_type = 'client backend'")
 	  or die 'the writer does not wait for the repeatable read';
 	return $writer;
 }

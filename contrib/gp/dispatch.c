@@ -51,6 +51,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "replication/message.h"
+#include "storage/condition_variable.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/builtins.h"
@@ -106,19 +107,44 @@ static bool prepared_any = false;
 static GpSegment *copy_segments = NULL;
 static int	copy_nsegments = 0;
 
-/* The lock of the distributed snapshot, and whether this backend holds it */
-static struct
+/*
+ * The gate of the distributed snapshot.  The queries of the cluster take
+ * their snapshots while no distributed commit runs, and a pass of the
+ * recovery resolves nothing while a commit runs.  A query once held the
+ * lock of the gate for its whole run, but a lock held across the wait
+ * for the rows of a segment defers the interrupts of the query, for the
+ * server processes none while any LWLock is held: a segment that stopped
+ * answering made the statement uncancelable and froze the commits of the
+ * whole cluster behind it.  The gate counts its readers instead, and the
+ * exclusive side waits them out, so a query that waits for its segments
+ * holds no lock and takes its cancel
+ */
+typedef struct GpDtxShared
 {
-	LWLock		lock;
-}		   *dtx_shared = NULL;
+	LWLock		lock;			/* guards the fields below, held briefly */
+	int			nreaders;		/* the queries excluding commits right now */
+	int			nexclusive;		/* the commits and the recovery passes inside */
+	ConditionVariable cv_readers;	/* the exclusive side drains the readers */
+	ConditionVariable cv_exclusive; /* the waiters of the gate */
+} GpDtxShared;
+static GpDtxShared *dtx_shared = NULL;
 static bool dtx_held = false;
 static bool dtx_xact_held = false;
 
-/* Estates whose remote scans share one distributed commit-exclusion lock */
+/* Whether a query of this backend is inside the gate already: a query
+ * inside the gate enters again without waiting, the way a second shared
+ * lock of the old gate did */
+static int	dtx_gate_inside = 0;
+
+/* The wait event of the sleeps of the gate */
+static uint32 dtx_gate_wait_event = 0;
+
+/* Estates whose remote scans share one distributed commit-exclusion gate */
 typedef struct GpDtxStatement
 {
 	EState	   *estate;
 	GpSnapshots *snapshots;
+	bool		inside;			/* the gate counts this statement */
 } GpDtxStatement;
 static List *dtx_statements = NIL;
 static ExecutorEnd_hook_type prev_executor_end = NULL;
@@ -375,6 +401,8 @@ static void
 gp_dispatch_shmem_init(void *arg)
 {
 	LWLockInitialize(&dtx_shared->lock, LWLockNewTrancheId("gp dtx"));
+	ConditionVariableInit(&dtx_shared->cv_readers);
+	ConditionVariableInit(&dtx_shared->cv_exclusive);
 }
 
 /*
@@ -387,35 +415,117 @@ gp_dispatch_in_xact(void)
 	return ndispatched > 0;
 }
 
+/* The wait event of the sleeps of the gate */
+static uint32
+gp_dtx_gate_event(void)
+{
+	if (dtx_gate_wait_event == 0)
+		dtx_gate_wait_event = WaitEventExtensionNew("GpDtxGate");
+	return dtx_gate_wait_event;
+}
+
 /*
- * The lock of the distributed snapshot, for the recovery worker: a pass
- * of it takes the lock too, and resolves nothing while a commit runs
+ * The exclusive side of the gate: a commit of a distributed transaction
+ * from its prepare to its commit prepared, or a pass of the recovery.
+ * One exclusive side waits out the other, the way the old lock made
+ * them wait, and waits the readers out; neither wait takes an
+ * interrupt, for the commit is atomic
  */
 void
-gp_dtx_lock(void)
+gp_dtx_exclusive_enter(void)
 {
+	bool		sleeping = false;
+
 	LWLockAcquire(&dtx_shared->lock, LW_EXCLUSIVE);
+	while (dtx_shared->nexclusive > 0)
+	{
+		if (!sleeping)
+		{
+			ConditionVariablePrepareToSleep(&dtx_shared->cv_exclusive);
+			sleeping = true;
+		}
+		LWLockRelease(&dtx_shared->lock);
+		(void) ConditionVariableSleep(&dtx_shared->cv_exclusive,
+									  gp_dtx_gate_event());
+		LWLockAcquire(&dtx_shared->lock, LW_EXCLUSIVE);
+	}
+	if (sleeping)
+		ConditionVariableCancelSleep();
+	dtx_shared->nexclusive++;
+	ConditionVariableBroadcast(&dtx_shared->cv_exclusive);
+	ConditionVariablePrepareToSleep(&dtx_shared->cv_readers);
+	while (dtx_shared->nreaders > 0)
+	{
+		LWLockRelease(&dtx_shared->lock);
+		(void) ConditionVariableSleep(&dtx_shared->cv_readers,
+									  gp_dtx_gate_event());
+		LWLockAcquire(&dtx_shared->lock, LW_EXCLUSIVE);
+	}
+	LWLockRelease(&dtx_shared->lock);
+	ConditionVariableCancelSleep();
 }
 
 void
-gp_dtx_unlock(void)
+gp_dtx_exclusive_exit(void)
 {
+	LWLockAcquire(&dtx_shared->lock, LW_EXCLUSIVE);
+	Assert(dtx_shared->nexclusive > 0);
+	dtx_shared->nexclusive--;
+	if (dtx_shared->nexclusive == 0)
+		ConditionVariableBroadcast(&dtx_shared->cv_exclusive);
 	LWLockRelease(&dtx_shared->lock);
 }
 
-/* Keep distributed commits away while an interconnect query takes snapshots */
+/*
+ * The reader side of the gate: a query from its start to its end.  A
+ * query of a backend inside the gate enters again without waiting, and
+ * a query that arrives while the exclusive side is inside waits it out,
+ * interruptibly, like the rest of its run
+ */
 void
-gp_dtx_read_lock(void)
+gp_dtx_read_enter(void)
 {
-	LWLockAcquire(&dtx_shared->lock, LW_SHARED);
+	if (dtx_gate_inside > 0)
+	{
+		LWLockAcquire(&dtx_shared->lock, LW_EXCLUSIVE);
+		dtx_shared->nreaders++;
+		LWLockRelease(&dtx_shared->lock);
+	}
+	else
+	{
+		LWLockAcquire(&dtx_shared->lock, LW_EXCLUSIVE);
+		if (dtx_shared->nexclusive == 0)
+		{
+			dtx_shared->nreaders++;
+			LWLockRelease(&dtx_shared->lock);
+			dtx_gate_inside++;
+			return;
+		}
+		ConditionVariablePrepareToSleep(&dtx_shared->cv_exclusive);
+		while (dtx_shared->nexclusive > 0)
+		{
+			LWLockRelease(&dtx_shared->lock);
+			(void) ConditionVariableSleep(&dtx_shared->cv_exclusive,
+										  gp_dtx_gate_event());
+			LWLockAcquire(&dtx_shared->lock, LW_EXCLUSIVE);
+		}
+		ConditionVariableCancelSleep();
+		dtx_shared->nreaders++;
+		LWLockRelease(&dtx_shared->lock);
+	}
+	dtx_gate_inside++;
 }
 
 void
-gp_dtx_read_unlock(void)
+gp_dtx_read_exit(void)
 {
-	/* ERROR resets the holdoff before entering a cleanup */
-	if (InterruptHoldoffCount == 0)
-		HOLD_INTERRUPTS();
+	Assert(dtx_gate_inside > 0);
+	dtx_gate_inside--;
+	LWLockAcquire(&dtx_shared->lock, LW_EXCLUSIVE);
+	Assert(dtx_shared->nreaders > 0);
+	dtx_shared->nreaders--;
+	if (dtx_shared->nexclusive > 0 && dtx_shared->nreaders == 0)
+		ConditionVariableBroadcast(&dtx_shared->cv_readers);
 	LWLockRelease(&dtx_shared->lock);
 }
 
@@ -554,10 +664,11 @@ gp_dtx_statement_start(EState *estate)
 
 	if (gp_dtx_statement_find(estate) != NULL)
 		return;
-	gp_dtx_read_lock();
+	gp_dtx_read_enter();
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 	statement = palloc0(sizeof(*statement));
 	statement->estate = estate;
+	statement->inside = true;
 	dtx_statements = lappend(dtx_statements, statement);
 	MemoryContextSwitchTo(oldcontext);
 }
@@ -582,11 +693,35 @@ gp_dtx_statement_end(EState *estate)
 
 	if (statement == NULL)
 		return;
+	if (statement->inside)
+	{
+		gp_dtx_read_exit();
+		statement->inside = false;
+	}
 	gp_snapshots_free(statement->snapshots);
 	dtx_statements = list_delete_ptr(dtx_statements, statement);
 	pfree(statement);
-	if (LWLockHeldByMe(&dtx_shared->lock))
-		gp_dtx_read_unlock();
+}
+
+/*
+ * The statements that an error stopped leave the gate: the abort of the
+ * transaction releases no lock of it
+ */
+static void
+gp_dtx_statements_exit(void)
+{
+	ListCell   *lc;
+
+	foreach(lc, dtx_statements)
+	{
+		GpDtxStatement *statement = lfirst(lc);
+
+		if (statement->inside)
+		{
+			gp_dtx_read_exit();
+			statement->inside = false;
+		}
+	}
 }
 
 static void
@@ -611,7 +746,7 @@ gp_dtx_xact_snapshot(void)
 {
 	if (!IsolationUsesXactSnapshot() || dtx_xact_held)
 		return;
-	gp_dtx_read_lock();
+	gp_dtx_read_enter();
 	dtx_xact_held = true;
 }
 
@@ -620,7 +755,7 @@ gp_dtx_xact_release(void)
 {
 	if (!dtx_xact_held)
 		return;
-	gp_dtx_read_unlock();
+	gp_dtx_read_exit();
 	dtx_xact_held = false;
 }
 
@@ -662,12 +797,15 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 			if (prepared_any || one_phase_any)
 			{
 				/*
-				 * The distributed snapshot: from the moment the segments
-				 * prepare to the moment they all hear COMMIT PREPARED, no
-				 * query may take its snapshots on the segments, or it
-				 * would see the transaction on some of them only
+				 * The distributed snapshot: from the moment the gate is
+				 * the exclusive one to the moment the segments all hear
+				 * COMMIT PREPARED, no query may take its snapshots on
+				 * the segments, or it would see the transaction on some
+				 * of them only.  The gate is entered before the segments
+				 * prepare, so a query that arrives while they prepare
+				 * waits already
 				 */
-				LWLockAcquire(&dtx_shared->lock, LW_EXCLUSIVE);
+				gp_dtx_exclusive_enter();
 				dtx_held = true;
 				if (prepared_any)
 					INJECTION_POINT("gp-after-prepare-transaction", NULL);
@@ -696,7 +834,7 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 			}
 			if (dtx_held)
 			{
-				LWLockRelease(&dtx_shared->lock);
+				gp_dtx_exclusive_exit();
 				dtx_held = false;
 			}
 			break;
@@ -712,7 +850,7 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 									  GP_FINISH_PREPARED);
 			if (dtx_held)
 			{
-				LWLockRelease(&dtx_shared->lock);
+				gp_dtx_exclusive_exit();
 				dtx_held = false;
 			}
 			break;
@@ -732,8 +870,16 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 		one_phase_any = false;
 		copy_segments = NULL;
 		copy_nsegments = 0;
+		gp_dtx_statements_exit();
 		gp_dtx_statements_clear();
-		dtx_xact_held = false;
+		if (dtx_xact_held)
+		{
+			/* The abort releases no lock of the gate: the snapshot the
+			 * explicit BEGIN took leaves through the gate itself */
+			gp_dtx_read_exit();
+			dtx_xact_held = false;
+		}
+		dtx_gate_inside = 0;
 	}
 }
 
@@ -762,10 +908,9 @@ gp_connections_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					diverged = true;
 				subxact_marks = list_delete_first(subxact_marks);
 			}
-			/* AbortSubTransaction released every LWLock: restore ours */
-			if (dtx_xact_held)
-				gp_dtx_read_lock();
-			/* Surviving scans register again on their next call */
+			/* The gates of the aborted statements: the surviving scans
+			 * register again on their next call */
+			gp_dtx_statements_exit();
 			gp_dtx_statements_clear();
 			break;
 		default:
@@ -1629,31 +1774,20 @@ gp_query_start(const char *sql, int only, GpSnapshots *snapshots)
 	 * either sees a distributed transaction in full or not at all.  The
 	 * first result of a segment tells that its snapshot is taken.
 	 */
-	if (query->nsegments > 0)
+	for (int i = 0; i < query->nsegments; i++)
 	{
-		LWLockAcquire(&dtx_shared->lock, LW_SHARED);
-		PG_TRY(dtqx);
-		{
-			for (int i = 0; i < query->nsegments; i++)
-			{
-				GpConnection *entry = hash_search(connections,
-												  &query->segments[i].segment_id,
-												  HASH_FIND, NULL);
+		GpConnection *entry = hash_search(connections,
+										  &query->segments[i].segment_id,
+										  HASH_FIND, NULL);
 
-				query->first[i] = libpqsrv_get_result(entry->conn,
-													  wait_event_result);
-			}
-		}
-		PG_FINALLY(dtqx);
-		{
-			LWLockRelease(&dtx_shared->lock);
-		}
-		PG_END_TRY(dtqx);
+		/* The gate is entered already: this wait takes its cancel */
+		query->first[i] = libpqsrv_get_result(entry->conn,
+											  wait_event_result);
 	}
 	}
 	PG_CATCH();
 	{
-		gp_query_end(query);
+		gp_query_end(query, true);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -1682,18 +1816,47 @@ gp_connection_drain(GpConnection *entry)
 }
 
 /*
- * End the query of the statement: drain what its segments still hold, and
- * end the local transactions that gp_query_start() began for the statement
- * snapshots.  Safe on the success path (gp_query_next() already read each
- * finished segment to its end) and required on the error path, where an
- * unfinished query would keep its connection out of libpq's idle state and
- * leave its segments in a transaction the pool does not know about.
+ * End the query of the statement.  On the success path the segments have
+ * answered already: drain what they still hold, and end the local
+ * transactions that gp_query_start() began for the statement snapshots,
+ * for an unfinished query would keep its connection out of libpq's idle
+ * state and leave its segments in a transaction the pool does not know
+ * about.  On the error path a segment may keep a query nobody waits
+ * for, one the drain would wait for forever: the busy queries of the
+ * statement are cancelled first, and their answers, the errors, are
+ * drained like the rest.
  */
 void
-gp_query_end(GpQuery *query)
+gp_query_end(GpQuery *query, bool cancel)
 {
 	if (query == NULL)
 		return;
+
+	PG_TRY();
+	{
+		/* On the error path a segment may keep a query nobody waits for,
+		 * and the drain would wait for it forever: every busy query of
+		 * the statement is cancelled first, and the drain then reads
+		 * every answer, its error included */
+		if (cancel)
+			for (int i = 0; i < query->nsegments; i++)
+			{
+				GpConnection *entry;
+
+				entry = hash_search(connections,
+									&query->segments[i].segment_id,
+									HASH_FIND, NULL);
+				if (entry != NULL && entry->busy)
+					(void) libpqsrv_cancel(entry->conn,
+										   TimestampTzPlusSeconds(GetCurrentTimestamp(),
+																  GP_CANCEL_TIMEOUT));
+			}
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+	}
+	PG_END_TRY();
 
 	PG_TRY();
 	{

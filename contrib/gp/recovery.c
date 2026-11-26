@@ -258,7 +258,7 @@ gp_recovery_pass(void)
 		nsegments = gp_segments_get(&segments);
 		if (nsegments > 0)
 		{
-			gp_dtx_lock();
+			gp_dtx_exclusive_enter();
 			locked = true;
 			for (int i = 0; i < nsegments; i++)
 			{
@@ -287,7 +287,7 @@ gp_recovery_pass(void)
 	MemoryContextDelete(passcxt);
 
 	if (locked)
-		gp_dtx_unlock();
+		gp_dtx_exclusive_exit();
 }
 
 pg_noreturn void

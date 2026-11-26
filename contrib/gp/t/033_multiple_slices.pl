@@ -5,10 +5,8 @@
 # pull over libpq sessions, and a read query's fragment must not write
 # even through an immutable function: the dispatched fragment session
 # runs read-only.  The deep live-orchestration scenario (parked readers
-# across three dispatched slice sessions, cancellation through their
-# wakeups) is tracked separately: it needs a live-debug session on the
-# hung query, the wake choreography of the interconnect workers does not
-# transfer to the libpq pulls as written.
+# across the dispatched slice sessions, cancellation) runs in
+# 059_slices_cancel.pl.
 
 use strict;
 use warnings FATAL => 'all';

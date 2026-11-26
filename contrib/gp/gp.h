@@ -159,10 +159,10 @@ extern void gp_recovery_init(void);
 /* dispatch.c */
 extern void gp_dispatch_init(void);
 extern bool gp_dispatch_in_xact(void);
-extern void gp_dtx_lock(void);
-extern void gp_dtx_unlock(void);
-extern void gp_dtx_read_lock(void);
-extern void gp_dtx_read_unlock(void);
+extern void gp_dtx_exclusive_enter(void);
+extern void gp_dtx_exclusive_exit(void);
+extern void gp_dtx_read_enter(void);
+extern void gp_dtx_read_exit(void);
 extern void gp_dtx_statement_start(EState *estate);
 extern GpSnapshots *gp_dtx_statement_snapshots(EState *estate);
 extern void gp_snapshots_free(GpSnapshots *snapshots);
@@ -182,7 +182,7 @@ typedef struct GpQuery GpQuery;
 extern GpQuery *gp_query_start(const char *sql, int only,
 							   GpSnapshots *snapshots);
 extern PGresult *gp_query_next(GpQuery *query);
-extern void gp_query_end(GpQuery *query);
+extern void gp_query_end(GpQuery *query, bool cancel);
 
 /* Segments may create objects of their own for a command out of a transaction */
 #define GP_NONXACT_LOCAL_DDL 0x01
