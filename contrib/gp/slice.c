@@ -683,7 +683,8 @@ gp_slice_autonomous(Query *query)
 static void
 gp_slice_load_libpq(GpSliceState *state)
 {
-	ScanState  *ss = &state->css.ss;
+	bool		done;
+ScanState  *ss = &state->css.ss;
 	TupleDesc	tupdesc = ss->ss_ScanTupleSlot->tts_tupleDescriptor;
 	int			natts = tupdesc->natts;
 	FmgrInfo   *recv = palloc0_array(FmgrInfo, natts);
@@ -735,6 +736,7 @@ gp_slice_load_libpq(GpSliceState *state)
 	query = gp_query_start(state->sql, only,
 						   state->motion ?
 						   gp_dtx_statement_snapshots(ss->ps.state) : NULL);
+	done = false;
 	PG_TRY();
 	{
 	while ((res = gp_query_next(query)) != NULL)
@@ -778,10 +780,11 @@ gp_slice_load_libpq(GpSliceState *state)
 
 	ExecDropSingleTupleTableSlot(loadslot);
 	MemoryContextDelete(rowcxt);
+	done = true;
 	}
 	PG_FINALLY();
 	{
-		gp_query_end(query);
+		gp_query_end(query, done);
 	}
 	PG_END_TRY();
 }

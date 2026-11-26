@@ -226,7 +226,7 @@ gp_gather_load_libpq(GpGatherState *state)
 				MemoryContextReset(rowcxt);
 				PQclear(res);
 			}
-			gp_query_end(query);
+			gp_query_end(query, false);
 			state->peeks[state->nstores] =
 				MakeSingleTupleTableSlot(tupdesc, &TTSOpsMinimalTuple);
 			if (tuplestore_gettupleslot(state->stores[state->nstores], true,
