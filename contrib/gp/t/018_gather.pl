@@ -268,11 +268,11 @@ fails('SELECT * FROM d TABLESAMPLE SYSTEM (10)',
 is(run('SELECT count(*) FROM d'), 510, 'and they leave the rows as they were');
 
 # The segment this server is: the coordinator answers 0, and a segment its
-# own number.  Rows do not tell their segment yet: that comes with the
-# pushdown of the MPP planner.
+# own number.  A condition by it rides the segments with the query: no row
+# of a distributed table belongs to the coordinator
 is(run('SELECT gp.segment_id()'), 0, 'the coordinator is segment 0');
-is(run('SELECT count(*) FROM d WHERE gp.segment_id() = 0'), 510,
-	'a query reads a distributed table with the function in it');
+is(run('SELECT count(*) FROM d WHERE gp.segment_id() = 0'), 0,
+	'no row of a distributed table belongs to the coordinator');
 
 # A caught subtransaction must not release the statement lock twice
 run(q{CREATE FUNCTION caught_error() RETURNS int LANGUAGE plpgsql AS $$
