@@ -1000,6 +1000,21 @@ gp_slice_agg_plan(Query *original, Query *parse, PlannedStmt *stmt)
 	 * for its own rows, and no group travels between them.  There is no
 	 * bucket filter to build and no combine to run
 	 */
+	{
+		/*
+		 * The share of the coordinator is not on the segments: no slice of
+		 * this table rides, and the coordinator answers over the gather
+		 */
+		RangeTblRef *ref = linitial_node(RangeTblRef,
+										 original->jointree->fromlist);
+		RangeTblEntry *rte = rt_fetch(ref->rtindex, original->rtable);
+		GpPolicy	policy;
+
+		if (rte->rtekind == RTE_RELATION &&
+			gp_policy_get(rte->relid, &policy) &&
+			gp_policy_has_coordinator(&policy))
+			return false;
+	}
 	if (gp_slice_segment_keys(parse))
 	{
 		if (list_length(agg->plan.targetlist) !=
@@ -2854,7 +2869,8 @@ gp_slice_redistribute_rte_keys(Query *remote, GpJoinTable *stay, GpJoinTable *mo
 	 * broadcast of the other side answers a stay of any distribution, and
 	 * a replicated stay keeps a copy everywhere already
 	 */
-	if (!stay->policy.replicated && stay->policy.nbuckets <= 0)
+	if (!stay->policy.replicated &&
+		(stay->policy.nbuckets <= 0 || gp_policy_has_coordinator(&stay->policy)))
 		return false;
 
 	/* Equal RT indexes of different query levels name different tables */
@@ -4575,7 +4591,9 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 	{
 		GpJoinTable *table = lfirst(lc);
 
-		if (!table->policy.replicated && table->policy.nbuckets <= 0)
+		if (!table->policy.replicated &&
+			(table->policy.nbuckets <= 0 ||
+			 gp_policy_has_coordinator(&table->policy)))
 			return false;
 	}
 
@@ -5229,7 +5247,9 @@ locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
 	{
 		GpJoinTable *table = lfirst(lc);
 
-		if (!table->policy.replicated && table->policy.nbuckets <= 0)
+		if (!table->policy.replicated &&
+			(table->policy.nbuckets <= 0 ||
+			 gp_policy_has_coordinator(&table->policy)))
 			return false;
 	}
 	if (!gp_slice_join_probes_keyed(tables, conds))
@@ -6629,7 +6649,8 @@ gp_slice_agg_two_phase(Query *parse, Agg *agg, Plan *below)
 	ref = linitial_node(RangeTblRef, parse->jointree->fromlist);
 	rte = rt_fetch(ref->rtindex, parse->rtable);
 	if (rte->rtekind != RTE_RELATION || !gp_policy_get(rte->relid, &policy) ||
-		policy.replicated || policy.nbuckets <= 0)
+		policy.replicated || policy.nbuckets <= 0 ||
+		gp_policy_has_coordinator(&policy))
 		return false;
 
 	rel = table_open(rte->relid, AccessShareLock);
@@ -7135,7 +7156,8 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 	rte_base = rt_fetch(ref->rtindex, parse->rtable);
 	if (rte_base->rtekind != RTE_RELATION ||
 		!gp_policy_get(rte_base->relid, &policy) || policy.replicated ||
-		policy.nbuckets <= 0)
+		policy.nbuckets <= 0 ||
+		gp_policy_has_coordinator(&policy))
 		return;
 
 	/* The grouping columns lead the answer of the segments */

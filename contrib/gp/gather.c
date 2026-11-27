@@ -28,6 +28,8 @@
  */
 #include "postgres.h"
 
+#include "executor/spi.h"
+
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/pg_class.h"
@@ -88,6 +90,7 @@ typedef struct GpGatherState
 	int		   *starts;			/* the first row of every share of the store */
 	int		   *segs;			/* the segment of every share */
 	int			nshares;
+	int			local_rows;		/* the share of the coordinator, first in the store */
 	int			row;			/* the rows handed out of the store */
 	List	   *sortkeys;		/* one list per key: attno, desc, nulls first, type, collation; NIL when the gather does not merge */
 	Tuplestorestate **stores;	/* one sorted store per segment */
@@ -99,6 +102,7 @@ typedef struct GpGatherState
 
 static void gp_gather_append_order(StringInfoData *sql, List *sortkeys,
 								   Oid relid);
+static char *gp_gather_sql_rel(Relation rel, bool inh);
 static int	gp_gather_merge_heap_cmp(Datum a, Datum b, void *arg);
 
 static Node *gp_gather_create_state(CustomScan *cscan);
@@ -264,6 +268,79 @@ gp_gather_load_libpq(GpGatherState *state)
 					binaryheap_add(state->heap, Int32GetDatum(i));
 		}
 		return;
+	}
+
+	/*
+	 * The share of the coordinator comes first: the rows of its buckets
+	 * live in the copy of the table here, and the gather reads them the
+	 * way it reads any rows, as datums of the columns of the table
+	 */
+	if (!state->replicated)
+	{
+		GpPolicy	policy;
+		Relation	rel = ss->ss_currentRelation;
+
+		if (gp_policy_get(rel->rd_id, &policy) &&
+			gp_policy_has_coordinator(&policy))
+		{
+			char	   *localsql = gp_gather_sql_rel(rel, true);
+
+
+			/*
+			 * The scan of the copy here must not plan itself a gather of
+			 * its own: the flag makes the hooks of the extension let it be
+			 */
+			gp_local_routing = true;
+			PG_TRY();
+			{
+				if (SPI_connect() != SPI_OK_CONNECT)
+					elog(ERROR, "could not read the share of the coordinator");
+				if (SPI_execute(localsql, true, 0) != SPI_OK_SELECT)
+					elog(ERROR, "could not read the share of the coordinator");
+			}
+			PG_CATCH();
+			{
+				gp_local_routing = false;
+				SPI_finish();
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			gp_local_routing = false;
+			state->local_rows = SPI_processed;
+			state->row = 0;
+			for (int k = 0; k < SPI_processed; k++)
+			{
+				HeapTuple	rt = SPI_tuptable->vals[k];
+				TupleDesc	rd = SPI_tuptable->tupdesc;
+				MemoryContext oldcontext;
+
+				ExecClearTuple(loadslot);
+				oldcontext = MemoryContextSwitchTo(rowcxt);
+				for (int i = 0; i < natts; i++)
+				{
+					loadslot->tts_values[i] = (Datum) 0;
+					loadslot->tts_isnull[i] = true;
+				}
+				for (int c = 0; c < ncols; c++)
+				{
+					int			i = colmap[c];
+					bool		isnull;
+					Datum		d = SPI_getbinval(rt, rd, c + 1, &isnull);
+
+					if (!isnull)
+					{
+						loadslot->tts_values[i] = d;
+						loadslot->tts_isnull[i] = false;
+					}
+				}
+				ExecStoreVirtualTuple(loadslot);
+				tuplestore_puttupleslot(state->store, loadslot);
+				MemoryContextSwitchTo(oldcontext);
+				MemoryContextReset(rowcxt);
+			}
+			SPI_finish();
+			(void) gp_local_routing;
+		}
 	}
 
 	query = gp_query_start(state->sql, only, NULL);
@@ -462,15 +539,22 @@ gp_gather_next(ScanState *ss)
 		/*
 		 * The rows of the store came share after share, one segment after
 		 * another: the row reads its segment, and the function of the
-		 * segment of the row answers it while the row is the answer
+		 * segment of the row answers it while the row is the answer.  The
+		 * share of the coordinator, first in the store, reads as the
+		 * coordinator itself
 		 */
 		gp_row_segment = 0;
-		for (int i = state->nshares - 1; i >= 0; i--)
-			if (state->starts[i] <= r)
-			{
-				gp_row_segment = state->segs[i];
-				break;
-			}
+		if (r >= state->local_rows)
+		{
+			int			dr = r - state->local_rows;
+
+			for (int i = state->nshares - 1; i >= 0; i--)
+				if (state->starts[i] <= dr)
+				{
+					gp_row_segment = state->segs[i];
+					break;
+				}
+		}
 		return slot;
 	}
 	gp_row_segment = 0;
@@ -614,9 +698,8 @@ gp_is_gather(Plan *plan)
  * them
  */
 static char *
-gp_gather_sql(RangeTblEntry *rte)
+gp_gather_sql_rel(Relation rel, bool inh)
 {
-	Relation	rel = table_open(rte->relid, NoLock);
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	StringInfoData cols;
 	char	   *sql;
@@ -632,9 +715,18 @@ gp_gather_sql(RangeTblEntry *rte)
 						 quote_identifier(NameStr(att->attname)));
 	}
 	sql = psprintf("SELECT %s FROM %s%s", cols.data,
-				   rte->inh ? "" : "ONLY ",
+				   inh ? "" : "ONLY ",
 				   quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
 											  RelationGetRelationName(rel)));
+	return sql;
+}
+
+static char *
+gp_gather_sql(RangeTblEntry *rte)
+{
+	Relation	rel = table_open(rte->relid, NoLock);
+	char	   *sql = gp_gather_sql_rel(rel, rte->inh);
+
 	table_close(rel, NoLock);
 	return sql;
 }
@@ -719,6 +811,14 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 
 	if (prev_set_rel_pathlist)
 		prev_set_rel_pathlist(root, rel, rti, rte);
+
+	/*
+	 * The scan of the share of the coordinator plans itself here: the flag
+	 * makes the ordinary paths, for the copy of the table is a plain table
+	 * of this server
+	 */
+	if (gp_local_routing)
+		return;
 
 	if (!IsUnderPostmaster || fragment_plan || rte->rtekind != RTE_RELATION ||
 		(rte->relkind != RELKIND_RELATION &&
@@ -860,8 +960,11 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		root->parse->setOperations == NULL)
 	{
 		List	   *sortkeys = gp_gather_sortkeys(root, rel);
+		GpPolicy	sp;
+		bool		shared = gp_policy_get(rte->relid, &sp) &&
+			gp_policy_has_coordinator(&sp);
 
-		if (sortkeys != NIL)
+		if (sortkeys != NIL && !shared)
 		{
 			StringInfoData suffix;
 			CustomPath *spath;

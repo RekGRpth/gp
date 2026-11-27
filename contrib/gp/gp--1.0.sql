@@ -318,7 +318,8 @@ LANGUAGE C STRICT;
 -- all of its rows live on that segment alone.
 CREATE FUNCTION gp.distribute(relation regclass, key name[],
 							  colocate_with regclass DEFAULT NULL,
-							  segment int DEFAULT NULL)
+							  segment int DEFAULT NULL,
+							  coordinator bool DEFAULT false)
 RETURNS void
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
@@ -329,6 +330,7 @@ DECLARE
 	types regtype[];
 	group_id int;
 	group_types regtype[];
+	group_coordinator bool;
 	segments int[];
 	nonempty bool;
 BEGIN
@@ -369,6 +371,9 @@ BEGIN
 	END IF;
 
 	IF key IS NULL THEN
+		IF coordinator THEN
+			RAISE EXCEPTION 'a replicated table keeps no share of the coordinator';
+		END IF;
 		IF colocate_with IS NOT NULL THEN
 			RAISE EXCEPTION 'a replicated table has no colocation group';
 		END IF;
@@ -403,6 +408,9 @@ BEGIN
 	END IF;
 	PERFORM gp.check_distribution_key(relation, attnums);
 
+	IF segment IS NOT NULL AND coordinator THEN
+		RAISE EXCEPTION 'a table pinned to a segment keeps no share of the coordinator';
+	END IF;
 	IF segment IS NOT NULL THEN
 		IF colocate_with IS NOT NULL THEN
 			RAISE EXCEPTION 'a table pinned to a segment joins no colocation group of another';
@@ -428,12 +436,18 @@ BEGIN
 	LOCK TABLE gp.colocation_groups IN SHARE ROW EXCLUSIVE MODE;
 
 	IF colocate_with IS NOT NULL THEN
-		SELECT p.colocation_id, g.key_types INTO group_id, group_types
+		SELECT p.colocation_id, g.key_types,
+			   (0 = ANY (g.map)) AS group_coordinator
+		INTO group_id, group_types, group_coordinator
 		FROM gp.distribution_policy p
 		JOIN gp.colocation_groups g USING (colocation_id)
 		WHERE p.relid = colocate_with AND p.kind = 'hash';
 		IF NOT FOUND THEN
 			RAISE EXCEPTION 'table "%" is not distributed by hash',
+				colocate_with;
+		END IF;
+		IF coordinator <> group_coordinator THEN
+			RAISE EXCEPTION 'table "%" does not keep a share of the coordinator',
 				colocate_with;
 		END IF;
 		IF group_types <> types THEN
@@ -442,13 +456,17 @@ BEGIN
 		END IF;
 	ELSE
 		SELECT g.colocation_id INTO group_id FROM gp.colocation_groups g
-		WHERE g.key_types = types AND g.nbuckets = buckets
+		WHERE g.key_types = types AND g.nbuckets = buckets AND
+			  coordinator = (0 = ANY (g.map))
 		ORDER BY g.colocation_id LIMIT 1;
 		IF NOT FOUND THEN
 			SELECT array_agg(s.segment_id ORDER BY s.segment_id) INTO segments
 			FROM gp.cluster_segments() s;
 			IF segments IS NULL THEN
 				RAISE EXCEPTION 'the cluster has no segments';
+			END IF;
+			IF coordinator THEN
+				segments := ARRAY[0] || segments;
 			END IF;
 			INSERT INTO gp.colocation_groups (key_types, nbuckets, map)
 			SELECT types, buckets,
@@ -464,7 +482,8 @@ BEGIN
 END
 $$;
 
-REVOKE ALL ON FUNCTION gp.distribute(regclass, name[], regclass, int) FROM PUBLIC;
+REVOKE ALL ON FUNCTION gp.distribute(regclass, name[], regclass, int, bool)
+FROM PUBLIC;
 
 -- Distribute a table by the ranges of one key column: bounds[i] ends the
 -- bucket i and starts the bucket i + 1, every bucket of which goes to

@@ -21,6 +21,7 @@
  */
 #include "postgres.h"
 
+#include "executor/spi.h"
 #include "libpq/pqformat.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -59,6 +60,9 @@ struct GpRoute
 	bool	   *rule_hasvalue;
 	int		   *rule_pos;
 	char	   *relname;
+	bool		local;			/* buckets of the coordinator write here */
+	char	   *local_cols;		/* the column list of the local insert */
+	FmgrInfo   *outfn;			/* the text output of every sent column */
 };
 
 /* The rule of a key: the range that holds it, or the value that equals it,
@@ -125,6 +129,7 @@ gp_route_begin(Relation rel, const GpPolicy *policy, int only)
 	char	   *copysql;
 
 	route->policy = *policy;
+	route->local = gp_policy_has_coordinator(policy);
 
 	/* The columns that go to the segments; they compute the generated ones */
 	route->sendatt = palloc_array(int, natts);
@@ -191,6 +196,31 @@ gp_route_begin(Relation rel, const GpPolicy *policy, int only)
 	}
 
 	route->relname = pstrdup(RelationGetRelationName(rel));
+	if (route->local)
+	{
+		/* The rows of the buckets of the coordinator insert into the copy
+		 * of the table here, through the executor, with the indexes and
+		 * the toast and everything; the flag keeps the hooks of the
+		 * extension from dispatching this insert to the segments.  The
+		 * values ride as the literals of their own types */
+		StringInfoData cols;
+
+		initStringInfo(&cols);
+		route->outfn = palloc_array(FmgrInfo, route->nsend);
+		for (int k = 0; k < route->nsend; k++)
+		{
+			Form_pg_attribute att = TupleDescAttr(tupDesc,
+												  route->sendatt[k]);
+			Oid			outoid;
+			bool		varlena;
+
+			appendStringInfo(&cols, "%s%s", k > 0 ? ", " : "",
+							 quote_identifier(NameStr(att->attname)));
+			getTypeOutputInfo(att->atttypid, &outoid, &varlena);
+			fmgr_info(outoid, &route->outfn[k]);
+		}
+		route->local_cols = pstrdup(cols.data);
+	}
 	route->direct = only != 0;
 	route->nsegments = gp_copy_open(copysql, only, &route->segments);
 	if (route->nsegments == 0)
@@ -217,7 +247,8 @@ gp_route_begin(Relation rel, const GpPolicy *policy, int only)
 			route->rule_pos[i] = pos;
 		}
 
-	/* The segment of each bucket, as a position in the segments */
+	/* The segment of each bucket, as a position in the segments; a bucket
+	 * of the coordinator itself takes -1, and its rows insert here */
 	if (!policy->replicated && !route->direct)
 	{
 		route->bucket_pos = palloc_array(int, policy->nbuckets);
@@ -225,6 +256,11 @@ gp_route_begin(Relation rel, const GpPolicy *policy, int only)
 		{
 			int			pos = -1;
 
+			if (policy->map[b] == 0)
+			{
+				route->bucket_pos[b] = -1;
+				continue;
+			}
 			for (int i = 0; i < route->nsegments && pos < 0; i++)
 				if (route->segments[i].segment_id == policy->map[b])
 					pos = i;
@@ -297,17 +333,65 @@ gp_route_row(GpRoute *route, const Datum *values, const bool *nulls)
 	}
 	else
 	{
+		int			bucket;
+
 		for (int k = 0; k < policy->nkeys; k++)
 		{
 			route->keyvalues[k] = values[policy->keys[k] - 1];
 			route->keynulls[k] = nulls[policy->keys[k] - 1];
 		}
-		first = last = route->bucket_pos[gp_key_bucket(policy->nbuckets,
-													   policy->nkeys,
-													   route->keyvalues,
-													   route->keynulls,
-													   route->keytypes,
-													   InvalidOid)];
+		bucket = gp_key_bucket(policy->nbuckets, policy->nkeys,
+							   route->keyvalues, route->keynulls,
+							   route->keytypes, InvalidOid);
+		first = last = route->bucket_pos[bucket];
+
+		/*
+		 * A bucket of the coordinator inserts here: the values run through
+		 * the executor of this server, with its indexes and its toast, and
+		 * the hooks of the extension let the insert be
+		 */
+		if (first < 0)
+		{
+			/* The values as the literals of their own types: the row of
+			 * the coordinator inserts through the executor of this server,
+			 * and the flag keeps the hooks of the extension from
+			 * dispatching it */
+			StringInfoData row;
+
+			initStringInfo(&row);
+			for (int k = 0; k < route->nsend; k++)
+			{
+				int			i = route->sendatt[k];
+				char	   *text = nulls[i] ? NULL :
+					OutputFunctionCall(&route->outfn[k], values[i]);
+
+				appendStringInfo(&row, "%s%s", k > 0 ? ", " : "",
+								 nulls[i] ? "NULL" :
+								 quote_literal_cstr(text));
+			}
+			gp_local_routing = true;
+			PG_TRY();
+			{
+				if (SPI_connect() != SPI_OK_CONNECT)
+					elog(ERROR, "could not connect for a row of the coordinator");
+				{
+					int			r = SPI_execute(psprintf(
+						"INSERT INTO %s (%s) VALUES (%s)", route->relname,
+						route->local_cols, row.data), false, 0);
+
+					if (r < 0)
+						elog(ERROR, "could not insert a row of the coordinator (SPI result %d)",
+							 r);
+				}
+			}
+			PG_FINALLY();
+			{
+				SPI_finish();
+				gp_local_routing = false;
+			}
+			PG_END_TRY();
+			return;
+		}
 	}
 
 	for (int i = first; i <= last; i++)

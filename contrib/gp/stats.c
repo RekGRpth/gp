@@ -20,6 +20,7 @@
  */
 #include "postgres.h"
 
+#include "access/table.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
@@ -247,6 +248,22 @@ gp_stats_relation(Oid relid, bool replicated)
 	nsegments = gp_segments_get(&segments);
 	if (rows != nsegments)
 		elog(ERROR, "relation statistics are missing on a segment");
+
+	/* A share of the coordinator adds its own copy to the sums */
+	{
+		GpPolicy	policy;
+
+		if (gp_policy_get(relid, &policy) && gp_policy_has_coordinator(&policy))
+		{
+			Relation	rel = table_open(relid, NoLock);
+
+			pages += rel->rd_rel->relpages;
+			tuples += rel->rd_rel->reltuples;
+			allvisible += rel->rd_rel->relallvisible;
+			allfrozen += rel->rd_rel->relallfrozen;
+			table_close(rel, NoLock);
+		}
+	}
 
 	initStringInfo(&sql);
 	appendStringInfo(&sql,

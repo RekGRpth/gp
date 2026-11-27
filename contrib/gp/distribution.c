@@ -107,6 +107,20 @@ gp_hash_proc_of(Oid typid)
 }
 
 /*
+ * Whether the map of the policy names the coordinator itself: such a table
+ * keeps a share of its rows in the copy of the coordinator, and the rules
+ * that ride the hash of the keys refuse it
+ */
+bool
+gp_policy_has_coordinator(const GpPolicy *policy)
+{
+	for (int b = 0; b < policy->nbuckets; b++)
+		if (policy->map[b] == 0)
+			return true;
+	return false;
+}
+
+/*
  * The comparison function of the default btree operator class of a type,
  * remembered from call to call
  */

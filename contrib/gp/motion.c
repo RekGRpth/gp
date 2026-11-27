@@ -594,6 +594,9 @@ gp_motion_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	if (prev_set_rel_pathlist)
 		prev_set_rel_pathlist(root, rel, rti, rte);
 
+	if (gp_local_routing)
+		return;
+
 	if (!IsUnderPostmaster || rel->reloptkind != RELOPT_BASEREL)
 		return;
 	serialized = gp_motion_serialized(rte);
