@@ -933,6 +933,21 @@ gp_check_modifications(Query *parse, bool toplevel)
 						   "a data-modifying statement in WITH"));
 	}
 
+	if (parse->resultRelation > 0 && toplevel &&
+		(parse->commandType == CMD_UPDATE || parse->commandType == CMD_DELETE))
+	{
+		RangeTblEntry *rte = rt_fetch(parse->resultRelation, parse->rtable);
+		GpPolicy	policy;
+
+		if (gp_policy_get(rte->relid, &policy) &&
+			gp_policy_has_coordinator(&policy))
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("%s of a table with a share of the coordinator is not supported yet",
+						   parse->commandType == CMD_UPDATE ? "UPDATE" : "DELETE"),
+					errhint("The rows of the share of the coordinator keep out of the segments the statement runs on."));
+	}
+
 	foreach_node(CommonTableExpr, cte, parse->cteList)
 	{
 		Query	   *query = castNode(Query, cte->ctequery);
@@ -963,6 +978,19 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 	if (IsUnderPostmaster)
 		gp_check_modifications(parse, true);
 	gp_autoanalyze_check();
+
+	/*
+	 * The rows of the share of the coordinator insert into the copy of the
+	 * table here, and this insert of ours must not dispatch itself
+	 */
+	if (gp_local_routing)
+	{
+		if (prev_planner)
+			return prev_planner(parse, query_string, cursorOptions,
+								boundParams, es);
+		return standard_planner(parse, query_string, cursorOptions,
+								boundParams, es);
+	}
 
 	agg_original = gp_slice_agg_query(parse);
 	if (agg_original == NULL)

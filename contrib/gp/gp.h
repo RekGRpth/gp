@@ -74,6 +74,8 @@ extern int	gp_segment_id;
 extern int	gp_row_segment;
 /* Analyze the tables the cluster has changed past the threshold */
 extern bool gp_autoanalyze;
+/* The coordinator inserts the rows of its own share of a table itself */
+extern bool gp_local_routing;
 extern char *gp_database;
 extern int	gp_max_segments;
 extern int	gp_default_distribution;
@@ -112,6 +114,7 @@ typedef struct GpPolicy
 
 /* distribution.c */
 extern bool gp_policy_get(Oid relid, GpPolicy *policy);
+extern bool gp_policy_has_coordinator(const GpPolicy *policy);
 extern void gp_distribute_by_default(Oid relid);
 extern int	gp_key_bucket(int nbuckets, int nkeys, const Datum *values,
 						  const bool *nulls, const Oid *types, Oid collation);

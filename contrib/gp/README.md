@@ -253,6 +253,16 @@ of a hash, while the joins that move rows by the hash of the keys are
 answered by the coordinator: rows that sit by ranges keep no order by
 that hash.
 
+With `coordinator = true` the map of the group names the coordinator
+itself for a share of the buckets: those rows live in the copy of the
+table on the coordinator, insert through its executor, and read in the
+gather beside the answers of the segments; the function of the segment
+of a row names them 0.  The rules of the planner that ride the hash of
+the keys refuse such tables the way they refuse the ranges and the
+values, and `UPDATE` and `DELETE` of a whole shared table are not
+supported yet, for the rows of the share keep out of the segments the
+statement runs on.
+
 The map belongs to a *colocation group*, not to a table: tables of a group
 have keys of the same types and the same number of buckets (1024), so rows
 with equal keys are on the same segment and a join by the key is local.  A
@@ -732,7 +742,7 @@ All are set at server start unless noted.
 | `gp.reload_conf()` | Reread the configuration files of every node, so a written parameter takes effect without a restart |
 | `gp.exec_on_all(sql)` | Run a command on all segments, return the status of each |
 | `gp.recorded_oids()` | OIDs of the new catalog rows of the transaction on the coordinator |
-| `gp.distribute(table, key, colocate_with, segment)` | Distribute an empty table by hash of `key`, or replicate it, or pin it to a segment |
+| `gp.distribute(table, key, colocate_with, segment, coordinator)` | Distribute an empty table by hash of `key`, or replicate it, or pin it to a segment; `coordinator = true` names the coordinator a keeper of its share of the buckets, and its rows live in the copy of the table here |
 | `gp.distribute_range(table, key, bounds, segments)` | Distribute an empty table by the ranges of one key column: `bounds[i]` ends the bucket `i` and starts the next, bucket `i` goes to `segments[i]`; the bounds are the texts of the type of the key and must ascend |
 | `gp.distribute_list(table, key, values, segments)` | Distribute an empty table by the values of one key column: `values[i]` makes the bucket `i`, which goes to `segments[i]` |
 | `gp.bucket(nbuckets, VARIADIC key)` | Bucket of a key |
@@ -885,8 +895,9 @@ by the patch and `contrib/gp`.
    sums the change counters of the segments, and the tables past the
    threshold take the same analyze and import.
 8. **More kinds of distribution** — replicated with the coordinator, on the
-   coordinator only, on one segment, by the ranges of a key column, and by
-   the values of one.  A row goes to the segment of the range that holds
+   coordinator only, on one segment, by the ranges of a key column, by the
+   values of one, and with the coordinator keeping a share of the buckets
+   of a hash.  A row goes to the segment of the range that holds
    its key or of the value that equals it, and a key with no range and no
    value has no segment: such a row cannot be inserted.  The planner
    answers by the key columns as it answers by the columns of a hash; the

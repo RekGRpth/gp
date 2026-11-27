@@ -112,6 +112,7 @@ gp_dispatches_bump(void)
 int			gp_segment_id = 0;
 int			gp_row_segment = 0;
 bool		gp_autoanalyze = false;
+bool		gp_local_routing = false;
 static int	gp_requester_segment = 0;
 char	   *gp_database = NULL;
 int			gp_max_segments = 64;

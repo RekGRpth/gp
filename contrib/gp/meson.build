@@ -122,6 +122,7 @@ tests += {
       't/062_autostats.pl',
       't/063_range_list.pl',
       't/064_mixed_outer.pl',
+      't/065_coordinator_share.pl',
     ],
   },
 }
