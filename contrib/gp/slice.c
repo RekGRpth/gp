@@ -1875,7 +1875,7 @@ gp_slice_make(Plan *src, Query *original, bool replicated, bool motion,
 	cscan->scan.plan.plan_width = src->plan_width;
 	cscan->custom_scan_tlist = copyObject(origtlist);
 	cscan->custom_private = list_make4(makeString(psprintf("%s%s",
-														   pg_get_querydef(remote, false),
+														   pg_get_querydef(gp_slice_time_copy(remote), false),
 														   limits ? limits : "")),
 									   makeBoolean(replicated),
 									   makeBoolean(motion),
@@ -6397,7 +6397,7 @@ gp_slice_partial_finish(Agg *agg, GpPartialState *state,
 						List *final_target, List *final_qual, int only)
 {
 	CustomScan *cscan = gp_slice_partial_cscan(agg, state,
-											   pg_get_querydef(remote, false),
+											   pg_get_querydef(gp_slice_time_copy(remote), false),
 											   remote->targetList, motion,
 											   gp_slice_autonomous(remote),
 											   only);
@@ -6674,7 +6674,7 @@ gp_slice_agg_two_phase(Query *parse, Agg *agg, Plan *below)
 	appendStringInfo(&marker,
 					 "SELECT * FROM (%s) AS gp_partial WHERE (%s)[gp.bucket(%d, %s) + 1] "
 					 "OPERATOR(pg_catalog.=) (SELECT current_setting('gp.requester_segment')::int4)",
-					 pg_get_querydef(remote, false), map.data,
+					 pg_get_querydef(gp_slice_time_copy(remote), false), map.data,
 					 policy.nbuckets, keys.data);
 	planned = gp_fragment_plan(marker.data);
 
@@ -6942,6 +6942,22 @@ gp_fold_time_functions(Query *parse)
 		if (!cte->cterecursive && IsA(cte->ctequery, Query))
 			gp_fold_time_functions((Query *) cte->ctequery);
 	}
+}
+
+/*
+ * A copy of the query for the SQL of the segments: its time functions are
+ * the constants of the transaction of the coordinator, for every server
+ * answers the same instant.  The query of the coordinator keeps its
+ * functions as they are: the plan prints them the way the query wrote
+ * them, and the planner prunes with them the way it prunes without us
+ */
+Query *
+gp_slice_time_copy(Query *parse)
+{
+	Query	   *copy = copyObject(parse);
+
+	gp_fold_time_functions(copy);
+	return copy;
 }
 
 /*
@@ -8065,7 +8081,7 @@ gp_slice_join_redistributed_agg(Query *original, PlannedStmt *stmt, Plan *plan,
 	/* Keep on the asking segment only rows whose grouping key belongs to it */
 	initStringInfo(&sql);
 	appendStringInfo(&sql, "SELECT * FROM (%s) AS joined WHERE (ARRAY[",
-					 pg_get_querydef(inner, false));
+					 pg_get_querydef(gp_slice_time_copy(inner), false));
 	for (int i = 0; i < maptable->policy.nbuckets; i++)
 		appendStringInfo(&sql, "%s%d", i > 0 ? "," : "",
 						 maptable->policy.map[i]);

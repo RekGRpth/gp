@@ -541,7 +541,8 @@ gp_insert_plan(Query *parse, Query *original, PlannedStmt *stmt)
 		cscan->scan.plan.plan_rows = mt->plan.plan_rows;
 		cscan->scan.plan.plan_width = mt->plan.plan_width;
 		cscan->scan.scanrelid = 0;
-		cscan->custom_private = list_make3(makeString(pg_get_querydef(original, false)),
+		cscan->custom_private = list_make3(makeString(pg_get_querydef(
+			gp_slice_time_copy(original), false)),
 										   makeBoolean(mt->canSetTag),
 										   makeBoolean(motion));
 		cscan->methods = &gp_dml_plan_methods;
@@ -960,7 +961,6 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 
 	if (IsUnderPostmaster)
 		gp_check_modifications(parse, true);
-	gp_fold_time_functions(parse);
 
 	agg_original = gp_slice_agg_query(parse);
 	if (agg_original == NULL)

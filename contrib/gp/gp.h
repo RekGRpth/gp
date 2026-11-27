@@ -120,6 +120,7 @@ extern bool gp_gather_fragment(bool enable);
 /* slice.c */
 extern void gp_slice_init(void);
 extern void gp_fold_time_functions(Query *parse);
+extern Query *gp_slice_time_copy(Query *parse);
 extern Query *gp_slice_agg_query(Query *parse);
 extern bool gp_slice_agg_plan(Query *original, Query *parse,
 				PlannedStmt *stmt);
