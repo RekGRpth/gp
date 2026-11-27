@@ -165,6 +165,125 @@ LANGUAGE C STRICT;
 
 REVOKE ALL ON FUNCTION gp.move_bucket(regclass, int, int) FROM PUBLIC;
 
+-- Clean up a segment that joined the cluster from a copy of the
+-- coordinator: the copy holds the rows of the coordinator's own share of
+-- every coordinator-share table, and they belong to the coordinator
+-- alone.  Returns the number of the truncated tables.  Superusers only
+CREATE FUNCTION gp.expand_cleanup(segment_id int)
+RETURNS int
+AS 'MODULE_PATHNAME', 'gp_expand_cleanup'
+LANGUAGE C STRICT;
+
+REVOKE ALL ON FUNCTION gp.expand_cleanup(int) FROM PUBLIC;
+
+-- Spread the buckets of every hash colocation group over the registered
+-- segments: a bucket of an owner that keeps more buckets than the even
+-- share moves to the segment that keeps the fewest.  Returns the number
+-- of the moved buckets.  Superusers only
+CREATE FUNCTION gp.rebalance_segments()
+RETURNS int
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	gp_ record;
+	bk int;
+	owner int;
+	target int;
+	share int;
+	owncnt int;
+	moved int := 0;
+	total int := 0;
+	segs int[];
+	segcnt int;
+	curmap int[];
+	currel regclass;
+BEGIN
+	IF current_setting('gp.role', true) IS DISTINCT FROM 'coordinator' THEN
+		RAISE EXCEPTION 'the cluster rebalances on the coordinator only';
+	END IF;
+	SELECT array_agg(segment_id ORDER BY segment_id) INTO segs
+	FROM gp.segments;
+	IF segs IS NULL THEN
+		RETURN 0;
+	END IF;
+	segcnt := cardinality(segs);
+
+	FOR gp_ IN SELECT c.colocation_id, c.nbuckets
+			   FROM gp.colocation_groups c
+			   WHERE EXISTS (SELECT FROM gp.distribution_policy p
+							 WHERE p.colocation_id = c.colocation_id AND
+								   p.kind = 'hash')
+			 ORDER BY c.colocation_id
+	LOOP
+		share := gp_.nbuckets / segcnt;
+		FOR bk IN 0 .. gp_.nbuckets - 1 LOOP
+			SELECT c.map INTO curmap
+			FROM gp.colocation_groups c
+			WHERE c.colocation_id = gp_.colocation_id;
+			owner := curmap[bk + 1];
+			CONTINUE WHEN owner = 0;	-- the coordinator keeps its share
+			CONTINUE WHEN owner <> ALL (segs);	-- nobody to hand it to
+			SELECT count(*) INTO owncnt
+			FROM unnest(curmap) m WHERE m = owner;
+			CONTINUE WHEN owncnt <= share;
+
+			SELECT s.segment_id INTO target
+			FROM gp.segments s
+			ORDER BY (SELECT count(*) FROM unnest(curmap) m
+					  WHERE m = s.segment_id),
+				  s.segment_id
+			LIMIT 1;
+			CONTINUE WHEN target = owner;
+
+			SELECT p.relid INTO currel
+			FROM gp.distribution_policy p
+			WHERE p.colocation_id = gp_.colocation_id AND p.kind = 'hash'
+			ORDER BY p.relid LIMIT 1;
+			PERFORM gp.move_bucket(currel, bk, target);
+			moved := moved + 1;
+		END LOOP;
+	END LOOP;
+	RETURN total + moved;
+END
+$$;
+
+REVOKE ALL ON FUNCTION gp.rebalance_segments() FROM PUBLIC;
+
+-- Finish the joining of a segment that started from a copy of the
+-- coordinator: the copy holds the rows of the coordinator's own share of
+-- every coordinator-share table, and they belong to the coordinator
+-- alone, so they truncate on the new segment; then the buckets of every
+-- hash group spread over the registered segments.  Returns the number of
+-- the moved buckets.  Superusers only
+CREATE FUNCTION gp.expand_segment(segment_id int)
+RETURNS int
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	moved int := 0;
+	cleaned int := 0;
+BEGIN
+	IF current_setting('gp.role', true) IS DISTINCT FROM 'coordinator' THEN
+		RAISE EXCEPTION 'the cluster expands on the coordinator only';
+	END IF;
+	IF NOT EXISTS (SELECT FROM gp.segments s
+				   WHERE s.segment_id = expand_segment.segment_id) THEN
+		RAISE EXCEPTION 'segment % is not registered',
+			expand_segment.segment_id;
+	END IF;
+
+	SELECT gp.expand_cleanup(expand_segment.segment_id) INTO cleaned;
+	moved := gp.rebalance_segments();
+	RAISE NOTICE 'the segment % took the cluster: % tables cleaned, % buckets moved',
+		expand_segment.segment_id, cleaned, moved;
+	RETURN moved;
+END
+$$;
+
+REVOKE ALL ON FUNCTION gp.expand_segment(int) FROM PUBLIC;
+
 -- Shrink the cluster: every bucket the segment keeps moves to the other
 -- segments, the segment stops, and its row goes away.  Its number stays
 -- a hole and is never given to a new node, so an old connection or a
