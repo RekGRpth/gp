@@ -111,7 +111,6 @@ $$;
 
 REVOKE ALL ON FUNCTION gp.register_segment(int, text, int) FROM PUBLIC;
 
-
 -- Register the mirror of a segment: the standby answers for the segment
 -- when its primary stops answering.  Superusers only, for the pair is the
 -- whole of the data of the cluster
@@ -165,6 +164,98 @@ AS 'MODULE_PATHNAME', 'gp_move_bucket'
 LANGUAGE C STRICT;
 
 REVOKE ALL ON FUNCTION gp.move_bucket(regclass, int, int) FROM PUBLIC;
+
+-- Shrink the cluster: every bucket the segment keeps moves to the other
+-- segments, the segment stops, and its row goes away.  Its number stays
+-- a hole and is never given to a new node, so an old connection or a
+-- forgotten data directory does not pass for a new one.  Tables of the
+-- group are locked while their buckets move.  Mirrors of the segment
+-- are not handled yet: remove them first
+CREATE FUNCTION gp.shrink_segment(segment_id int)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	g record;
+	b int;
+	target int;
+	remaining int[];
+	moved int;
+	wait int;
+BEGIN
+	IF current_setting('gp.role', true) IS DISTINCT FROM 'coordinator' THEN
+		RAISE EXCEPTION 'the cluster shrinks on the coordinator only';
+	END IF;
+	IF NOT EXISTS (SELECT FROM gp.segments s
+				   WHERE s.segment_id = shrink_segment.segment_id) THEN
+		RAISE EXCEPTION 'segment % is not registered',
+			shrink_segment.segment_id;
+	END IF;
+	IF EXISTS (SELECT FROM gp.mirrors m
+			   WHERE m.segment_id = shrink_segment.segment_id) THEN
+		RAISE EXCEPTION 'segment % keeps a mirror; remove the mirror first',
+			shrink_segment.segment_id;
+	END IF;
+	SELECT array_agg(s2.segment_id ORDER BY s2.segment_id)
+	INTO remaining
+	FROM gp.segments s2
+	WHERE s2.segment_id <> shrink_segment.segment_id;
+	IF remaining IS NULL OR cardinality(remaining) = 0 THEN
+		RAISE EXCEPTION 'the cluster keeps no other segment';
+	END IF;
+
+	-- Every bucket the segment keeps moves to the segments that stay, in
+	-- turn, so the shares even out
+	FOR g IN SELECT c.colocation_id, c.nbuckets
+			 FROM gp.colocation_groups c
+			 WHERE EXISTS (SELECT FROM gp.distribution_policy p
+						   WHERE p.colocation_id = c.colocation_id AND
+								 p.kind = 'hash')
+			 ORDER BY c.colocation_id
+	LOOP
+		moved := 0;
+		FOR b IN 0 .. g.nbuckets - 1 LOOP
+			IF (SELECT c.map[b + 1] FROM gp.colocation_groups c
+				WHERE c.colocation_id = g.colocation_id)
+				= shrink_segment.segment_id THEN
+				target := remaining[moved % cardinality(remaining) + 1];
+				PERFORM gp.move_bucket(
+					(SELECT p.relid FROM gp.distribution_policy p
+					 WHERE p.colocation_id = g.colocation_id AND
+						   p.kind = 'hash'
+					 ORDER BY p.relid LIMIT 1),
+					b, target);
+				moved := moved + 1;
+			END IF;
+		END LOOP;
+	END LOOP;
+
+	-- The segment stops, and its row goes away.  The register worker of
+	-- the segment re-registers on its heartbeat and would put the row
+	-- back after a delete, so the delete repeats until the row, whose
+	-- server is dying, stops coming back
+	FOR wait IN 1 .. 30 LOOP
+		DELETE FROM gp.segments del
+		WHERE del.segment_id = shrink_segment.segment_id;
+		EXIT WHEN NOT EXISTS (SELECT FROM gp.segments s
+							  WHERE s.segment_id = shrink_segment.segment_id);
+		PERFORM pg_sleep(1);
+		BEGIN
+			PERFORM gp.stop_segment(shrink_segment.segment_id);
+		EXCEPTION WHEN OTHERS THEN
+			-- The segment is already down
+		END;
+	END LOOP;
+	IF EXISTS (SELECT FROM gp.segments s
+			   WHERE s.segment_id = shrink_segment.segment_id) THEN
+		RAISE EXCEPTION 'segment % did not leave the cluster',
+			shrink_segment.segment_id;
+	END IF;
+END
+$$;
+
+REVOKE ALL ON FUNCTION gp.shrink_segment(int) FROM PUBLIC;
 
 -- Run a command on all segments at once and return the command status of
 -- each; rows of a query are discarded.  Each segment runs the command in a
@@ -456,7 +547,6 @@ BEGIN
 		PERFORM gp.policy_changed(relation);
 		RETURN;
 	END IF;
-
 
 
 	IF cardinality(key) = 0 THEN

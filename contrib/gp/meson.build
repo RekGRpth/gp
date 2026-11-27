@@ -126,6 +126,7 @@ tests += {
       't/065_coordinator_share.pl',
       't/066_mirrors.pl',
       't/067_move_bucket.pl',
+      't/068_shrink.pl',
     ],
   },
 }
