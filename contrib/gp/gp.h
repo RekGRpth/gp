@@ -72,6 +72,8 @@ extern int	gp_role;
 extern int	gp_segment_id;
 /* The segment whose rows a gather of the coordinator hands out now */
 extern int	gp_row_segment;
+/* Analyze the tables the cluster has changed past the threshold */
+extern bool gp_autoanalyze;
 extern char *gp_database;
 extern int	gp_max_segments;
 extern int	gp_default_distribution;
@@ -148,6 +150,7 @@ extern bool gp_slice_insert_motion(Query *parse, bool *motion);
 
 /* stats.c */
 extern void gp_analyze(VacuumStmt *stmt);
+extern void gp_autoanalyze_check(void);
 
 /* motion.c */
 extern void gp_motion_init(void);

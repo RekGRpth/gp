@@ -1106,6 +1106,9 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 	int			mark = 0;
 	bool		like_local = false;
 
+	/* The tables the cluster has changed past the threshold, analyzed */
+	gp_autoanalyze_check();
+
 	/* COPY into a distributed table goes to the segments instead */
 	if (IsA(parsetree, CopyStmt) && dispatch_depth == 0 && IsUnderPostmaster &&
 		gp_copy_from(pstmt, queryString, qc))

@@ -119,6 +119,7 @@ tests += {
       't/059_slices_cancel.pl',
       't/060_segment_id.pl',
       't/061_time_functions.pl',
+      't/062_autostats.pl',
     ],
   },
 }

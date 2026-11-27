@@ -28,10 +28,20 @@
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
 #include "nodes/value.h"
+#include "postmaster/autovacuum.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
 
 #include "gp.h"
+
+/* A change count of one table, summed over the segments */
+typedef struct GpModCount
+{
+	Oid			relid;
+	uint64		mods;
+} GpModCount;
 
 static const char *const gp_stat_names[] = {
 	"null_frac",
@@ -195,6 +205,8 @@ gp_stats_restore(const char *sql)
 		elog(ERROR, "could not restore cluster statistics");
 }
 
+static void gp_stats_import(Oid relid);
+
 /* Sum relation sizes, except that a replicated table is already whole */
 static void
 gp_stats_relation(Oid relid, bool replicated)
@@ -324,15 +336,162 @@ gp_analyze(VacuumStmt *stmt)
 
 	SPI_connect();
 	foreach(lc, relids)
-	{
-		Oid			relid = lfirst_oid(lc);
-		GpPolicy	policy;
-
-		if (!gp_policy_get(relid, &policy))
-			continue;
-		gp_stats_relation(relid, policy.replicated);
-		gp_stats_attributes(relid, segments[0].segment_id);
-	}
+		gp_stats_import(lfirst_oid(lc));
 	SPI_finish();
 	CommandCounterIncrement();
+}
+
+/* Bring the cluster statistics of one table to the coordinator */
+static void
+gp_stats_import(Oid relid)
+{
+	GpPolicy	policy;
+	GpSegment  *segments;
+
+	if (!gp_policy_get(relid, &policy))
+		return;
+	if (gp_segments_get(&segments) == 0)
+		return;
+	gp_stats_relation(relid, policy.replicated);
+	gp_stats_attributes(relid, segments[0].segment_id);
+}
+
+/*
+ * Analyze the distributed tables the cluster has changed more than the
+ * threshold autovacuum names: the sum of the changes of the segments
+ * answers the changes of the cluster, and the ANALYZE of the segments
+ * resets their counters.  The check runs at the start of a statement of
+ * the coordinator, while gp.autoanalyze is on; a failure of the check
+ * warns and leaves the statement alone
+ */
+void
+gp_autoanalyze_check(void)
+{
+	GpQuery    *query;
+	PGresult   *res;
+	ListCell   *lc;
+	List	   *relids = NIL;
+	MemoryContext ctx = CurrentMemoryContext;
+	double		threshold;
+	double		scale;
+
+	if (!gp_autoanalyze || !IsUnderPostmaster ||
+		gp_role != GP_ROLE_COORDINATOR)
+		return;
+
+	threshold = strtod(GetConfigOption("autovacuum_analyze_threshold",
+									   false, false), NULL);
+	scale = strtod(GetConfigOption("autovacuum_analyze_scale_factor",
+								   false, false), NULL);
+
+	PG_TRY();
+	{
+		ListCell   *lc2;
+		List	   *counts = NIL;
+
+		query = gp_query_start("SELECT relid::text, "
+			"n_mod_since_analyze::text "
+			"FROM pg_catalog.pg_stat_user_tables "
+			"WHERE n_mod_since_analyze > 0", 0, NULL);
+		while ((res = gp_query_next(query)) != NULL)
+		{
+			Oid			relid;
+			uint64		mods;
+			ListCell   *lc3;
+			GpModCount *m;
+			GpModCount *found = NULL;
+
+			relid = (Oid) strtoul(PQgetvalue(res, 0, 0), NULL, 10);
+			mods = strtoull(PQgetvalue(res, 0, 1), NULL, 10);
+			foreach(lc3, counts)
+			{
+				GpModCount *c = lfirst(lc3);
+
+				if (c->relid == relid)
+				{
+					c->mods += mods;
+					found = c;
+					break;
+				}
+			}
+			if (found == NULL)
+			{
+				m = palloc_object(GpModCount);
+				m->relid = relid;
+				m->mods = mods;
+				counts = lappend(counts, m);
+			}
+			PQclear(res);
+		}
+		gp_query_end(query, false);
+
+		foreach(lc2, counts)
+		{
+			GpModCount *m = lfirst(lc2);
+			GpPolicy	policy;
+			const char *schema;
+			HeapTuple	tuple;
+
+			schema = get_namespace_name(get_rel_namespace(m->relid));
+			if (schema == NULL ||
+				strcmp(schema, "pg_catalog") == 0 ||
+				strcmp(schema, "information_schema") == 0)
+				continue;
+			if (!gp_policy_get(m->relid, &policy))
+				continue;
+			tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(m->relid));
+			if (HeapTupleIsValid(tuple))
+			{
+				double		reltuples;
+
+				reltuples = ((Form_pg_class) GETSTRUCT(tuple))->reltuples;
+				ReleaseSysCache(tuple);
+				if (m->mods > threshold + scale * reltuples)
+					relids = lappend_oid(relids, m->relid);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(ctx);
+		FlushErrorState();
+		ereport(WARNING,
+				errcode(ERRCODE_INTERNAL_ERROR),
+				errmsg("the check of the statistics of the cluster failed"),
+				errdetail("The statements go on; turn gp.autoanalyze off "
+						  "if the check is not wanted."));
+		return;
+	}
+	PG_END_TRY();
+
+	if (relids == NIL)
+		return;
+
+	PG_TRY();
+	{
+		SPI_connect();
+		foreach(lc, relids)
+		{
+			Oid			relid = lfirst_oid(lc);
+			const char *schema = get_namespace_name(get_rel_namespace(relid));
+			const char *relname = get_rel_name(relid);
+
+			gp_dispatch_xact(psprintf("ANALYZE %s",
+				quote_qualified_identifier(schema, relname)));
+			gp_stats_import(relid);
+		}
+		SPI_finish();
+		CommandCounterIncrement();
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(ctx);
+		FlushErrorState();
+		ereport(WARNING,
+				errcode(ERRCODE_INTERNAL_ERROR),
+				errmsg("the automatic analyze of the cluster failed"),
+				errdetail("The statistics stay as they were; the next "
+						  "statement checks again."));
+	}
+	PG_END_TRY();
 }

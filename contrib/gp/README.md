@@ -7,8 +7,9 @@ patch of the server, `new_oid_hook`, rather than a fork.
 
 **Status: under development, not for production.**  The cluster forms,
 segments register themselves, and DDL of the coordinator runs on the
-segments with the same OIDs.  Distributed queries and distributed
-transactions are yet to come; see [Roadmap](#roadmap).
+segments with the same OIDs.  Distributed queries and transactions run on
+the cluster; the roadmap names what remains, see
+[Roadmap](#roadmap).
 
 ## Requirements
 
@@ -699,6 +700,7 @@ All are set at server start unless noted.
 | `gp.dispatch_oids_session` | off | Keeps `gp.dispatch_oids` for the next transaction, for a command out of a transaction block |
 | `gp.allow_local_ddl` | off | Lets a segment create objects of its own; superuser, for maintenance |
 | `gp.dispatch_ddl` | on | Sends DDL of the coordinator to the segments; superuser, for maintenance |
+| `gp.autoanalyze` | off | Analyzes the distributed tables the cluster has changed past the threshold of autovacuum, at the start of a statement of the coordinator; settable by a user |
 | `gp.default_distribution` | `coordinator` | `first_column` distributes new tables by their first column; settable by a user |
 
 ### Functions
@@ -835,10 +837,17 @@ by the patch and `contrib/gp`.
    plans; aggregates of CTEs over joins run on the segments; joins the
    sublinks drive keep the table of the fromlist; `DISTINCT` is local when
    its whole key is in the output; `INSERT ... SELECT` skips Motion when
-   source and target are already colocated.  What stays on the coordinator:
-   joins whose graph is not connected by keys, mixed outer and inner levels
-   of one fromlist, and queries the rules cannot prove safe — the fallback
-   always gives a right answer.
+   source and target are already colocated; a level of a fromlist whose
+   joins mix kinds rides too, when every join of the level keeps the rows
+   of its leftmost table: the leftmost table partitions the answer, so the
+   slice keeps it on its segments and every other table of the level
+   broadcasts whole — an inner join over a chain of LEFT joins, the semi,
+   anti and scalar sublinks of the level beside them, and a chain of FULL
+   joins answered on one segment.  What stays on the coordinator: joins
+   whose graph is not connected by keys, a RIGHT join beside other kinds of
+   its level, a FULL join beside them, a derived table on such a level, and
+   queries the rules cannot prove safe — the fallback always gives a right
+   answer.
 6. **Motions** — done: a `GpMotion` custom scan moves tables by
    redistribution or broadcast over a serialized-plan transport with binary
    tuples; clean
@@ -850,9 +859,13 @@ by the patch and `contrib/gp`.
    as well: a chain of left joins keeps its first table on the segments and
    broadcasts the rest, and a chain of full joins broadcasts every table to
    one segment.
-7. **Statistics** — implemented for manual `ANALYZE`: relation sizes are
-   summed over the segments, attribute statistics are sampled from the first
-   segment, and the planner uses the imported cluster sizes.
+7. **Statistics** — done: manual `ANALYZE` runs on the segments (relation
+   sizes are summed over them, attribute statistics are sampled from the
+   first segment, and the planner uses the imported cluster sizes), and
+   `gp.autoanalyze` analyzes the distributed tables the cluster has
+   changed past the threshold autovacuum names: the start of a statement
+   sums the change counters of the segments, and the tables past the
+   threshold take the same analyze and import.
 8. **More kinds of distribution** — replicated with the coordinator, on the
    coordinator only, on one segment.
 9. **Management without ssh** — done: systemd units, the state of the
@@ -860,7 +873,7 @@ by the patch and `contrib/gp`.
    servers.
 
 Later: mirrors, growing and shrinking the cluster by moving buckets,
-two-stage aggregates, range and list distribution.
+range and list distribution.
 
 ## License
 
