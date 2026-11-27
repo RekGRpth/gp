@@ -885,11 +885,11 @@ by the patch and `contrib/gp`.
    anti and scalar sublinks of the level beside them, and a chain of FULL
    joins answered on one segment; a level whose outer joins mix kinds — a
    FULL join beside a LEFT join, a RIGHT join beside them — answers on one
-   segment too, where every table comes whole and the joins of the level
-   replay the way they would here.  What stays on the coordinator: joins
-   whose graph is not connected by keys, a level of such tables that keeps
-   a sublink or a derived table on it, and queries the rules cannot prove
-   safe — the fallback always gives a right answer.
+   segment too, where every table comes whole and the joins and the
+   sublinks of the level replay the way they would here.  What stays on
+   the coordinator: joins whose graph is not connected by keys, a level
+   of such tables that keeps a derived table on it, and queries the rules
+   cannot prove safe — the fallback always gives a right answer.
 6. **Motions** — done: a `GpMotion` custom scan moves tables by
    redistribution or broadcast over a serialized-plan transport with binary
    tuples; clean

@@ -4623,7 +4623,7 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 	 * it
 	 */
 	outer_mixed = false;
-	if (list_length(tables) > 2 && !original->hasSubLinks &&
+	if (list_length(tables) > 2 &&
 		!gp_slice_join_derived(original) && !outer_same && flat_stay == NULL &&
 		IsA(original->jointree, FromExpr) &&
 		list_length(original->jointree->fromlist) == 1 &&
@@ -4687,7 +4687,7 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 	}
 	if ((list_length(tables) != 2 || original->hasSubLinks ||
 		 gp_slice_join_derived(original)) &&
-		!outer_same &&
+		!outer_same && !outer_mixed &&
 		!gp_slice_join_all_inner_levels(tables))
 		return false;
 	if (redistributing)
