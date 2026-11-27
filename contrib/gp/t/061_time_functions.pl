@@ -45,16 +45,30 @@ is(run('SELECT count(*), max(d) FROM t WHERE d <= current_date'),
 	run('SELECT count(*), max(d) FROM l WHERE d <= current_date'),
 	'the aggregates take the fold in too');
 
-# The SQL of the segments carries the literal of the fold, not the function
-like(plan_for('SELECT count(*) FROM t WHERE d < current_date'),
+# The SQL of the segments carries the literal of the fold, not the
+# function: the query that the segments answer whole rides its filter with
+# the constant of the transaction of the coordinator
+like(plan_for('SELECT a, count(*) FROM t WHERE d < current_date GROUP BY a'),
 	qr/Remote SQL:.*'::date/s,
 	'the SQL of the segments carries the literal of the date');
-unlike(plan_for('SELECT count(*) FROM t WHERE d < current_date'),
+unlike(plan_for('SELECT a, count(*) FROM t WHERE d < current_date GROUP BY a'),
 	qr/Remote SQL:.*current_date/s,
 	'and no current_date: the segments need no clock of their own');
-like(plan_for("SELECT count(*) FROM t WHERE ts > current_timestamp"),
+like(plan_for('SELECT a, count(*) FROM t WHERE ts > current_timestamp ' .
+			  'GROUP BY a'),
 	qr/Remote SQL:.*'::timestamp with time zone/s,
 	'the literal of the timestamp rides the same way');
+is(run('SELECT count(*) FROM t WHERE d < current_date'),
+	run('SELECT count(*) FROM l WHERE d < current_date'),
+	'a filter the segments cannot take answers on the coordinator');
+
+# The plan of the coordinator keeps the functions the way the query wrote
+# them: the plan prints them so, and prunes with them as it prunes without
+# us
+like(plan_for('SELECT a FROM t WHERE d < current_date'),
+	qr/CURRENT_DATE/, 'the plan of the coordinator prints the function');
+unlike(plan_for('SELECT a FROM t WHERE d < current_date'),
+	qr/Filter:.*'::date/, 'and does not fold it into a literal');
 
 # The forms of the family fold too
 is(run('SELECT localtimestamp::date, count(*) FROM t GROUP BY 1'),
