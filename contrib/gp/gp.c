@@ -111,6 +111,7 @@ gp_dispatches_bump(void)
 }
 int			gp_segment_id = 0;
 int			gp_row_segment = 0;
+bool		gp_autoanalyze = false;
 static int	gp_requester_segment = 0;
 char	   *gp_database = NULL;
 int			gp_max_segments = 64;
@@ -282,6 +283,17 @@ _PG_init(void)
 							 &gp_dispatch_ddl,
 							 true,
 							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("gp.autoanalyze",
+							 "Analyzes the distributed tables the cluster has changed past the threshold of autovacuum.",
+							 "The check runs at the start of a statement of the coordinator, sums the change counters of the segments, and analyzes the tables whose cluster has changed more than autovacuum_analyze_threshold plus autovacuum_analyze_scale_factor of their rows; the statistics of the cluster land on the coordinator the way a manual ANALYZE brings them.",
+							 &gp_autoanalyze,
+							 false,
+							 PGC_USERSET,
 							 0,
 							 NULL,
 							 NULL,
