@@ -121,6 +121,7 @@ tests += {
       't/061_time_functions.pl',
       't/062_autostats.pl',
       't/063_range_list.pl',
+      't/064_mixed_outer.pl',
     ],
   },
 }

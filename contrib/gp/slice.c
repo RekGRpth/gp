@@ -4448,6 +4448,36 @@ gp_slice_join_has_left(Node *node)
 }
 
 /*
+ * Whether the tree keeps an outer join beside a join of another kind: a
+ * level the one-kind chain and the flat path of the leftmost table refuse
+ * is such a level.  It still answers whole on one segment, where every
+ * table comes whole and the joins replay the way they ran here
+ */
+static bool
+gp_slice_join_outer_mixed(Node *node, bool *outer, bool *mixed)
+{
+	JoinExpr   *join;
+
+	if (!IsA(node, JoinExpr))
+		return false;
+	join = (JoinExpr *) node;
+	if (join->jointype == JOIN_INNER)
+	{
+		if (*outer)
+			*mixed = true;
+	}
+	else
+	{
+		if (*outer)
+			*mixed = true;
+		*outer = true;
+	}
+	return *mixed ||
+		gp_slice_join_outer_mixed(join->larg, outer, mixed) ||
+		gp_slice_join_outer_mixed(join->rarg, outer, mixed);
+}
+
+/*
  * The kept table of a level of a multiway join: every join of the level
  * keeps the rows of the leftmost table of the tree -- an inner join keeps
  * the pairs, a LEFT join keeps its left side, and a semi, an anti or a
@@ -4527,6 +4557,7 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 	bool		redistributing;
 	bool		multiway = false;
 	bool		outer_same = false;
+	bool		outer_mixed = false;
 
 	*single_segment = false;
 	*agg_stay = NULL;
@@ -4565,9 +4596,29 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 		gp_slice_join_all_same_type(linitial(original->jointree->fromlist),
 									&jointype);
 	flat_stay = outer_same ? NULL : gp_slice_join_flat_outer(original, tables);
+
+	/*
+	 * A level whose outer joins mix kinds answers on one segment: every
+	 * table comes whole there, and the joins of the level replay the way
+	 * they ran on the coordinator.  The slice costs the whole of every
+	 * table on one server, so only the levels nothing smarter answers take
+	 * it
+	 */
+	outer_mixed = false;
+	if (list_length(tables) > 2 && !original->hasSubLinks &&
+		!gp_slice_join_derived(original) && !outer_same && flat_stay == NULL &&
+		IsA(original->jointree, FromExpr) &&
+		list_length(original->jointree->fromlist) == 1 &&
+		IsA(linitial(original->jointree->fromlist), JoinExpr))
+	{
+		bool		outer = false;
+
+		gp_slice_join_outer_mixed(linitial(original->jointree->fromlist),
+								  &outer, &outer_mixed);
+	}
 	if ((list_length(tables) != 2 || original->hasSubLinks ||
 		 gp_slice_join_derived(original)) &&
-		!outer_same && flat_stay == NULL &&
+		!outer_same && flat_stay == NULL && !outer_mixed &&
 		!gp_slice_join_all_inner_levels(tables))
 		return false;
 	stay = flat_stay != NULL ? flat_stay :
@@ -4585,6 +4636,22 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 			if (!gp_slice_redistribute_rte(original, stay, move, true))
 				return false;
 		}
+		return true;
+	}
+	if (outer_mixed)
+	{
+		/* Every table comes whole to the segment the slice runs on */
+		stay = linitial(tables);
+		foreach(lc, tables)
+		{
+			move = lfirst(lc);
+
+			if (move->policy.replicated)
+				continue;
+			if (!gp_slice_redistribute_rte(original, stay, move, true))
+				return false;
+		}
+		*single_segment = true;
 		return true;
 	}
 	redistributing = false;
