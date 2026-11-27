@@ -152,6 +152,20 @@ $$;
 
 REVOKE ALL ON FUNCTION gp.register_mirror(int, text, int) FROM PUBLIC;
 
+-- Move a bucket of the colocation group of a table to another segment:
+-- the rows of the bucket copy to the new segment, the bucket's row of
+-- the map switches in one transaction, and the rows go away from the old
+-- segment.  The tables of the group are locked against the statements of
+-- the cluster while the rows are in two places.  Returns the number of
+-- the moved rows of the table
+CREATE FUNCTION gp.move_bucket(relation regclass, bucket int,
+							   to_segment int)
+RETURNS int
+AS 'MODULE_PATHNAME', 'gp_move_bucket'
+LANGUAGE C STRICT;
+
+REVOKE ALL ON FUNCTION gp.move_bucket(regclass, int, int) FROM PUBLIC;
+
 -- Run a command on all segments at once and return the command status of
 -- each; rows of a query are discarded.  Each segment runs the command in a
 -- transaction of its own: a rollback on the coordinator does not undo it.

@@ -16,7 +16,7 @@ OBJS = \
 	motion.o \
 	oids.o \
 	recovery.o \
-	route.o \
+	move.o route.o \
 	segments.o \
 	slice.o \
 	state.o \
