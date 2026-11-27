@@ -239,6 +239,17 @@ such a table reads the copy alone, without dispatching anything.  A row goes to 
 functions of the key types combined as hash partitioning does, with a seed
 of its own; the bucket goes to a segment by a map.
 
+`gp.move_bucket(table, bucket, segment)` moves a bucket of the
+colocation group of a table to another segment: the rows of the bucket
+copy to the new segment, the bucket's row of the map switches in one
+transaction, and the rows go away from the old segment.  The tables of
+the group are locked against the statements of the cluster while the
+rows are in two places, and the sessions drop their cached policies
+after.  Every hash table of the group moves its share, so the joins by
+the key stay local.  Moving the buckets is how a cluster grows and
+shrinks: a new segment registers and takes buckets one by one, and a
+leaving segment hands out all of its buckets before its row goes away.
+
 `gp.distribute_range(table, key, bounds, segments)` distributes an empty
 table by the ranges of one key column: the bounds are the texts of the
 type of the key, `bounds[i]` ends the bucket `i` and starts the next, and
@@ -907,7 +918,9 @@ by the patch and `contrib/gp`.
    nodes, the stop of a node, the tail of a log, and settings on all
    servers.
 
-Later: mirrors, growing and shrinking the cluster by moving buckets.
+Later: mirrors.  The moving of the buckets is the base of growing and
+shrinking the cluster; the commands of the growth and the shrink on top
+of it are yet to come.
 
 ## License
 

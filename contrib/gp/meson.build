@@ -15,6 +15,7 @@ gp_sources = files(
   'motion.c',
   'oids.c',
   'recovery.c',
+  'move.c',
   'route.c',
   'segments.c',
   'slice.c',
@@ -124,6 +125,7 @@ tests += {
       't/064_mixed_outer.pl',
       't/065_coordinator_share.pl',
       't/066_mirrors.pl',
+      't/067_move_bucket.pl',
     ],
   },
 }

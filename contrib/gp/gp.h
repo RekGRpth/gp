@@ -130,6 +130,7 @@ extern GpRoute *gp_route_begin(Relation rel, const GpPolicy *policy, int only);
 extern void gp_route_row(GpRoute *route, const Datum *values,
 						 const bool *nulls);
 extern void gp_route_end(GpRoute *route);
+extern Datum gp_move_bucket(PG_FUNCTION_ARGS);
 
 /* insert.c */
 extern void gp_insert_init(void);
