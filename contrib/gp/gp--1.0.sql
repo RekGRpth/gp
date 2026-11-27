@@ -19,6 +19,22 @@ CREATE TABLE gp.segments (
 
 SELECT pg_catalog.pg_extension_config_dump('gp.segments', '');
 
+-- The mirror of every segment: a physical standby of the primary, kept
+-- by replication of the server itself.  The coordinator watches the pairs
+-- and promotes the mirror when the primary stops answering; the promoted
+-- server takes the identity of the segment, and the row of the mirror
+-- goes away
+CREATE TABLE gp.mirrors (
+	segment_id int PRIMARY KEY REFERENCES gp.segments (segment_id)
+			   ON DELETE CASCADE,
+	host text NOT NULL CHECK (octet_length(host) < 256),
+	port int NOT NULL CHECK (port BETWEEN 1 AND 65535),
+	registered timestamptz NOT NULL DEFAULT now(),
+	UNIQUE (host, port)
+);
+
+SELECT pg_catalog.pg_extension_config_dump('gp.mirrors', '');
+
 -- The coordinator keeps a copy of gp.segments in shared memory, for any
 -- database.  A transaction that changes the table updates the copy when it
 -- commits.
@@ -94,6 +110,47 @@ END
 $$;
 
 REVOKE ALL ON FUNCTION gp.register_segment(int, text, int) FROM PUBLIC;
+
+
+-- Register the mirror of a segment: the standby answers for the segment
+-- when its primary stops answering.  Superusers only, for the pair is the
+-- whole of the data of the cluster
+CREATE FUNCTION gp.register_mirror(segment_id int, host text, port int)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+#variable_conflict use_column
+BEGIN
+	IF current_setting('gp.role', true) IS DISTINCT FROM 'coordinator' THEN
+		RAISE EXCEPTION 'mirrors register on the coordinator only';
+	END IF;
+	IF current_database() <> current_setting('gp.database') THEN
+		RAISE EXCEPTION 'mirrors register in database "%" only',
+			current_setting('gp.database');
+	END IF;
+	IF NOT EXISTS (SELECT FROM gp.segments s
+				   WHERE s.segment_id = register_mirror.segment_id) THEN
+		RAISE EXCEPTION 'segment % is not registered',
+			register_mirror.segment_id;
+	END IF;
+	IF EXISTS (SELECT FROM gp.mirrors m
+			   WHERE m.host = register_mirror.host AND
+					 m.port = register_mirror.port) THEN
+		RAISE EXCEPTION 'a mirror is already registered at %:%',
+			register_mirror.host, register_mirror.port;
+	END IF;
+
+	INSERT INTO gp.mirrors (segment_id, host, port)
+	VALUES (register_mirror.segment_id, register_mirror.host,
+			register_mirror.port)
+	ON CONFLICT (segment_id) DO UPDATE
+		SET host = EXCLUDED.host, port = EXCLUDED.port,
+			registered = now();
+END
+$$;
+
+REVOKE ALL ON FUNCTION gp.register_mirror(int, text, int) FROM PUBLIC;
 
 -- Run a command on all segments at once and return the command status of
 -- each; rows of a query are discarded.  Each segment runs the command in a
