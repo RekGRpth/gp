@@ -49,7 +49,65 @@ struct GpRoute
 	bool		direct;			/* all rows go to the one segment of the route */
 	StringInfoData *buffers;	/* one for each segment */
 	StringInfoData tuple;		/* the row that is being sent */
+	/* The rules of a range or a list distribution, parsed to datums of the
+	 * key type, with the segment position of every rule */
+	Datum	   *rule_lower;
+	Datum	   *rule_upper;
+	Datum	   *rule_values;
+	bool	   *rule_haslower;
+	bool	   *rule_hasupper;
+	bool	   *rule_hasvalue;
+	int		   *rule_pos;
+	char	   *relname;
 };
+
+/* The rule of a key: the range that holds it, or the value that equals it,
+ * as a position in the rules; an error when the key has none */
+static int
+gp_route_rule(GpRoute *route, Datum value, bool isnull)
+{
+	GpPolicy   *policy = &route->policy;
+	Oid			cmp = gp_cmp_proc_of(route->keytypes[0]);
+
+	if (isnull)
+		ereport(ERROR,
+				errcode(ERRCODE_CHECK_VIOLATION),
+				errmsg("the distribution key of table \"%s\" is NULL",
+					   route->relname),
+				errhint("A range or a list distribution has no bucket for NULL."));
+	if (policy->kind == GP_POLICY_RANGE)
+	{
+		for (int i = 0; i < policy->nrules; i++)
+		{
+			if (route->rule_hasupper[i] &&
+				DatumGetInt32(OidFunctionCall2Coll(cmp, InvalidOid, value,
+												   route->rule_upper[i])) > 0)
+				continue;
+			if (route->rule_haslower[i] &&
+				DatumGetInt32(OidFunctionCall2Coll(cmp, InvalidOid, value,
+												   route->rule_lower[i])) <= 0)
+				continue;
+			return i;
+		}
+		ereport(ERROR,
+				errcode(ERRCODE_CHECK_VIOLATION),
+				errmsg("the distribution key of table \"%s\" is above every range",
+					   route->relname),
+				errhint("A range distribution has no bucket above its last bound."));
+	}
+	for (int i = 0; i < policy->nrules; i++)
+	{
+		if (!route->rule_hasvalue[i])
+			continue;
+		if (DatumGetInt32(OidFunctionCall2Coll(cmp, InvalidOid, value,
+											   route->rule_values[i])) == 0)
+			return i;
+	}
+	ereport(ERROR,
+			errcode(ERRCODE_CHECK_VIOLATION),
+			errmsg("the distribution key of table \"%s\" matches no value of its list distribution",
+				   route->relname));
+}
 
 /*
  * Start a route to the segments for rows of a table; the memory of the
@@ -97,12 +155,67 @@ gp_route_begin(Relation rel, const GpPolicy *policy, int only)
 	for (int k = 0; k < policy->nkeys; k++)
 		route->keytypes[k] = TupleDescAttr(tupDesc, policy->keys[k] - 1)->atttypid;
 
+	/* The rules of a range or a list distribution, as datums of the key
+	 * type, and the segment position of every rule */
+	if (policy->kind == GP_POLICY_RANGE || policy->kind == GP_POLICY_LIST)
+	{
+		Oid			infn;
+		Oid			typioparam;
+		int			n = policy->nrules;
+
+		getTypeInputInfo(route->keytypes[0], &infn, &typioparam);
+		route->rule_lower = palloc_array(Datum, n);
+		route->rule_upper = palloc_array(Datum, n);
+		route->rule_values = palloc_array(Datum, n);
+		route->rule_haslower = palloc_array(bool, n);
+		route->rule_hasupper = palloc_array(bool, n);
+		route->rule_hasvalue = palloc_array(bool, n);
+		route->rule_pos = palloc_array(int, n);
+		for (int i = 0; i < n; i++)
+		{
+			route->rule_haslower[i] = policy->rule_lower[i] != NULL;
+			route->rule_hasupper[i] = policy->rule_upper[i] != NULL;
+			route->rule_hasvalue[i] = policy->rule_values[i] != NULL;
+			route->rule_lower[i] = route->rule_haslower[i] ?
+				OidInputFunctionCall(infn, policy->rule_lower[i],
+									 typioparam, -1) : (Datum) 0;
+			route->rule_upper[i] = route->rule_hasupper[i] ?
+				OidInputFunctionCall(infn, policy->rule_upper[i],
+									 typioparam, -1) : (Datum) 0;
+			route->rule_values[i] = route->rule_hasvalue[i] ?
+				OidInputFunctionCall(infn, policy->rule_values[i],
+									 typioparam, -1) : (Datum) 0;
+			/* The segment position of the rule, after the route knows its
+			 * segments */
+		}
+	}
+
+	route->relname = pstrdup(RelationGetRelationName(rel));
 	route->direct = only != 0;
 	route->nsegments = gp_copy_open(copysql, only, &route->segments);
 	if (route->nsegments == 0)
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				errmsg("the cluster has no segments"));
+
+	/* The segment position of every rule of a range or a list */
+	if (policy->kind == GP_POLICY_RANGE || policy->kind == GP_POLICY_LIST)
+		for (int i = 0; i < policy->nrules; i++)
+		{
+			int			pos = -1;
+
+			for (int k = 0; k < route->nsegments && pos < 0; k++)
+				if (route->segments[k].segment_id == policy->rule_segments[i])
+					pos = k;
+			if (pos < 0)
+				ereport(ERROR,
+						errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("bucket %d of table \"%s\" is on segment %d, which is not registered",
+							   policy->rule_buckets[i],
+							   RelationGetRelationName(rel),
+							   policy->rule_segments[i]));
+			route->rule_pos[i] = pos;
+		}
 
 	/* The segment of each bucket, as a position in the segments */
 	if (!policy->replicated && !route->direct)
@@ -174,6 +287,14 @@ gp_route_row(GpRoute *route, const Datum *values, const bool *nulls)
 	}
 	else if (route->direct)
 		first = last = 0;
+	else if (policy->kind == GP_POLICY_RANGE ||
+			 policy->kind == GP_POLICY_LIST)
+	{
+		int			rule = gp_route_rule(route, values[policy->keys[0] - 1],
+										 nulls[policy->keys[0] - 1]);
+
+		first = last = route->rule_pos[rule];
+	}
 	else
 	{
 		for (int k = 0; k < policy->nkeys; k++)

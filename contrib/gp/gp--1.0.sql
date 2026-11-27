@@ -132,16 +132,38 @@ CREATE TABLE gp.colocation_groups (
 );
 
 -- How the tables of this database are distributed: by hash of the key
--- columns, in a colocation group, or replicated to all segments
+-- columns, in a colocation group, by the ranges or the values of one key
+-- column, or replicated to all segments
 CREATE TABLE gp.distribution_policy (
 	relid regclass PRIMARY KEY,
-	kind text NOT NULL CHECK (kind IN ('hash', 'replicated')),
+	kind text NOT NULL CHECK (kind IN ('hash', 'replicated', 'range', 'list')),
 	key_columns int2[],
 	colocation_id int REFERENCES gp.colocation_groups,
 	CHECK ((kind = 'hash') =
 		   (key_columns IS NOT NULL AND colocation_id IS NOT NULL)),
-	CHECK (kind = 'hash' OR (key_columns IS NULL AND colocation_id IS NULL))
+	CHECK ((kind = 'replicated') = (key_columns IS NULL)),
+	CHECK (colocation_id IS NULL OR kind = 'hash')
 );
+
+-- The rules of a range or a list distribution: the bucket of every range
+-- of values, with its bounds, and of every value of a list.  The bounds
+-- and the values are the texts of the type of the key column.  A range
+-- keeps its bounds and no value; a list keeps values and no bounds.  A
+-- range with n bounds has n + 1 buckets: the bucket of bucket index i
+-- holds the values above bounds[i - 1] and up to bounds[i], the first
+-- holds all below bounds[0], and the last all above the last bound
+CREATE TABLE gp.distribution_rules (
+	relid regclass NOT NULL REFERENCES gp.distribution_policy (relid)
+			   ON DELETE CASCADE,
+	bucket int NOT NULL CHECK (bucket >= 0),
+	segment int NOT NULL,
+	lower text,
+	upper text,
+	value text,
+	CHECK (value IS NULL OR (lower IS NULL AND upper IS NULL))
+);
+
+SELECT pg_catalog.pg_extension_config_dump('gp.distribution_rules', '');
 
 SELECT pg_catalog.pg_extension_config_dump('gp.colocation_groups', '');
 SELECT pg_catalog.pg_extension_config_dump('gp.colocation_groups_colocation_id_seq', '');
@@ -443,6 +465,208 @@ END
 $$;
 
 REVOKE ALL ON FUNCTION gp.distribute(regclass, name[], regclass, int) FROM PUBLIC;
+
+-- Distribute a table by the ranges of one key column: bounds[i] ends the
+-- bucket i and starts the bucket i + 1, every bucket of which goes to
+-- segments[i].  The bounds are the texts of the type of the key, and must
+-- ascend strictly.  A row whose key is NULL, or that no range covers
+-- through its upper bounds, has no bucket: such a row cannot be inserted
+CREATE FUNCTION gp.distribute_range(relation regclass, key name,
+									bounds text[], segments int[])
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	attnum int2;
+	typreg regtype;
+	typname text;
+	nonempty bool;
+	n int;
+	i int;
+	bad bool;
+BEGIN
+	IF current_setting('gp.role', true) IS DISTINCT FROM 'coordinator' THEN
+		RAISE EXCEPTION 'tables are distributed on the coordinator only';
+	END IF;
+	IF (SELECT c.relkind NOT IN ('r', 'p') OR c.relpersistence = 't'
+		FROM pg_class c WHERE c.oid = relation) THEN
+		RAISE EXCEPTION '"%" is not a permanent table', relation;
+	END IF;
+	IF EXISTS (SELECT FROM gp.distribution_policy p WHERE p.relid = relation)
+	THEN
+		RAISE EXCEPTION 'table "%" is distributed already', relation;
+	END IF;
+	EXECUTE format('SELECT EXISTS (SELECT FROM %s)', relation) INTO nonempty;
+	IF nonempty THEN
+		RAISE EXCEPTION 'table "%" is not empty', relation
+			USING HINT = 'Distribute a table before filling it.';
+	END IF;
+	IF cardinality(bounds) < 1 THEN
+		RAISE EXCEPTION 'a range distribution has at least one bound';
+	END IF;
+	IF cardinality(segments) <> cardinality(bounds) + 1 THEN
+		RAISE EXCEPTION
+			'a range of % bounds makes % buckets, but % segments are named',
+			cardinality(bounds), cardinality(bounds) + 1,
+			cardinality(segments);
+	END IF;
+
+	SELECT a.attnum, a.atttypid::regtype, format_type(a.atttypid, a.atttypmod)
+	INTO attnum, typreg, typname
+	FROM pg_attribute a
+	WHERE a.attrelid = relation AND a.attname = key AND a.attnum > 0 AND
+		  NOT a.attisdropped;
+	IF attnum IS NULL THEN
+		RAISE EXCEPTION 'column "%" of table "%" does not exist', key, relation;
+	END IF;
+	IF NOT EXISTS (
+		SELECT FROM pg_opclass c, pg_am m
+		WHERE c.opcmethod = m.oid AND m.amname = 'btree' AND
+			  c.opcintype = typreg::oid AND c.opcdefault
+	) THEN
+		RAISE EXCEPTION
+			'the key of a range distribution needs a type with a default opclass of btree';
+	END IF;
+
+	-- A unique index without the whole key cannot tell two equal rows
+	-- apart when they sit on different segments
+	IF EXISTS (
+		SELECT FROM pg_index i
+		WHERE i.indrelid = relation AND i.indisunique AND
+			  NOT (ARRAY[attnum] <@ i.indkey::pg_catalog.int2[])
+	) THEN
+		RAISE EXCEPTION
+			'the unique indexes of table "%" must include the key of the distribution',
+			relation
+			USING HINT = 'Rows with equal values may sit on different segments; distribute by a column of every unique index.';
+	END IF;
+
+	n := cardinality(bounds);
+	FOR i IN 1 .. n - 1 LOOP
+		EXECUTE format('SELECT %L::%s >= %L::%s',
+					   bounds[i], typname, bounds[i + 1], typname)
+		INTO bad;
+		IF bad THEN
+			RAISE EXCEPTION 'the bounds of the range distribution must ascend strictly';
+		END IF;
+	END LOOP;
+	FOREACH i IN ARRAY segments LOOP
+		IF NOT EXISTS (SELECT FROM gp.cluster_segments() s
+					   WHERE s.segment_id = i) THEN
+			RAISE EXCEPTION 'segment % is not registered', i;
+		END IF;
+	END LOOP;
+
+	INSERT INTO gp.distribution_policy (relid, kind, key_columns)
+	VALUES (relation, 'range', ARRAY[attnum]);
+	INSERT INTO gp.distribution_rules (relid, bucket, segment, lower, upper)
+	SELECT relation, b - 1, segments[b], bounds[b - 1],
+		   CASE WHEN b <= n THEN bounds[b] END
+	FROM generate_series(1, n + 1) b;
+	PERFORM gp.policy_changed(relation);
+END
+$$;
+
+REVOKE ALL ON FUNCTION gp.distribute_range(regclass, name, text[], int[])
+FROM PUBLIC;
+
+-- Distribute a table by the values of one key column: the value of
+-- values[i] makes the bucket i, which goes to segments[i].  A row whose
+-- key is NULL, or that matches no value, has no bucket: such a row cannot
+-- be inserted
+CREATE FUNCTION gp.distribute_list(relation regclass, key name,
+								   vals text[], segments int[])
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	attnum int2;
+	typreg regtype;
+	typname text;
+	nonempty bool;
+	i int;
+	dupes int;
+BEGIN
+	IF current_setting('gp.role', true) IS DISTINCT FROM 'coordinator' THEN
+		RAISE EXCEPTION 'tables are distributed on the coordinator only';
+	END IF;
+	IF (SELECT c.relkind NOT IN ('r', 'p') OR c.relpersistence = 't'
+		FROM pg_class c WHERE c.oid = relation) THEN
+		RAISE EXCEPTION '"%" is not a permanent table', relation;
+	END IF;
+	IF EXISTS (SELECT FROM gp.distribution_policy p WHERE p.relid = relation)
+	THEN
+		RAISE EXCEPTION 'table "%" is distributed already', relation;
+	END IF;
+	EXECUTE format('SELECT EXISTS (SELECT FROM %s)', relation) INTO nonempty;
+	IF nonempty THEN
+		RAISE EXCEPTION 'table "%" is not empty', relation
+			USING HINT = 'Distribute a table before filling it.';
+	END IF;
+	IF cardinality(vals) < 1 THEN
+		RAISE EXCEPTION 'a list distribution has at least one value';
+	END IF;
+	IF cardinality(segments) <> cardinality(vals) THEN
+		RAISE EXCEPTION
+			'a list of % values makes % buckets, but % segments are named',
+			cardinality(vals), cardinality(vals), cardinality(segments);
+	END IF;
+
+	SELECT a.attnum, a.atttypid::regtype, format_type(a.atttypid, a.atttypmod)
+	INTO attnum, typreg, typname
+	FROM pg_attribute a
+	WHERE a.attrelid = relation AND a.attname = key AND a.attnum > 0 AND
+		  NOT a.attisdropped;
+	IF attnum IS NULL THEN
+		RAISE EXCEPTION 'column "%" of table "%" does not exist', key, relation;
+	END IF;
+	IF NOT EXISTS (
+		SELECT FROM pg_opclass c, pg_am m
+		WHERE c.opcmethod = m.oid AND m.amname = 'btree' AND
+			  c.opcintype = typreg::oid AND c.opcdefault
+	) THEN
+		RAISE EXCEPTION
+			'the key of a list distribution needs a type with a default opclass of btree';
+	END IF;
+
+	IF EXISTS (
+		SELECT FROM pg_index i
+		WHERE i.indrelid = relation AND i.indisunique AND
+			  NOT (ARRAY[attnum] <@ i.indkey::pg_catalog.int2[])
+	) THEN
+		RAISE EXCEPTION
+			'the unique indexes of table "%" must include the key of the distribution',
+			relation
+			USING HINT = 'Rows with equal values may sit on different segments; distribute by a column of every unique index.';
+	END IF;
+
+	EXECUTE 'SELECT count(*) - count(DISTINCT v) '
+			'FROM unnest($1::pg_catalog.text[]::' || typname || '[]) v'
+	INTO dupes
+	USING vals;
+	IF dupes > 0 THEN
+		RAISE EXCEPTION 'the values of a list distribution must differ';
+	END IF;
+	FOREACH i IN ARRAY segments LOOP
+		IF NOT EXISTS (SELECT FROM gp.cluster_segments() s
+					   WHERE s.segment_id = i) THEN
+			RAISE EXCEPTION 'segment % is not registered', i;
+		END IF;
+	END LOOP;
+
+	INSERT INTO gp.distribution_policy (relid, kind, key_columns)
+	VALUES (relation, 'list', ARRAY[attnum]);
+	INSERT INTO gp.distribution_rules (relid, bucket, segment, value)
+	SELECT relation, o - 1, segments[o], vals[o]
+	FROM generate_series(1, cardinality(vals)) o;
+	PERFORM gp.policy_changed(relation);
+END
+$$;
+
+REVOKE ALL ON FUNCTION gp.distribute_list(regclass, name, text[], int[])
+FROM PUBLIC;
 
 -- A dropped table loses its policy, lest a new table get its OID and the
 -- policy with it.  Defined as SECURITY DEFINER: a user that drops a table

@@ -20,6 +20,7 @@
 #include "postgres.h"
 
 #include "access/hash.h"
+#include "access/nbtree.h"
 #include "access/relation.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -100,6 +101,43 @@ gp_hash_proc_of(Oid typid)
 	if (cache_type[slot] == typid)
 		return cache_proc[slot];
 	proc = gp_hash_proc(typid);
+	cache_type[slot] = typid;
+	cache_proc[slot] = proc;
+	return proc;
+}
+
+/*
+ * The comparison function of the default btree operator class of a type,
+ * remembered from call to call
+ */
+Oid
+gp_cmp_proc_of(Oid typid)
+{
+#define GP_CMP_PROC_CACHE 32
+	static Oid	cache_type[GP_CMP_PROC_CACHE];
+	static Oid	cache_proc[GP_CMP_PROC_CACHE];
+	Oid			opclass;
+	Oid			opcintype;
+	Oid			proc;
+	int			slot = (int) typid % GP_CMP_PROC_CACHE;
+
+	if (cache_type[slot] == typid)
+		return cache_proc[slot];
+	opclass = GetDefaultOpClass(typid, BTREE_AM_OID);
+	if (!OidIsValid(opclass))
+		ereport(ERROR,
+				errcode(ERRCODE_UNDEFINED_OBJECT),
+				errmsg("type %s has no default btree operator class",
+					   format_type_be(typid)),
+				errhint("A range or a list distribution key needs a type with comparisons."));
+	opcintype = get_opclass_input_type(opclass);
+	proc = get_opfamily_proc(get_opclass_family(opclass), opcintype, opcintype,
+							 BTORDER_PROC);
+	if (!OidIsValid(proc))
+		ereport(ERROR,
+				errcode(ERRCODE_UNDEFINED_FUNCTION),
+				errmsg("type %s has no btree comparison function",
+					   format_type_be(typid)));
 	cache_type[slot] = typid;
 	cache_proc[slot] = proc;
 	return proc;
@@ -212,10 +250,19 @@ gp_policy_load(Oid relid, GpPolicy *policy)
 
 		found = true;
 		policy->replicated = strcmp(kind, "replicated") == 0;
+		policy->kind = strcmp(kind, "replicated") == 0 ? GP_POLICY_REPLICATED :
+			strcmp(kind, "range") == 0 ? GP_POLICY_RANGE :
+			strcmp(kind, "list") == 0 ? GP_POLICY_LIST : GP_POLICY_HASH;
 		policy->nkeys = 0;
 		policy->keys = NULL;
 		policy->nbuckets = 0;
 		policy->map = NULL;
+		policy->nrules = 0;
+		policy->rule_buckets = NULL;
+		policy->rule_segments = NULL;
+		policy->rule_lower = NULL;
+		policy->rule_upper = NULL;
+		policy->rule_values = NULL;
 		policy->colocation_id = DatumGetInt32(SPI_getbinval(tuple, desc, 5, &isnull));
 		if (isnull)
 			policy->colocation_id = 0;
@@ -233,11 +280,67 @@ gp_policy_load(Oid relid, GpPolicy *policy)
 				policy->keys[i] = DatumGetInt16(elems[i]);
 
 			policy->nbuckets = DatumGetInt32(SPI_getbinval(tuple, desc, 3, &isnull));
-			deconstruct_array_builtin(DatumGetArrayTypeP(SPI_getbinval(tuple, desc, 4, &isnull)),
-									  INT4OID, &elems, NULL, &n);
-			policy->map = MemoryContextAlloc(callercxt, sizeof(int) * n);
-			for (int i = 0; i < n; i++)
-				policy->map[i] = DatumGetInt32(elems[i]);
+			if (!isnull)
+			{
+				deconstruct_array_builtin(DatumGetArrayTypeP(SPI_getbinval(tuple, desc, 4, &isnull)),
+										  INT4OID, &elems, NULL, &n);
+				policy->map = MemoryContextAlloc(callercxt, sizeof(int) * n);
+				for (int i = 0; i < n; i++)
+					policy->map[i] = DatumGetInt32(elems[i]);
+			}
+
+			/* The rules of a range or a list distribution; the arrays
+			 * keep NULL elements where a bound or a value is NULL */
+			/* The rules of a range or a list distribution, one query of
+			 * their own, for these tables alone */
+			if (policy->kind == GP_POLICY_RANGE ||
+				policy->kind == GP_POLICY_LIST)
+			{
+				const char *rulesql =
+					"SELECT bucket, segment, lower, upper, value "
+					"FROM gp.distribution_rules "
+					"WHERE relid OPERATOR(pg_catalog.=) $1 "
+					"ORDER BY bucket";
+				int			cnt;
+				MemoryContext oldcxt;
+
+				if (SPI_execute_with_args(rulesql, 1, argtypes, args, NULL,
+										  true, 0) != SPI_OK_SELECT)
+					elog(ERROR, "could not read the distribution rules");
+				cnt = SPI_processed;
+				if (cnt > 0)
+				{
+					policy->nrules = cnt;
+					policy->rule_buckets = MemoryContextAlloc(callercxt, sizeof(int) * cnt);
+					policy->rule_segments = MemoryContextAlloc(callercxt, sizeof(int) * cnt);
+					policy->rule_lower = MemoryContextAlloc(callercxt, sizeof(char *) * cnt);
+					policy->rule_upper = MemoryContextAlloc(callercxt, sizeof(char *) * cnt);
+					policy->rule_values = MemoryContextAlloc(callercxt, sizeof(char *) * cnt);
+					/* The texts out of the SPI procedure context: it dies
+					 * with SPI_finish, and the policy outlives it */
+					oldcxt = MemoryContextSwitchTo(callercxt);
+
+					for (int k = 0; k < cnt; k++)
+					{
+						HeapTuple	rt = SPI_tuptable->vals[k];
+						TupleDesc	rd = SPI_tuptable->tupdesc;
+						Datum		d;
+
+						policy->rule_buckets[k] = DatumGetInt32(SPI_getbinval(rt, rd, 1, &isnull));
+						policy->rule_segments[k] = DatumGetInt32(SPI_getbinval(rt, rd, 2, &isnull));
+						d = SPI_getbinval(rt, rd, 3, &isnull);
+						policy->rule_lower[k] = isnull ?
+							NULL : TextDatumGetCString(d);
+						d = SPI_getbinval(rt, rd, 4, &isnull);
+						policy->rule_upper[k] = isnull ?
+							NULL : TextDatumGetCString(d);
+						d = SPI_getbinval(rt, rd, 5, &isnull);
+						policy->rule_values[k] = isnull ?
+							NULL : TextDatumGetCString(d);
+					}
+					MemoryContextSwitchTo(oldcxt);
+				}
+			}
 		}
 	}
 
@@ -369,6 +472,36 @@ gp_policy_get(Oid relid, GpPolicy *policy)
 			{
 				entry->policy.map = MemoryContextAlloc(policy_cxt, sizeof(int) * loaded.nbuckets);
 				memcpy(entry->policy.map, loaded.map, sizeof(int) * loaded.nbuckets);
+			}
+			if (loaded.nrules > 0)
+			{
+				GpPolicy  *p = &entry->policy;
+
+				p->nrules = loaded.nrules;
+				p->rule_buckets = MemoryContextAlloc(policy_cxt, sizeof(int) * loaded.nrules);
+				memcpy(p->rule_buckets, loaded.rule_buckets, sizeof(int) * loaded.nrules);
+				p->rule_segments = MemoryContextAlloc(policy_cxt, sizeof(int) * loaded.nrules);
+				memcpy(p->rule_segments, loaded.rule_segments, sizeof(int) * loaded.nrules);
+				p->rule_lower = MemoryContextAlloc(policy_cxt, sizeof(char *) * loaded.nrules);
+				p->rule_upper = MemoryContextAlloc(policy_cxt, sizeof(char *) * loaded.nrules);
+				p->rule_values = MemoryContextAlloc(policy_cxt, sizeof(char *) * loaded.nrules);
+				{
+					/* The strings themselves live in the context of the
+					 * cache, not in the one of the caller, which dies with
+					 * the plan */
+					MemoryContext old = MemoryContextSwitchTo(policy_cxt);
+
+					for (int i = 0; i < loaded.nrules; i++)
+					{
+						p->rule_lower[i] = loaded.rule_lower[i] != NULL ?
+							pstrdup(loaded.rule_lower[i]) : NULL;
+						p->rule_upper[i] = loaded.rule_upper[i] != NULL ?
+							pstrdup(loaded.rule_upper[i]) : NULL;
+						p->rule_values[i] = loaded.rule_values[i] != NULL ?
+							pstrdup(loaded.rule_values[i]) : NULL;
+					}
+					MemoryContextSwitchTo(old);
+				}
 			}
 		}
 	}
