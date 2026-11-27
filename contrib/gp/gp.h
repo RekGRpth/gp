@@ -84,14 +84,30 @@ extern int	gp_segments_get(GpSegment **segments);
 extern void gp_segments_refresh(GpSegment *segment);
 
 /* How the rows of a distributed table are placed */
+typedef enum GpPolicyKind
+{
+	GP_POLICY_HASH,
+	GP_POLICY_REPLICATED,
+	GP_POLICY_RANGE,
+	GP_POLICY_LIST,
+} GpPolicyKind;
+
 typedef struct GpPolicy
 {
-	bool		replicated;
+	bool		replicated;		/* kind is GP_POLICY_REPLICATED */
+	GpPolicyKind kind;
 	int			nkeys;
 	AttrNumber *keys;			/* key columns */
 	int			nbuckets;
 	int		   *map;			/* segment of each bucket */
 	int			colocation_id;	/* colocation group, for colocated joins */
+	/* the rules of a range or a list distribution, as the texts of the key */
+	int			nrules;
+	int		   *rule_buckets;	/* the bucket of every rule */
+	int		   *rule_segments;	/* the segment of every rule */
+	char	  **rule_lower;		/* the bounds of a range, NULL where none */
+	char	  **rule_upper;
+	char	  **rule_values;	/* the values of a list */
 } GpPolicy;
 
 /* distribution.c */
@@ -99,6 +115,7 @@ extern bool gp_policy_get(Oid relid, GpPolicy *policy);
 extern void gp_distribute_by_default(Oid relid);
 extern int	gp_key_bucket(int nbuckets, int nkeys, const Datum *values,
 						  const bool *nulls, const Oid *types, Oid collation);
+extern Oid	gp_cmp_proc_of(Oid typid);
 
 /* copy.c */
 extern bool gp_copy_from(PlannedStmt *pstmt, const char *queryString,

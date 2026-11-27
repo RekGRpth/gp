@@ -557,6 +557,7 @@ typedef struct GpJoinTable GpJoinTable;
 static bool gp_slice_join_rows(Query *parse, GpJoinTable *table, double *rows);
 static bool gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
 							   bool *replicated, bool *motion, GpLocus *locus);
+static bool gp_slice_segment_keys(Query *parse);
 static bool gp_slice_agg_two_phase(Query *parse, Agg *agg, Plan *below);
 static bool gp_slice_cte_agg_replace(Query *ctequery, PlannedStmt *stmt,
 									 int cteplanid, Plan *parent, Agg *agg,
@@ -991,6 +992,27 @@ gp_slice_agg_plan(Query *original, Query *parse, PlannedStmt *stmt)
 		below = below->lefttree;
 	if (below == NULL || !gp_is_gather(below))
 		return false;
+
+	/*
+	 * A grouping that names the segment itself keeps every group on one
+	 * segment, whatever the distribution of the table is - by hash, by
+	 * ranges or by values: the segments answer the whole aggregate, each
+	 * for its own rows, and no group travels between them.  There is no
+	 * bucket filter to build and no combine to run
+	 */
+	if (gp_slice_segment_keys(parse))
+	{
+		if (list_length(agg->plan.targetlist) !=
+			list_length(original->targetList))
+			return false;
+		cscan = gp_slice_make(&agg->plan, original, false, false,
+							  original->sortClause);
+		if (parent == NULL)
+			stmt->planTree = &cscan->scan.plan;
+		else
+			parent->lefttree = &cscan->scan.plan;
+		return true;
+	}
 
 	locus = gp_locus_plan(&agg->plan, stmt->rtable, stmt->subplans);
 	if (locus.kind == GP_LOCUS_COORDINATOR)
@@ -2825,6 +2847,16 @@ gp_slice_redistribute_rte_keys(Query *remote, GpJoinTable *stay, GpJoinTable *mo
 	Const	   *arg;
 	Oid			peer_query_oid;
 
+	/*
+	 * The rows that stay keep to the buckets of the hash of their key: a
+	 * table whose rows sit by the ranges or the values of the key keeps no
+	 * such order, and the pairs of the join would miss one another.  The
+	 * broadcast of the other side answers a stay of any distribution, and
+	 * a replicated stay keeps a copy everywhere already
+	 */
+	if (!stay->policy.replicated && stay->policy.nbuckets <= 0)
+		return false;
+
 	/* Equal RT indexes of different query levels name different tables */
 	if (move->query != NULL)
 		remote = move->query;
@@ -4502,6 +4534,20 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 	if (!gp_slice_join_load_policies(original, tables))
 		return false;
 
+	/*
+	 * A join of tables that sit by the ranges or the values of their keys
+	 * is answered by the coordinator: the rules of the join ride the hash
+	 * of the keys, and such tables keep no rows by it.  The gathers bring
+	 * every row here, and the join pairs them whole
+	 */
+	foreach(lc, tables)
+	{
+		GpJoinTable *table = lfirst(lc);
+
+		if (!table->policy.replicated && table->policy.nbuckets <= 0)
+			return false;
+	}
+
 	jointype = gp_slice_join_type_of(original);
 
 	/*
@@ -5105,6 +5151,20 @@ locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
 		return false;
 	if (!gp_slice_join_load_policies(original, tables))
 		return false;
+
+	/*
+	 * A join of tables that sit by the ranges or the values of their keys
+	 * is answered by the coordinator: the rules of the join ride the hash
+	 * of the keys, and such tables keep no rows by it.  The gathers bring
+	 * every row here, and the join pairs them whole
+	 */
+	foreach(lc, tables)
+	{
+		GpJoinTable *table = lfirst(lc);
+
+		if (!table->policy.replicated && table->policy.nbuckets <= 0)
+			return false;
+	}
 	if (!gp_slice_join_probes_keyed(tables, conds))
 		return false;
 
@@ -7007,7 +7067,8 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 	ref = linitial_node(RangeTblRef, parse->jointree->fromlist);
 	rte_base = rt_fetch(ref->rtindex, parse->rtable);
 	if (rte_base->rtekind != RTE_RELATION ||
-		!gp_policy_get(rte_base->relid, &policy) || policy.replicated)
+		!gp_policy_get(rte_base->relid, &policy) || policy.replicated ||
+		policy.nbuckets <= 0)
 		return;
 
 	/* The grouping columns lead the answer of the segments */

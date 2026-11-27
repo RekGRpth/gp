@@ -413,7 +413,8 @@ gp_insert_direct_segment(Oid relid, const GpPolicy *policy, Plan *source,
 	Datum	   *values;
 	bool	   *nulls;
 
-	if (policy->replicated || source->qual != NIL)
+	if (policy->replicated || policy->kind != GP_POLICY_HASH ||
+		source->qual != NIL)
 		return 0;
 	if (IsA(source, Result))
 	{
