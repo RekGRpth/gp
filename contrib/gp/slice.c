@@ -59,11 +59,13 @@
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
+#include "utils/date.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 
 #include "gp.h"
@@ -6835,6 +6837,111 @@ gp_slice_segment_keys(Query *parse)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * The time functions of the query (current_date, current_timestamp and the
+ * rest of their family) are the constants of the transaction by the SQL
+ * standard: fold them to their values on the coordinator, so the SQL of
+ * the segments carries a literal, and every server of the cluster answers
+ * the same instant of the transaction.  A statement of a PREPARE takes the
+ * value of the transaction its plan was built in
+ */
+static Node *
+gp_time_function_fold(Node *node, void *context)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, SQLValueFunction))
+	{
+		SQLValueFunction *svf = (SQLValueFunction *) node;
+		Oid			type;
+		int16		len;
+		bool		byval;
+		Datum		value;
+
+		switch (svf->op)
+		{
+			case SVFOP_CURRENT_DATE:
+				type = DATEOID;
+				value = DateADTGetDatum(GetSQLCurrentDate());
+				break;
+			case SVFOP_CURRENT_TIME:
+			case SVFOP_CURRENT_TIME_N:
+				type = TIMETZOID;
+				value = PointerGetDatum(GetSQLCurrentTime(svf->typmod));
+				break;
+			case SVFOP_CURRENT_TIMESTAMP:
+			case SVFOP_CURRENT_TIMESTAMP_N:
+				type = TIMESTAMPTZOID;
+				value = TimestampTzGetDatum(GetSQLCurrentTimestamp(svf->typmod));
+				break;
+			case SVFOP_LOCALTIME:
+			case SVFOP_LOCALTIME_N:
+				type = TIMEOID;
+				value = Int64GetDatum(GetSQLLocalTime(svf->typmod));
+				break;
+			case SVFOP_LOCALTIMESTAMP:
+			case SVFOP_LOCALTIMESTAMP_N:
+				type = TIMESTAMPOID;
+				value = TimestampGetDatum(GetSQLLocalTimestamp(svf->typmod));
+				break;
+			default:
+				return node;
+		}
+		get_typlenbyval(type, &len, &byval);
+		return (Node *) makeConst(type, svf->typmod, InvalidOid, len, value,
+								  false, byval);
+	}
+
+	/*
+	 * expression_tree_mutator does not descend into the queries of sublinks
+	 * and subqueries: fold them here, on the spot
+	 */
+	if (IsA(node, SubLink))
+		((SubLink *) node)->subselect =
+			gp_time_function_fold(((SubLink *) node)->subselect, context);
+	if (IsA(node, Query))
+	{
+		gp_fold_time_functions((Query *) node);
+		return node;
+	}
+	return expression_tree_mutator(node, gp_time_function_fold, context);
+}
+
+/*
+ * Fold the time functions of the query on the coordinator, before the plan
+ * and the SQL of the segments are built
+ */
+void
+gp_fold_time_functions(Query *parse)
+{
+	ListCell   *lc;
+
+	if (!IsUnderPostmaster || gp_role != GP_ROLE_COORDINATOR)
+		return;
+	parse->targetList = (List *) gp_time_function_fold((Node *) parse->targetList,
+													   NULL);
+	parse->havingQual = gp_time_function_fold(parse->havingQual, NULL);
+	parse->limitCount = gp_time_function_fold(parse->limitCount, NULL);
+	parse->limitOffset = gp_time_function_fold(parse->limitOffset, NULL);
+	if (parse->jointree != NULL)
+		parse->jointree->quals = gp_time_function_fold(parse->jointree->quals,
+													   NULL);
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL)
+			gp_fold_time_functions(rte->subquery);
+	}
+	foreach(lc, parse->cteList)
+	{
+		CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+
+		if (!cte->cterecursive && IsA(cte->ctequery, Query))
+			gp_fold_time_functions((Query *) cte->ctequery);
+	}
 }
 
 /*

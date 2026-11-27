@@ -118,6 +118,7 @@ tests += {
       't/058_qgen.pl',
       't/059_slices_cancel.pl',
       't/060_segment_id.pl',
+      't/061_time_functions.pl',
     ],
   },
 }

@@ -110,6 +110,7 @@ gp_dispatches_bump(void)
 	pg_atomic_fetch_add_u64(gp_dispatches_object(), 1);
 }
 int			gp_segment_id = 0;
+int			gp_row_segment = 0;
 static int	gp_requester_segment = 0;
 char	   *gp_database = NULL;
 int			gp_max_segments = 64;
@@ -554,7 +555,13 @@ PG_FUNCTION_INFO_V1(gp_segment_id_fn);
 Datum
 gp_segment_id_fn(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT32(gp_segment_id);
+	/*
+	 * The row a gather of the coordinator hands out came from one segment,
+	 * and the gather names it in gp_row_segment while the row is the
+	 * answer; the rest of the time the function is the segment this server
+	 * is, which is 0 on the coordinator
+	 */
+	PG_RETURN_INT32(gp_row_segment != 0 ? gp_row_segment : gp_segment_id);
 }
 
 PG_FUNCTION_INFO_V1(gp_dispatches_fn);

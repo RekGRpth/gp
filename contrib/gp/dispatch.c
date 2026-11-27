@@ -1940,6 +1940,20 @@ gp_query_next(GpQuery *query)
 	return NULL;
 }
 
+/* How many segments the query runs on */
+int
+gp_query_nsegments(GpQuery *query)
+{
+	return query->nsegments;
+}
+
+/* The segment whose row gp_query_next() hands out now */
+int
+gp_query_row_segment(GpQuery *query)
+{
+	return query->segments[query->current].segment_id;
+}
+
 /* Run a command on all segments, and drop its results */
 static void
 gp_dispatch_same(const GpSegment *segments, GpConnection **entries,

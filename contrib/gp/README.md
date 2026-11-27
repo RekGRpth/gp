@@ -720,7 +720,7 @@ All are set at server start unless noted.
 | `gp.bucket(nbuckets, VARIADIC key)` | Bucket of a key |
 | `gp.bucket_segment(colocation_id, bucket)` | Segment of a bucket of a colocation group |
 | `gp.policy_changed(relation)` | Make every session read the policy of a table again; `gp.distribute()` calls it |
-| `gp.segment_id()` | The segment this server is: 0 on the coordinator, and its number on a segment.  A query the segments answer takes the value of the server that read every row: a grouping keyed by it keeps every group on one segment — the skew of the data by the segments — and a condition by it names the segments whose rows pass.  The answer of a plain read above a gather is still 0 everywhere |
+| `gp.segment_id()` | The segment this server is: 0 on the coordinator, and its number on a segment.  A query the segments answer takes the value of the server that read every row: a plain read names the segment of each of its rows, a grouping keyed by it keeps every group on one segment — the skew of the data by the segments — and a condition by it names the segments whose rows pass.  An aggregate above a gather answers it as 0, for no row of theirs is the answer of one server |
 | `gp.dispatches()` | How many statements and row streams of this session have gone to the segments.  A query over the tables that keep their rows on the coordinator leaves it unchanged |
 
 `gp.register_segment()`, `gp.exec_on_all()`, `gp.distribute()`, `gp.stop_node()`,
@@ -812,11 +812,11 @@ by the patch and `contrib/gp`.
    refusals of non-immutable expressions, `CREATE TABLE AS EXECUTE`, the
    artifacts of a failed `CREATE INDEX CONCURRENTLY`, a command on a
    temporary table together with others.  `gp.segment_id()` of a query the
-   segments answer is the value of the server that read every row: a
-   grouping by it answers the skew of the data by the segments, and a
-   condition by it names the segments whose rows pass; next are the segment
-   of a row of a plain read, stable functions of time on the coordinator
-   and a comparison with a vanilla server.
+   segments answer is the value of the server that read every row: a plain
+   read names the segment of each of its rows, a grouping by it answers the
+   skew of the data by the segments, and a condition by it names the
+   segments whose rows pass; next are stable functions of time on the
+   coordinator and a comparison with a vanilla server.
 4. **Distributed transactions and DML** — done: two-phase commit of all
    writes, and one phase for a transaction that wrote one segment;
    distributed snapshots; `UPDATE` and `DELETE` on the segments; unique
