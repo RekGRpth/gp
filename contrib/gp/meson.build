@@ -123,6 +123,7 @@ tests += {
       't/063_range_list.pl',
       't/064_mixed_outer.pl',
       't/065_coordinator_share.pl',
+      't/066_mirrors.pl',
     ],
   },
 }

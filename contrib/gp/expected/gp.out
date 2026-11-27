@@ -56,9 +56,9 @@ SHOW gp.register_retry_interval;
 
 -- Segments are dumped with the extension
 SELECT extconfig::regclass[] FROM pg_extension WHERE extname = 'gp';
-                                                       extconfig                                                        
-------------------------------------------------------------------------------------------------------------------------
- {gp.segments,gp.distribution_rules,gp.colocation_groups,gp.colocation_groups_colocation_id_seq,gp.distribution_policy}
+                                                             extconfig                                                             
+-----------------------------------------------------------------------------------------------------------------------------------
+ {gp.segments,gp.mirrors,gp.distribution_rules,gp.colocation_groups,gp.colocation_groups_colocation_id_seq,gp.distribution_policy}
 (1 row)
 
 SELECT * FROM gp.segments;

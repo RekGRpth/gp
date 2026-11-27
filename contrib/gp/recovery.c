@@ -32,10 +32,13 @@
 
 #include "access/transam.h"
 #include "fmgr.h"
+#include "executor/spi.h"
 #include "libpq-fe.h"
 #include "libpq/libpq-be-fe-helpers.h"
 #include "miscadmin.h"
+#include "utils/builtins.h"
 #include "postmaster/bgworker.h"
+#include "postmaster/postmaster.h"
 #include "postmaster/interrupt.h"
 #include "storage/latch.h"
 #include "storage/procarray.h"
@@ -109,7 +112,7 @@ gp_recovery_init(void)
 	RegisterBackgroundWorker(&worker);
 }
 
-static void
+static bool
 gp_recovery_segment(int segment_id, const char *shost, int sport)
 {
 	const char *keywords[] = {"host", "port", "dbname", "application_name",
@@ -138,7 +141,7 @@ gp_recovery_segment(int segment_id, const char *shost, int sport)
 				 pchomp(PQerrorMessage(conn)));
 			libpqsrv_disconnect(conn);
 			conn = NULL;
-			return;
+			return false;
 		}
 
 		res = libpqsrv_exec_params(conn,
@@ -153,7 +156,7 @@ gp_recovery_segment(int segment_id, const char *shost, int sport)
 			PQclear(res);
 			libpqsrv_disconnect(conn);
 			conn = NULL;
-			return;
+			return false;
 		}
 
 		nrows = PQntuples(res);
@@ -231,6 +234,7 @@ gp_recovery_segment(int segment_id, const char *shost, int sport)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	return true;
 }
 
 /*
@@ -240,7 +244,214 @@ gp_recovery_segment(int segment_id, const char *shost, int sport)
  * clearing of a result does not outlive the pass either.  No error of a pass
  * gets out: the worker tries again later.
  */
-static void
+
+/*
+ * The watch of the mirrors: a pair of a primary and its physical standby.
+ * A primary that stops answering hands the identity of its segment to its
+ * mirror: the mirror promotes, takes the extension of the segments, and
+ * takes the address of the segment in the copy; the row of the mirror
+ * goes away.  The pass runs on the coordinator, in the database of the
+ * cluster
+ */
+/* One statement of a connection, tolerantly */
+static bool
+gp_mirror_exec(PGconn *conn, const char *sql)
+{
+	PGresult   *res = libpqsrv_exec(conn, sql, gp_recovery_wait_event);
+	bool		ok = res != NULL &&
+		(PQresultStatus(res) == PGRES_COMMAND_OK ||
+		 PQresultStatus(res) == PGRES_TUPLES_OK);
+
+	if (res != NULL)
+		PQclear(res);
+	return ok;
+}
+
+static bool
+gp_mirrors_take_over(int segment_id)
+{
+	const char *keys[5] = {"host", "port", "dbname", "connect_timeout", NULL};
+	const char *vals[5];
+	MemoryContext oldcxt = CurrentMemoryContext;
+	MemoryContext passcxt = AllocSetContextCreate(TopMemoryContext,
+												  "gp mirrors take over",
+												  ALLOCSET_SMALL_SIZES);
+	const char *dirs;
+	char		sockdir[108];
+	char		cport[16];
+	char		mhost[GP_HOST_LEN] = "";
+	int			mport = 0;
+	bool		found = false;
+	PGconn	   *self = NULL;
+	PGconn	   *mirror = NULL;
+	PGresult   *res;
+	const Oid	atypes[1] = {INT4OID};
+	char		sidstr[16];
+	const char *avalues[1];
+	char	   *oids = NULL;
+
+	StartTransactionCommand();
+	MemoryContextSwitchTo(passcxt);
+
+	/* The socket directory and the port of the coordinator, for the
+	 * loopback: the statements run as SQL of the database of the cluster,
+	 * out of the worker's process, for the pass keeps no state of its own
+	 */
+	dirs = GetConfigOption("unix_socket_directories", false, false);
+	{
+		int			n = 0;
+
+		while (dirs != NULL && dirs[n] != '\0' && dirs[n] != ',')
+			n++;
+		strlcpy(sockdir, dirs != NULL ? dirs : "/tmp",
+				n + 1 > sizeof(sockdir) ? sizeof(sockdir) : n + 1);
+	}
+	snprintf(cport, sizeof(cport), "%d", PostPortNumber);
+	snprintf(sidstr, sizeof(sidstr), "%d", segment_id);
+	avalues[0] = sidstr;
+	vals[0] = sockdir;
+	vals[1] = cport;
+	vals[2] = gp_database;
+	vals[3] = "5";
+	vals[4] = NULL;
+
+	/*
+	 * The mirror of the segment and the oids of the extension, over the
+	 * loopback
+	 */
+	self = libpqsrv_connect_params(keys, vals, false, gp_recovery_wait_event);
+	if (self == NULL || PQstatus(self) != CONNECTION_OK)
+	{
+		elog(WARNING, "the watch of the mirrors lost the coordinator");
+		if (self != NULL)
+			libpqsrv_disconnect(self);
+		MemoryContextSwitchTo(oldcxt);
+		CommitTransactionCommand();
+		MemoryContextDelete(passcxt);
+		return false;
+	}
+
+	res = libpqsrv_exec_params(self,
+							   "SELECT host, port FROM gp.mirrors "
+							   "WHERE segment_id = $1", 1, atypes, avalues,
+							   NULL, NULL, 0, gp_recovery_wait_event);
+	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		elog(WARNING, "could not read the mirror of segment %d (%s)", segment_id,
+			 res != NULL ? pchomp(PQresultErrorMessage(res)) : "no result");
+		if (res != NULL)
+			PQclear(res);
+		libpqsrv_disconnect(self);
+		MemoryContextSwitchTo(oldcxt);
+		CommitTransactionCommand();
+		MemoryContextDelete(passcxt);
+		return false;
+	}
+	found = PQntuples(res) == 1;
+	if (found)
+	{
+		strlcpy(mhost, PQgetvalue(res, 0, 0), GP_HOST_LEN);
+		mport = atoi(PQgetvalue(res, 0, 1));
+	}
+	PQclear(res);
+
+	if (!found)
+	{
+		/* No mirror keeps the segment: the pass resolves what it can */
+		libpqsrv_disconnect(self);
+		MemoryContextSwitchTo(oldcxt);
+		CommitTransactionCommand();
+		MemoryContextDelete(passcxt);
+		return false;
+	}
+
+	res = libpqsrv_exec(self, "SELECT gp.extension_oids()::text",
+						gp_recovery_wait_event);
+	if (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK &&
+		PQntuples(res) == 1)
+		oids = pstrdup(PQgetvalue(res, 0, 0));
+	if (res != NULL)
+		PQclear(res);
+	libpqsrv_disconnect(self);
+
+	/*
+	 * The mirror promotes and takes the extension of the segments, with
+	 * the oids of ours, the way a segment takes them at its first start
+	 */
+	vals[0] = mhost;
+	vals[1] = psprintf("%d", mport);
+	vals[2] = gp_database;
+	vals[3] = "5";
+	vals[4] = NULL;
+	mirror = libpqsrv_connect_params(keys, vals, false, gp_recovery_wait_event);
+	if (mirror == NULL || PQstatus(mirror) != CONNECTION_OK)
+	{
+		elog(WARNING, "the mirror of the segment %d at %s:%d does not answer",
+			 segment_id, mhost, mport);
+		if (mirror != NULL)
+			libpqsrv_disconnect(mirror);
+		MemoryContextSwitchTo(oldcxt);
+		CommitTransactionCommand();
+		MemoryContextDelete(passcxt);
+		return false;
+	}
+
+	/*
+	 * An earlier pass may have promoted the mirror already: the identity
+	 * below moves once, whatever the pass took to get here
+	 */
+	if (!gp_mirror_exec(mirror, "SELECT pg_promote(true, 30)"))
+		elog(WARNING, "the mirror of the segment %d did not promote this pass",
+			 segment_id);
+	if (oids != NULL)
+	{
+		char	   *set = psprintf("SET gp.dispatch_oids = '%s'", oids);
+
+		if (!gp_mirror_exec(mirror, set))
+			elog(WARNING, "the mirror %d took no oids of ours", segment_id);
+		pfree(set);
+	}
+	if (!gp_mirror_exec(mirror, "CREATE EXTENSION IF NOT EXISTS gp"))
+		elog(WARNING, "the mirror %d took no extension of ours", segment_id);
+	libpqsrv_disconnect(mirror);
+
+	/*
+	 * The segment takes the address of the mirror, and the row of the
+	 * mirror goes away: the copy of the segments reloads on the commit,
+	 * and the sessions reconnect by the known rules
+	 */
+	vals[1] = cport;
+	self = libpqsrv_connect_params(keys, vals, false, gp_recovery_wait_event);
+	if (self != NULL && PQstatus(self) == CONNECTION_OK)
+	{
+		char	   *sql = psprintf("UPDATE gp.segments SET host = %s, port = %d "
+								   "WHERE segment_id = %d",
+								   quote_literal_cstr(mhost), mport,
+								   segment_id);
+
+		if (!gp_mirror_exec(self, sql))
+			elog(WARNING, "the identity of the segment %d did not move (%s)",
+				 segment_id, pchomp(PQerrorMessage(self)));
+		pfree(sql);
+		sql = psprintf("DELETE FROM gp.mirrors WHERE segment_id = %d",
+					   segment_id);
+		if (!gp_mirror_exec(self, sql))
+			elog(WARNING, "the mirror row of the segment %d did not go (%s)",
+				 segment_id, pchomp(PQerrorMessage(self)));
+		pfree(sql);
+		elog(WARNING, "the identity of the segment %d moved to %s:%d",
+			 segment_id, mhost, mport);
+	}
+	if (self != NULL)
+		libpqsrv_disconnect(self);
+
+	MemoryContextSwitchTo(oldcxt);
+	CommitTransactionCommand();
+	MemoryContextDelete(passcxt);
+	return true;
+}
+
+void
 gp_recovery_pass(void)
 {
 	MemoryContext oldcxt = CurrentMemoryContext;
@@ -271,7 +482,8 @@ gp_recovery_pass(void)
 				int			sport = segments[i].port;
 
 				strlcpy(shost, segments[i].host, sizeof(shost));
-				gp_recovery_segment(sid, shost, sport);
+				if (!gp_recovery_segment(sid, shost, sport))
+					gp_mirrors_take_over(sid);
 			}
 		}
 	}

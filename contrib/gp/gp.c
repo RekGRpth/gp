@@ -307,18 +307,18 @@ _PG_init(void)
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				errmsg("\"gp.segment_id\" must be set on a segment"));
-	if (gp_role != GP_ROLE_SEGMENT && gp_segment_id != 0)
+	if (gp_role == GP_ROLE_COORDINATOR && gp_segment_id != 0)
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				errmsg("\"gp.segment_id\" is set, but \"gp.role\" is not \"segment\""));
+				errmsg("\"gp.segment_id\" is set, but \"gp.role\" is \"coordinator\""));
 	if (gp_role == GP_ROLE_SEGMENT && gp_coordinator[0] == '\0')
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				errmsg("\"gp.coordinator\" must be set on a segment"));
-	if (gp_role != GP_ROLE_SEGMENT && gp_coordinator[0] != '\0')
+	if (gp_role == GP_ROLE_COORDINATOR && gp_coordinator[0] != '\0')
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				errmsg("\"gp.coordinator\" is set, but \"gp.role\" is not \"segment\""));
+				errmsg("\"gp.coordinator\" is set, but \"gp.role\" is \"coordinator\""));
 
 	if (gp_role == GP_ROLE_COORDINATOR)
 	{
