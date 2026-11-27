@@ -92,5 +92,24 @@ is(run('SELECT sum(n) FROM (SELECT gp.segment_id(), count(*) AS n ' .
 	run('SELECT count(*) FROM l'),
 	'the groups of the segments add up to the whole table');
 
+# A plain read tells the segment of every row, as the segments read there
+my @rows;
+foreach my $segment (@segments)
+{
+	my $number = $segment->safe_psql('postgres',
+		'SELECT gp.segment_id() FROM t LIMIT 1');
+	push(@rows, map { [$number, $_] }
+		 split(/\n/, $segment->safe_psql('postgres', 'SELECT a FROM t')));
+}
+@rows = sort { $a->[1] <=> $b->[1] or $a->[0] <=> $b->[0] } @rows;
+is(run('SELECT gp.segment_id(), a FROM t ORDER BY 2'),
+	join("\n", map { "$_->[0]|$_->[1]" } @rows),
+	'every row of a plain read names the segment that read it');
+is(run("SELECT count(*) FROM t WHERE gp.segment_id() = $first " .
+	   'AND a % 2 = 0'),
+	$segments[0]->safe_psql('postgres',
+		'SELECT count(*) FROM t WHERE a % 2 = 0'),
+	'a condition rides over the segment of the plain read');
+
 $coordinator->stop;
 done_testing();

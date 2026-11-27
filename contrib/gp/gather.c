@@ -85,8 +85,13 @@ typedef struct GpGatherState
 	int			only;			/* the segment all the rows live on, 0 if not */
 	bool		inherit;
 	Tuplestorestate *store;		/* all rows, once read */
+	int		   *starts;			/* the first row of every share of the store */
+	int		   *segs;			/* the segment of every share */
+	int			nshares;
+	int			row;			/* the rows handed out of the store */
 	List	   *sortkeys;		/* one list per key: attno, desc, nulls first, type, collation; NIL when the gather does not merge */
 	Tuplestorestate **stores;	/* one sorted store per segment */
+	int		   *storesegs;		/* the segment of every store */
 	int			nstores;
 	binaryheap *heap;			/* the segment whose next row is the next answer */
 	TupleTableSlot **peeks;		/* the unemitted next row of every store */
@@ -176,12 +181,14 @@ gp_gather_load_libpq(GpGatherState *state)
 		state->nstores = 0;
 		state->stores = palloc_array(Tuplestorestate *, count);
 		state->peeks = palloc_array(TupleTableSlot *, count);
+		state->storesegs = palloc_array(int, count);
 		for (int si = 0; si < count; si++)
 		{
 			int			target = only != 0 ? only : segments[si].segment_id;
 
 			state->stores[state->nstores] =
 				tuplestore_begin_heap(true, false, work_mem);
+			state->storesegs[state->nstores] = target;
 			query = gp_query_start(state->sql, target, NULL);
 			while ((res = gp_query_next(query)) != NULL)
 			{
@@ -260,50 +267,71 @@ gp_gather_load_libpq(GpGatherState *state)
 	}
 
 	query = gp_query_start(state->sql, only, NULL);
-	while ((res = gp_query_next(query)) != NULL)
 	{
-		MemoryContext oldcontext;
+		int			nrows = 0;
+		int			nshares = 0;
+		int		   *starts = palloc_array(int, gp_query_nsegments(query));
+		int		   *segs = palloc_array(int, gp_query_nsegments(query));
 
-		CHECK_FOR_INTERRUPTS();
-
-		if (PQnfields(res) != ncols)
-			ereport(ERROR,
-					errcode(ERRCODE_DATA_CORRUPTED),
-					errmsg("a segment returned %d columns, but table \"%s\" has %d",
-						   PQnfields(res),
-						   RelationGetRelationName(ss->ss_currentRelation),
-						   ncols));
-
-		ExecClearTuple(loadslot);
-		oldcontext = MemoryContextSwitchTo(rowcxt);
-		for (int i = 0; i < natts; i++)
+		while ((res = gp_query_next(query)) != NULL)
 		{
-			loadslot->tts_values[i] = (Datum) 0;
-			loadslot->tts_isnull[i] = true;
-		}
-		for (int c = 0; c < ncols; c++)
-		{
-			int			i = colmap[c];
-			StringInfoData buf;
+			MemoryContext oldcontext;
 
-			if (PQgetisnull(res, 0, c))
-				continue;
+			CHECK_FOR_INTERRUPTS();
 
-			/* libpq ends every value with a zero byte, as the receive functions expect */
-			buf.data = PQgetvalue(res, 0, c);
-			buf.len = PQgetlength(res, 0, c);
-			buf.maxlen = buf.len + 1;
-			buf.cursor = 0;
-			loadslot->tts_values[i] = ReceiveFunctionCall(&recv[i], &buf,
-														  ioparam[i],
-														  TupleDescAttr(tupdesc, i)->atttypmod);
-			loadslot->tts_isnull[i] = false;
+			if (PQnfields(res) != ncols)
+				ereport(ERROR,
+						errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("a segment returned %d columns, but table \"%s\" has %d",
+							   PQnfields(res),
+							   RelationGetRelationName(ss->ss_currentRelation),
+							   ncols));
+
+			if (nshares == 0 || segs[nshares - 1] !=
+				gp_query_row_segment(query))
+			{
+				starts[nshares] = nrows;
+				segs[nshares] = gp_query_row_segment(query);
+				nshares++;
+			}
+
+			ExecClearTuple(loadslot);
+			oldcontext = MemoryContextSwitchTo(rowcxt);
+			for (int i = 0; i < natts; i++)
+			{
+				loadslot->tts_values[i] = (Datum) 0;
+				loadslot->tts_isnull[i] = true;
+			}
+			for (int c = 0; c < ncols; c++)
+			{
+				int			i = colmap[c];
+				StringInfoData buf;
+
+				if (PQgetisnull(res, 0, c))
+					continue;
+
+				/* libpq ends every value with a zero byte, as the receive functions expect */
+				buf.data = PQgetvalue(res, 0, c);
+				buf.len = PQgetlength(res, 0, c);
+				buf.maxlen = buf.len + 1;
+				buf.cursor = 0;
+				loadslot->tts_values[i] = ReceiveFunctionCall(&recv[i], &buf,
+															  ioparam[i],
+															  TupleDescAttr(tupdesc, i)->atttypmod);
+				loadslot->tts_isnull[i] = false;
+			}
+			ExecStoreVirtualTuple(loadslot);
+			tuplestore_puttupleslot(state->store, loadslot);
+			MemoryContextSwitchTo(oldcontext);
+			MemoryContextReset(rowcxt);
+			PQclear(res);
+			nrows++;
 		}
-		ExecStoreVirtualTuple(loadslot);
-		tuplestore_puttupleslot(state->store, loadslot);
-		MemoryContextSwitchTo(oldcontext);
-		MemoryContextReset(rowcxt);
-		PQclear(res);
+
+		state->starts = starts;
+		state->segs = segs;
+		state->nshares = nshares;
+		state->row = 0;
 	}
 
 	ExecDropSingleTupleTableSlot(loadslot);
@@ -401,6 +429,7 @@ gp_gather_next_merged(GpGatherState *state, TupleTableSlot *slot)
 		int			i = DatumGetInt32(binaryheap_first(state->heap));
 
 		ExecCopySlot(slot, state->peeks[i]);
+		gp_row_segment = state->storesegs[i];
 		if (!tuplestore_gettupleslot(state->stores[i], true, true,
 									 state->peeks[i]))
 			binaryheap_remove_first(state->heap);
@@ -408,6 +437,7 @@ gp_gather_next_merged(GpGatherState *state, TupleTableSlot *slot)
 			binaryheap_replace_first(state->heap, Int32GetDatum(i));
 		return slot;
 	}
+	gp_row_segment = 0;
 	return NULL;
 }
 
@@ -425,7 +455,25 @@ gp_gather_next(ScanState *ss)
 		return gp_gather_next_merged(state, slot);
 
 	/* At the end the slot is empty, which is what ExecScan() looks for */
-	(void) tuplestore_gettupleslot(state->store, true, false, slot);
+	if (tuplestore_gettupleslot(state->store, true, false, slot))
+	{
+		int			r = state->row++;
+
+		/*
+		 * The rows of the store came share after share, one segment after
+		 * another: the row reads its segment, and the function of the
+		 * segment of the row answers it while the row is the answer
+		 */
+		gp_row_segment = 0;
+		for (int i = state->nshares - 1; i >= 0; i--)
+			if (state->starts[i] <= r)
+			{
+				gp_row_segment = state->segs[i];
+				break;
+			}
+		return slot;
+	}
+	gp_row_segment = 0;
 	return slot;
 }
 
@@ -459,6 +507,7 @@ gp_gather_end(CustomScanState *node)
 		}
 		pfree(state->stores);
 		pfree(state->peeks);
+		pfree(state->storesegs);
 		state->stores = NULL;
 		state->peeks = NULL;
 	}
@@ -468,6 +517,7 @@ gp_gather_end(CustomScanState *node)
 		state->heap = NULL;
 	}
 	state->peeks = NULL;
+	gp_row_segment = 0;
 }
 
 /* The rows are all here, so a rescan reads them again from the stores */
@@ -478,7 +528,10 @@ gp_gather_rescan(CustomScanState *node)
 	int			i;
 
 	if (state->store != NULL)
+	{
 		tuplestore_rescan(state->store);
+		state->row = 0;
+	}
 	if (state->stores != NULL)
 	{
 		binaryheap_reset(state->heap);

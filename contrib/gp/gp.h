@@ -70,6 +70,8 @@ extern const char *gp_coordinator_conninfo(void);
 extern const char *gp_host_address(void);
 extern int	gp_role;
 extern int	gp_segment_id;
+/* The segment whose rows a gather of the coordinator hands out now */
+extern int	gp_row_segment;
 extern char *gp_database;
 extern int	gp_max_segments;
 extern int	gp_default_distribution;
@@ -117,6 +119,7 @@ extern bool gp_gather_fragment(bool enable);
 
 /* slice.c */
 extern void gp_slice_init(void);
+extern void gp_fold_time_functions(Query *parse);
 extern Query *gp_slice_agg_query(Query *parse);
 extern bool gp_slice_agg_plan(Query *original, Query *parse,
 				PlannedStmt *stmt);
@@ -182,6 +185,8 @@ typedef struct GpQuery GpQuery;
 extern GpQuery *gp_query_start(const char *sql, int only,
 							   GpSnapshots *snapshots);
 extern PGresult *gp_query_next(GpQuery *query);
+extern int	gp_query_nsegments(GpQuery *query);
+extern int	gp_query_row_segment(GpQuery *query);
 extern void gp_query_end(GpQuery *query, bool cancel);
 
 /* Segments may create objects of their own for a command out of a transaction */

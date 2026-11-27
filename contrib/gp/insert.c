@@ -960,6 +960,7 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 
 	if (IsUnderPostmaster)
 		gp_check_modifications(parse, true);
+	gp_fold_time_functions(parse);
 
 	agg_original = gp_slice_agg_query(parse);
 	if (agg_original == NULL)
