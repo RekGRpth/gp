@@ -468,3 +468,137 @@ gp_move_bucket(PG_FUNCTION_ARGS)
 
 	PG_RETURN_INT32(rows);
 }
+
+/*
+ * The cleanup of a node that joined the cluster from a copy of the
+ * coordinator: the copy holds the rows of the coordinator's own share of
+ * every coordinator-share table, and they belong to the coordinator
+ * alone.  The node's copies of the distributed tables are empty, and its
+ * copies of the replicated ones are whole, the way a segment needs them
+ * Returns the number of the truncated tables
+ */
+PG_FUNCTION_INFO_V1(gp_expand_cleanup);
+
+Datum
+gp_expand_cleanup(PG_FUNCTION_ARGS)
+{
+	int			segment_id = PG_GETARG_INT32(0);
+	GpSegment  *segments;
+	int			nsegments;
+	char		shost[GP_HOST_LEN] = "";
+	int			sport = 0;
+	const char *keys[5] = {"host", "port", "dbname", "connect_timeout", NULL};
+	const char *vals[5];
+	char		portstr[16];
+	PGconn	   *conn = NULL;
+	MemoryContext oldcxt = CurrentMemoryContext;
+	StringInfoData truncate_sql;
+	int			ntruncated = 0;
+
+	if (gp_role != GP_ROLE_COORDINATOR || !IsUnderPostmaster)
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("the expansion cleans up on the coordinator only"));
+
+	nsegments = gp_segments_get(&segments);
+	if (nsegments == 0)
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("the cluster has no segments"));
+	for (int i = 0; i < nsegments; i++)
+		if (segments[i].segment_id == segment_id)
+		{
+			strlcpy(shost, segments[i].host, sizeof(shost));
+			sport = segments[i].port;
+		}
+	if (shost[0] == '\0')
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("segment %d is not registered", segment_id));
+
+	SPI_connect();
+
+	/*
+	 * The coordinator-share tables: hash tables whose map names the
+	 * coordinator itself
+	 */
+	SPI_execute("SELECT p.relid FROM gp.distribution_policy p "
+				"JOIN gp.colocation_groups c USING (colocation_id) "
+				"WHERE p.kind = 'hash' "
+				"AND 0 OPERATOR(pg_catalog.=) ANY (c.map)", true, 0);
+
+	/* The statement built here outlives SPI_finish: its context dies */
+	MemoryContextSwitchTo(oldcxt);
+	if (SPI_processed > 0)
+	{
+		bool		first = true;
+
+		initStringInfo(&truncate_sql);
+		appendStringInfo(&truncate_sql, "TRUNCATE ");
+		for (int k = 0; k < SPI_processed; k++)
+		{
+			bool		isnull;
+			Datum		d = SPI_getbinval(SPI_tuptable->vals[k],
+										 SPI_tuptable->tupdesc, 1, &isnull);
+			Oid			relid = isnull ? InvalidOid : DatumGetObjectId(d);
+			Relation	rel;
+
+			if (!OidIsValid(relid))
+				continue;
+			rel = table_open(relid, AccessShareLock);
+			appendStringInfo(&truncate_sql, "%s%s", first ? "" : ", ",
+							 quote_qualified_identifier(
+								 get_namespace_name(RelationGetNamespace(rel)),
+								 RelationGetRelationName(rel)));
+			first = false;
+			table_close(rel, AccessShareLock);
+			ntruncated++;
+		}
+	}
+	SPI_finish();
+
+	if (ntruncated == 0)
+		PG_RETURN_INT32(0);
+
+	snprintf(portstr, sizeof(portstr), "%d", sport);
+	vals[0] = shost;
+	vals[1] = portstr;
+	vals[2] = gp_database;
+	vals[3] = "30";
+	vals[4] = NULL;
+	conn = PQconnectdbParams(keys, vals, 1);
+	if (conn == NULL || PQstatus(conn) != CONNECTION_OK)
+		ereport(ERROR,
+				errcode(ERRCODE_CONNECTION_FAILURE),
+				errmsg("could not connect to the new segment %d at %s:%d for the cleanup",
+					   segment_id, shost, sport),
+				errdetail("%s", conn != NULL ?
+						  pchomp(PQerrorMessage(conn)) : "no connection"));
+
+	PG_TRY();
+	{
+		if (!gp_move_exec(conn, "BEGIN"))
+			ereport(ERROR,
+					errcode(ERRCODE_CONNECTION_FAILURE),
+					errmsg("could not begin the cleanup on the new segment"));
+		if (!gp_move_exec(conn, truncate_sql.data))
+			ereport(ERROR,
+					errcode(ERRCODE_CONNECTION_FAILURE),
+					errmsg("could not truncate the tables of the coordinator's share on the new segment (%s)",
+						   pchomp(PQerrorMessage(conn))));
+		if (!gp_move_exec(conn, "COMMIT"))
+			ereport(ERROR,
+					errcode(ERRCODE_CONNECTION_FAILURE),
+					errmsg("could not commit the cleanup on the new segment"));
+	}
+	PG_CATCH();
+	{
+		(void) gp_move_exec(conn, "ROLLBACK");
+		PQfinish(conn);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	PQfinish(conn);
+
+	PG_RETURN_INT32(ntruncated);
+}
