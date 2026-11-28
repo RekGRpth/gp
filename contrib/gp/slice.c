@@ -4358,6 +4358,30 @@ gp_slice_join_derived(Query *parse)
 	return false;
 }
 
+/* The mixed kind of the outer joins of a level, declared below */
+static bool gp_slice_join_outer_mixed(Node *node, bool *outer, bool *mixed);
+
+/*
+ * Whether the level of the query mixes the kinds of its outer joins: it
+ * answers whole on one segment, where every table of it comes whole
+ * beside the rest, the derived tables of the level among them -- their
+ * own tables come whole there too, and the subquery replays beside them
+ */
+static bool
+gp_slice_join_outer_mixed_level(Query *parse)
+{
+	bool		outer = false;
+	bool		mixed = false;
+
+	if (!IsA(parse->jointree, FromExpr) ||
+		list_length(parse->jointree->fromlist) != 1 ||
+		!IsA(linitial(parse->jointree->fromlist), JoinExpr))
+		return false;
+	gp_slice_join_outer_mixed(linitial(parse->jointree->fromlist),
+							  &outer, &mixed);
+	return mixed;
+}
+
 static bool
 gp_slice_join_all_inner_levels(List *tables)
 {
@@ -4617,14 +4641,15 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 
 	/*
 	 * A level whose outer joins mix kinds answers on one segment: every
-	 * table comes whole there, and the joins of the level replay the way
-	 * they ran on the coordinator.  The slice costs the whole of every
+	 * table comes whole there, the tables of the derived inputs of the
+	 * level among them, and the joins of the level replay the way they
+	 * ran on the coordinator.  The slice costs the whole of every
 	 * table on one server, so only the levels nothing smarter answers take
 	 * it
 	 */
 	outer_mixed = false;
 	if (list_length(tables) > 2 &&
-		!gp_slice_join_derived(original) && !outer_same && flat_stay == NULL &&
+		!outer_same && flat_stay == NULL &&
 		IsA(original->jointree, FromExpr) &&
 		list_length(original->jointree->fromlist) == 1 &&
 		IsA(linitial(original->jointree->fromlist), JoinExpr))
@@ -4977,6 +5002,7 @@ gp_slice_join_query(Query *parse)
 	 * answer, unless a full join keeps it whole on one segment alone.
 	 */
 	if (gp_slice_join_derived(parse) &&
+		!gp_slice_join_outer_mixed_level(parse) &&
 		(!gp_slice_join_all_inner_levels(tables) ||
 		 !gp_slice_join_motion_affordable(parse, tables, conds)))
 	{
@@ -5265,9 +5291,7 @@ locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
 	 * refused, and the coordinator answers
 	 */
 	if (!gp_slice_join_colocated(original, tables, conds) &&
-		(locus.kind == GP_LOCUS_COORDINATOR || original->hasSubLinks) &&
-		!(gp_slice_join_derived(original) &&
-		  !gp_slice_join_all_inner_levels(tables)))
+		(locus.kind == GP_LOCUS_COORDINATOR || original->hasSubLinks))
 	{
 		{
 			bool		motion_ok = gp_slice_join_motion(original, tables, conds,

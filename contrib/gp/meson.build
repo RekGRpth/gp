@@ -132,6 +132,7 @@ tests += {
       't/071_move_readers.pl',
       't/072_write_gate.pl',
       't/073_move_heal.pl',
+      't/074_derived_mixed.pl',
     ],
   },
 }
