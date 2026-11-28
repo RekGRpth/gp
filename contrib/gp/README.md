@@ -929,15 +929,15 @@ by the patch and `contrib/gp`.
    (`gp.rebalance_segments`), the shrink of a segment
    (`gp.shrink_segment`), and the growth of one (`gp.expand_segment`
    joins a copy of the coordinator as a segment, `gp.expand_cleanup`
-   cleans its copies of the tables).  A move holds the tables of the
-   group against the writes of the cluster and lets the readers answer
-   while the rows are in two places: the map commits in one transaction,
-   so no read doubles a row and no write loses one.
+   cleans its copies of the tables).  A move gates the writes by the
+   advisory locks of the group: a write of the moving bucket waits,
+   the writes of the other buckets and the readers answer while the
+   rows are in two places, and a write that runs on the segments holds
+   the whole group, for it may touch any bucket of it.  The map commits
+   in one transaction, so no read doubles a row and no write loses one.
 
-Later: a thinner lock of a move — the writes of the moving bucket wait,
-the writes of the other buckets answer; the repair of a move that a
-crash breaks in the middle; the queries whose derived tables ride mixed
-levels.
+Later: the repair of a move that a crash breaks in the middle; the
+queries whose derived tables ride mixed levels.
 
 ## License
 

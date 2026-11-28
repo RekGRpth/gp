@@ -881,6 +881,15 @@ gp_dml_plan(Query *parse, PlannedStmt *stmt, ParamListInfo boundParams,
 		}
 	}
 
+	/*
+	 * The writes that run on the segments may touch any bucket of the
+	 * group: they take the shared lock of the whole group, and a move of
+	 * any bucket waits for them.  The rules of a range or a list have no
+	 * buckets that move, and take no part
+	 */
+	if (policy.kind == GP_POLICY_HASH)
+		gp_gate_group_shared(policy.colocation_id);
+
 	/* The writers of the table run one at a time */
 	gp_dml_lock(rte->relid);
 

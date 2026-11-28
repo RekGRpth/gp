@@ -63,6 +63,9 @@ struct GpRoute
 	bool		local;			/* buckets of the coordinator write here */
 	char	   *local_cols;		/* the column list of the local insert */
 	FmgrInfo   *outfn;			/* the text output of every sent column */
+	unsigned char *gated;		/* the buckets the route has locked, one bit
+								 * each: the gate of a move takes a bucket
+								 * once for the route */
 };
 
 /* The rule of a key: the range that holds it, or the value that equals it,
@@ -159,6 +162,12 @@ gp_route_begin(Relation rel, const GpPolicy *policy, int only)
 	route->keynulls = palloc_array(bool, Max(policy->nkeys, 1));
 	for (int k = 0; k < policy->nkeys; k++)
 		route->keytypes[k] = TupleDescAttr(tupDesc, policy->keys[k] - 1)->atttypid;
+
+	/* The bits of the buckets the route has locked for the gate of a
+	 * move; a route of a hash takes every bucket of its rows once */
+	if (policy->kind == GP_POLICY_HASH)
+		route->gated = palloc0_array(unsigned char,
+									 (policy->nbuckets + 7) / 8);
 
 	/* The rules of a range or a list distribution, as datums of the key
 	 * type, and the segment position of every rule */
@@ -298,6 +307,7 @@ gp_route_row(GpRoute *route, const Datum *values, const bool *nulls)
 	const GpPolicy *policy = &route->policy;
 	int			first;
 	int			last;
+	int			bucket = 0;
 
 	resetStringInfo(&route->tuple);
 	pq_sendint16(&route->tuple, route->nsend);
@@ -313,6 +323,30 @@ gp_route_row(GpRoute *route, const Datum *values, const bool *nulls)
 
 			pq_sendint32(&route->tuple, VARSIZE_ANY_EXHDR(data));
 			pq_sendbytes(&route->tuple, VARDATA_ANY(data), VARSIZE_ANY_EXHDR(data));
+		}
+	}
+
+	/*
+	 * The bucket of the row by the hash of its keys; the gate of a move
+	 * takes the bucket once for the route: a write of the bucket waits
+	 * while the bucket moves, the writes of the other buckets answer.
+	 * A route to one segment counts its bucket too, for the rows of it
+	 * belong to the bucket all the same
+	 */
+	if (!policy->replicated && policy->kind == GP_POLICY_HASH)
+	{
+		for (int k = 0; k < policy->nkeys; k++)
+		{
+			route->keyvalues[k] = values[policy->keys[k] - 1];
+			route->keynulls[k] = nulls[policy->keys[k] - 1];
+		}
+		bucket = gp_key_bucket(policy->nbuckets, policy->nkeys,
+							   route->keyvalues, route->keynulls,
+							   route->keytypes, InvalidOid);
+		if ((route->gated[bucket >> 3] & (1 << (bucket & 7))) == 0)
+		{
+			gp_gate_bucket_shared(policy->colocation_id, bucket);
+			route->gated[bucket >> 3] |= 1 << (bucket & 7);
 		}
 	}
 
@@ -333,16 +367,6 @@ gp_route_row(GpRoute *route, const Datum *values, const bool *nulls)
 	}
 	else
 	{
-		int			bucket;
-
-		for (int k = 0; k < policy->nkeys; k++)
-		{
-			route->keyvalues[k] = values[policy->keys[k] - 1];
-			route->keynulls[k] = nulls[policy->keys[k] - 1];
-		}
-		bucket = gp_key_bucket(policy->nbuckets, policy->nkeys,
-							   route->keyvalues, route->keynulls,
-							   route->keytypes, InvalidOid);
 		first = last = route->bucket_pos[bucket];
 
 		/*

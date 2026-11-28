@@ -6,12 +6,13 @@
  * A bucket moves in three steps: the rows of the bucket copy from the old
  * segment of the bucket to the new one, the bucket's row of the map
  * switches in one transaction, and the rows go away from the old segment.
- * The tables of the group take a share-row-exclusive lock on the
- * coordinator for the move: the writers of the tables wait while the
- * rows are in two places, and the readers answer — the map commits in
- * one transaction, so a read keeps to the side of the switch its
- * snapshot took and never doubles a row.  The sessions drop their cached
- * policies after.
+ * The move gates the writes by the advisory locks of the group: a write
+ * of the moving bucket waits, the writes of the other buckets answer,
+ * and the readers answer too — the map commits in one transaction, so a
+ * read keeps to the side of the switch its snapshot took and never
+ * doubles a row.  The tables take a share-update-exclusive lock for the
+ * move, which holds the DDL and the vacuum off the rows while they are
+ * in two places.  The sessions drop their cached policies after.
  * The number of the segment that owns a bucket is a name, not a position:
  * a move never renumbers anything else.
  *
@@ -31,6 +32,7 @@
 #include "libpq-fe.h"
 #include "libpq/libpq-be-fe-helpers.h"
 #include "miscadmin.h"
+#include "storage/lock.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/fmgroids.h"
@@ -131,6 +133,57 @@ gp_move_open_cursor(PGconn *conn, GpMoveTable *table, int nbuckets,
 					 cursor, table->cols.data, table->relqual, nbuckets,
 					 table->keys.data, bucket);
 	return gp_move_exec(conn, sql.data);
+}
+
+/* The advisory tag of the locks of the gate, by the layout the cluster
+ * keeps for the two-int4 advisory locks: the database, the two keys, and
+ * the mark of their kind -- so the locks of the gate are the ordinary
+ * advisory locks, taken and watched from SQL as well */
+#define GP_GATE_TAG(tag, key1, key2) \
+	SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, key1, key2, 2)
+
+/*
+ * The shared lock of a bucket: a write of the bucket takes it for its
+ * transaction, and a move of the bucket waits for it.  The writers of
+ * the other buckets take no part in it and answer
+ */
+void
+gp_gate_bucket_shared(int colocation_id, int bucket)
+{
+	LOCKTAG		tag;
+
+	GP_GATE_TAG(tag, colocation_id, bucket);
+	(void) LockAcquire(&tag, ShareLock, false, false);
+}
+
+/*
+ * The shared lock of the whole group: a write that may touch any bucket
+ * of the group takes it, and a move of any bucket waits for it
+ */
+void
+gp_gate_group_shared(int colocation_id)
+{
+	LOCKTAG		tag;
+
+	GP_GATE_TAG(tag, colocation_id, -1);
+	(void) LockAcquire(&tag, ShareLock, false, false);
+}
+
+/*
+ * The exclusive locks of a move: the bucket first, the whole group
+ * after.  Every taker of the locks of the gate takes the locks of its
+ * buckets before the lock of the group, so the waits never close a
+ * circle
+ */
+void
+gp_gate_move(int colocation_id, int bucket)
+{
+	LOCKTAG		tag;
+
+	GP_GATE_TAG(tag, colocation_id, bucket);
+	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+	GP_GATE_TAG(tag, colocation_id, -1);
+	(void) LockAcquire(&tag, ExclusiveLock, false, false);
 }
 
 Datum
@@ -276,16 +329,19 @@ gp_move_bucket(PG_FUNCTION_ARGS)
 	SPI_finish();
 
 	/*
-	 * The move holds the tables of the group against the writes of the
-	 * cluster while the rows are in two places, so no write loses one;
-	 * the readers answer, and the one-transaction switch of the map keeps
-	 * every read on one side of it
+	 * The move takes the locks of the gate: the writes of the bucket
+	 * wait, the writes of the other buckets answer, and the readers
+	 * answer too -- the one-transaction switch of the map keeps every
+	 * read on one side of it, and no write loses one.  The tables take a
+	 * lock that holds the DDL and the vacuum off the rows while they are
+	 * in two places
 	 */
+	gp_gate_move(policy.colocation_id, bucket);
 	for (int k = 0; k < ntables; k++)
 	{
-		Relation	rel = table_open(tables[k].relid, ShareRowExclusiveLock);
+		Relation	rel = table_open(tables[k].relid, ShareUpdateExclusiveLock);
 
-		table_close(rel, ShareRowExclusiveLock);
+		table_close(rel, ShareUpdateExclusiveLock);
 	}
 
 	/* The connections of the two segments */
