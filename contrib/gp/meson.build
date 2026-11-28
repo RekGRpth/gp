@@ -128,6 +128,7 @@ tests += {
       't/067_move_bucket.pl',
       't/068_shrink.pl',
       't/069_expansion.pl',
+      't/070_mixed_sublinks.pl',
     ],
   },
 }
