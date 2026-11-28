@@ -1,11 +1,13 @@
 # Copyright (c) 2026, Georgy Shelkovy
 # Licensed under the PostgreSQL License, see LICENSE
 
-# A move of a bucket holds the tables of the group against the writes of
-# the cluster and lets the readers answer while the rows are in two
-# places: the writers wait at the lock (a write that slipped past would
-# be lost by the switch), a read keeps to the side of the switch its
-# snapshot took, and no read doubles a row and no write loses one
+# A move of a bucket copies while the readers answer: the rows of the
+# copy wait uncommitted on the new segment, and the cluster reads the
+# old side, once each.  Then a short window holds the readers while the
+# copy commits, the map switches, and the rows go away from the old
+# segment.  The writers wait at the locks of the gate: a
+# share-row-exclusive holder of the table, and an uncommitted write of
+# the moving bucket, each makes the move wait
 
 use strict;
 use warnings FATAL => 'all';
@@ -28,12 +30,35 @@ INSERT INTO t SELECT g, 'r' || g FROM generate_series(1, 30) gs(g);
 INSERT INTO u SELECT g % 4, g * 1.5 FROM generate_series(1, 30) gs(g);
 DDL
 
-# A reader with an open cursor holds AccessShare and does not block the
-# move: an AccessExclusive move would wait for it
-my $reader = $coordinator->background_psql('postgres', on_error_stop => 1);
-$reader->query("BEGIN;\nDECLARE c CURSOR FOR SELECT * FROM t;\nFETCH 1 FROM c;\n");
-like(run("SET lock_timeout = '3s'; SELECT gp.move_bucket('t', 0, 3)"), qr/^\d+$/,
-	'the move answers while a reader holds the table');
+# The copy goes under an open reader, and the window of the switch
+# waits for the reader's transaction to end
+if ($ENV{enable_injection_points} eq 'yes')
+{
+	run("CREATE EXTENSION injection_points;\n"
+	   . "SELECT injection_points_attach('gp-move-copied', 'wait')");
+	my $reader = $coordinator->background_psql('postgres', on_error_stop => 1);
+	$reader->query("BEGIN;\nDECLARE c CURSOR FOR SELECT * FROM t;\n"
+				   . "FETCH 1 FROM c;\n");
+	my $mover = $coordinator->background_psql('postgres', on_error_stop => 1);
+	$mover->query_until(qr/go/, "\\echo go\nSELECT gp.move_bucket('t', 0, 3);\n");
+	$coordinator->wait_for_event('client backend', 'gp-move-copied');
+	is(run('SELECT sum(a), count(*) FROM t'), '465|30',
+		'the cluster reads the old side once while the copy waits');
+	my $seen = $reader->query("FETCH ALL FROM c");
+	is(scalar(grep { length } split(/\n/, $seen)), 29,
+		'the open cursor of the reader keeps its rows through the copy');
+	$reader->query("ROLLBACK;\n");
+	$reader->quit;
+	run("SELECT injection_points_detach('gp-move-copied');\n"
+		. "SELECT injection_points_wakeup('gp-move-copied');\n");
+	$mover->query('SELECT 1');
+}
+else
+{
+	run("SELECT gp.move_bucket('t', 0, 3)");
+	pass('injection points are not supported by this build');
+	pass('injection points are not supported by this build');
+}
 
 # The rows moved: the map names the new segment, and the answers of the
 # cluster are the ones of the whole
@@ -43,19 +68,6 @@ is(run("SELECT map[1] FROM gp.colocation_groups g "
 	'the map names the new segment');
 is(run('SELECT sum(a), count(*) FROM t'), '465|30',
 	'the cluster answers the truth of the whole');
-
-# A read keeps to the side of the switch its snapshot took: the cursor
-# still reads the rows of the old segment, the delete of the old copy is
-# invisible to its snapshot, and a fresh statement of the same session
-# reads by the new map.  The fetch of the first row left the cursor 29
-# rows before it, and they are all still there after the move
-my $seen = $reader->query("FETCH ALL FROM c");
-is(scalar(grep { length } split(/\n/, $seen)), 29,
-	'the open cursor of the reader keeps its rows through the switch');
-is($reader->query('SELECT count(*) FROM t'), 30,
-	'and a fresh read of the session answers by the new map');
-$reader->query("ROLLBACK;\n");
-$reader->quit;
 
 # A share-row-exclusive holder of the table makes the move wait: the
 # mover requests a lock the writers' own conflicts with
@@ -70,8 +82,7 @@ $locker->quit;
 
 # An uncommitted write holds the gate of its bucket, and the move of
 # that bucket waits for it: the row it wrote before the copy would be
-# lost by the switch.  The write holds no lock that the moves of the
-# other buckets would wait for
+# lost by the switch
 my $writer = $coordinator->background_psql('postgres', on_error_stop => 1);
 $writer->query("BEGIN;\nINSERT INTO t VALUES (500, 'pending');\n");
 my $wbucket = run('SELECT gp.bucket(1024, 500)');

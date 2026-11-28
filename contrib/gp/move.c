@@ -3,9 +3,14 @@
  * move.c
  *		Moving a bucket of a colocation group to another segment
  *
- * A bucket moves in three steps: the rows of the bucket copy from the old
- * segment of the bucket to the new one, the bucket's row of the map
- * switches in one transaction, and the rows go away from the old segment.
+ * A bucket moves in two phases.  The rows of the bucket copy from the
+ * old segment of the bucket to the new one while the readers answer:
+ * the copy stays uncommitted on the new segment, and every row of the
+ * bucket reads from one place, the old one.  Then a short window holds
+ * the readers while the copy commits, the bucket's row of the map
+ * switches, and the rows go away from the old segment: no read doubles
+ * a row.  The copy starts clean on the new segment, so a move that a
+ * crash broke in the middle repeats, a bucket never doubling.
  * The move gates the writes by the advisory locks of the group: a write
  * of the moving bucket waits, the writes of the other buckets answer,
  * and the readers answer too — the map commits in one transaction, so a
@@ -34,6 +39,7 @@
 #include "miscadmin.h"
 #include "storage/lock.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -372,6 +378,17 @@ gp_move_bucket(PG_FUNCTION_ARGS)
 	{
 		MemoryContextSwitchTo(movecxt);
 
+		/*
+		 * The copy of the whole group goes in one transaction of the new
+		 * segment: the rows of it stay invisible to the cluster while
+		 * the readers answer by the old side, every row of the bucket
+		 * reads from one place
+		 */
+		if (!gp_move_exec(to, "BEGIN"))
+			ereport(ERROR,
+					errcode(ERRCODE_CONNECTION_FAILURE),
+					errmsg("could not begin the copy on the new segment"));
+
 		for (int k = 0; k < ntables; k++)
 		{
 			GpMoveTable *table = &tables[k];
@@ -385,10 +402,23 @@ gp_move_bucket(PG_FUNCTION_ARGS)
 						errmsg("could not read the bucket %d of %s on the old segment (%s)",
 							   bucket, table->relqual,
 							   pchomp(PQerrorMessage(from))));
-			if (!gp_move_exec(to, "BEGIN"))
+
+			/*
+			 * The copy starts clean: the rows of the bucket that an
+			 * earlier move of it left on this segment when a crash broke
+			 * it in the middle go away with the batches of this one, and
+			 * a move repeats after a crash, a bucket never doubling.  The
+			 * rows of the other buckets keep out of the delete
+			 */
+			if (!gp_move_exec(to, psprintf(
+					"DELETE FROM ONLY %s WHERE gp.bucket(%d, %s) "
+					"OPERATOR(pg_catalog.=) %d",
+					table->relqual, policy.nbuckets, table->keys.data,
+					bucket)))
 				ereport(ERROR,
 						errcode(ERRCODE_CONNECTION_FAILURE),
-						errmsg("could not begin the copy on the new segment"));
+						errmsg("could not clean the bucket %d of %s on the new segment",
+							   bucket, table->relqual));
 
 			for (;;)
 			{
@@ -436,12 +466,35 @@ gp_move_bucket(PG_FUNCTION_ARGS)
 				PQclear(res);
 			}
 			(void) gp_move_exec(from, psprintf("CLOSE %s", cursor));
-			if (!gp_move_exec(to, "COMMIT"))
-				ereport(ERROR,
-						errcode(ERRCODE_CONNECTION_FAILURE),
-						errmsg("could not commit the copy of %s",
-							   table->relqual));
 		}
+
+		/*
+		 * The copy is done: the rows of it wait uncommitted on the new
+		 * segment, and the cluster still reads the old side, once each
+		 */
+		INJECTION_POINT("gp-move-copied", NULL);
+
+		(void) gp_move_exec(from, "COMMIT");
+
+		/*
+		 * The window of the switch: the readers of the tables wait while
+		 * the copy commits on the new segment, the map switches, and the
+		 * rows go away from the old segment -- the three together keep
+		 * every read on one side of the switch, and no read doubles a
+		 * row.  A reader of an open transaction holds the window while
+		 * its transaction lasts
+		 */
+		for (int k = 0; k < ntables; k++)
+		{
+			Relation	rel = table_open(tables[k].relid, AccessExclusiveLock);
+
+			table_close(rel, AccessExclusiveLock);
+		}
+
+		if (!gp_move_exec(to, "COMMIT"))
+			ereport(ERROR,
+					errcode(ERRCODE_CONNECTION_FAILURE),
+					errmsg("could not commit the copy on the new segment"));
 	}
 	PG_CATCH();
 	{
@@ -466,8 +519,6 @@ gp_move_bucket(PG_FUNCTION_ARGS)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	(void) gp_move_exec(from, psprintf("CLOSE %s", cursor));
-	(void) gp_move_exec(from, "COMMIT");
 	PQfinish(from);
 	PQfinish(to);
 	MemoryContextSwitchTo(oldcxt);
