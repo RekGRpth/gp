@@ -172,6 +172,11 @@ extern bool gp_slice_insert_motion(Query *parse, bool *motion);
 extern void gp_analyze(VacuumStmt *stmt);
 extern void gp_autoanalyze_check(void);
 
+/* move.c */
+extern void gp_gate_bucket_shared(int colocation_id, int bucket);
+extern void gp_gate_group_shared(int colocation_id);
+extern void gp_gate_move(int colocation_id, int bucket);
+
 /* motion.c */
 extern void gp_motion_init(void);
 extern bool gp_is_motion(Plan *plan);

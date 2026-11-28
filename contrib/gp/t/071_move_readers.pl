@@ -68,14 +68,17 @@ like($@, qr/lock timeout/, 'a share-row-exclusive holder makes the move wait');
 $locker->query("ROLLBACK;\n");
 $locker->quit;
 
-# An uncommitted write holds RowExclusive and makes the move wait too:
-# the rows it wrote before the copy would be lost by the switch
+# An uncommitted write holds the gate of its bucket, and the move of
+# that bucket waits for it: the row it wrote before the copy would be
+# lost by the switch.  The write holds no lock that the moves of the
+# other buckets would wait for
 my $writer = $coordinator->background_psql('postgres', on_error_stop => 1);
 $writer->query("BEGIN;\nINSERT INTO t VALUES (500, 'pending');\n");
+my $wbucket = run('SELECT gp.bucket(1024, 500)');
 eval {
-	run("SET lock_timeout = '1s'; SELECT gp.move_bucket('t', 0, 2)");
+	run("SET lock_timeout = '1s'; SELECT gp.move_bucket('t', $wbucket, 2)");
 };
-like($@, qr/lock timeout/, 'an uncommitted write makes the move wait');
+like($@, qr/lock timeout/, 'an uncommitted write makes the move of its bucket wait');
 $writer->query("ROLLBACK;\n");
 $writer->quit;
 is(run('SELECT count(*) FROM t'), 30,

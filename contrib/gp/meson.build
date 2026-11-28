@@ -130,6 +130,7 @@ tests += {
       't/069_expansion.pl',
       't/070_mixed_sublinks.pl',
       't/071_move_readers.pl',
+      't/072_write_gate.pl',
     ],
   },
 }
