@@ -893,10 +893,11 @@ by the patch and `contrib/gp`.
    joins answered on one segment; a level whose outer joins mix kinds — a
    FULL join beside a LEFT join, a RIGHT join beside them — answers on one
    segment too, where every table comes whole and the joins and the
-   sublinks of the level replay the way they would here.  What stays on
-   the coordinator: joins whose graph is not connected by keys, a level
-   of such tables that keeps a derived table on it, and queries the rules
-   cannot prove safe — the fallback always gives a right answer.
+   sublinks of the level replay the way they would here; a derived table
+   of the level rides the same, its own tables coming whole beside the
+   rest.  What stays on the coordinator: joins whose graph is not
+   connected by keys, and queries the rules cannot prove safe — the
+   fallback always gives a right answer.
 6. **Motions** — done: a `GpMotion` custom scan moves tables by
    redistribution or broadcast over a serialized-plan transport with binary
    tuples; clean
@@ -945,7 +946,9 @@ by the patch and `contrib/gp`.
    write loses one; a move that a crash broke in the middle repeats:
    the copy starts clean on the new segment.
 
-Later: the queries whose derived tables ride mixed levels.
+Later: the reads that answer by the owner of their rows: a scan keeps
+to the segments the map names, and the rows that a broken move left on
+a foreign segment never double the answer.
 
 ## License
 
