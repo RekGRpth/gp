@@ -133,6 +133,7 @@ tests += {
       't/072_write_gate.pl',
       't/073_move_heal.pl',
       't/074_derived_mixed.pl',
+      't/075_ownership_reads.pl',
     ],
   },
 }

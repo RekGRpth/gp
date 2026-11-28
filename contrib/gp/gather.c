@@ -102,7 +102,7 @@ typedef struct GpGatherState
 
 static void gp_gather_append_order(StringInfoData *sql, List *sortkeys,
 								   Oid relid);
-static char *gp_gather_sql_rel(Relation rel, bool inh);
+static char *gp_gather_sql_rel(Relation rel, bool inh, bool filtered);
 static int	gp_gather_merge_heap_cmp(Datum a, Datum b, void *arg);
 
 static Node *gp_gather_create_state(CustomScan *cscan);
@@ -283,7 +283,7 @@ gp_gather_load_libpq(GpGatherState *state)
 		if (gp_policy_get(rel->rd_id, &policy) &&
 			gp_policy_has_coordinator(&policy))
 		{
-			char	   *localsql = gp_gather_sql_rel(rel, true);
+			char	   *localsql = gp_gather_sql_rel(rel, true, false);
 
 
 			/*
@@ -694,14 +694,54 @@ gp_is_gather(Plan *plan)
 }
 
 /*
- * The query that the segments run, and their columns, as the node reads
- * them
+ * The ownership of the rows of the table, as a condition the segments
+ * run: the map of the group rides in the query as an array, and a row
+ * answers when the bucket of its key names the segment that runs the
+ * query.  The rows that a broken move left on a foreign segment keep
+ * out of the answer, for no map names their segment
  */
 static char *
-gp_gather_sql_rel(Relation rel, bool inh)
+gp_gather_own_qual(Relation rel)
+{
+	GpPolicy	policy;
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	StringInfoData map;
+	StringInfoData keys;
+	int			i;
+
+	if (!gp_policy_get(rel->rd_id, &policy) || policy.replicated ||
+		policy.kind != GP_POLICY_HASH || policy.nbuckets <= 0 ||
+		policy.map == NULL || policy.keys == NULL)
+		return NULL;
+	initStringInfo(&map);
+	for (i = 0; i < policy.nbuckets; i++)
+		appendStringInfo(&map, "%s%d", i > 0 ? "," : "", policy.map[i]);
+	initStringInfo(&keys);
+	for (i = 0; i < policy.nkeys; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, policy.keys[i] - 1);
+
+		appendStringInfo(&keys, "%s%s%s", i > 0 ? ", " : "",
+						 quote_identifier(NameStr(att->attname)),
+						 att->attcollation != InvalidOid ?
+						 " COLLATE pg_catalog.default" : "");
+	}
+	return psprintf(" WHERE gp.row_owned(%d, ARRAY[%s]%s%s)",
+					policy.nbuckets, map.data,
+					keys.len > 0 ? ", " : "", keys.data);
+}
+
+/*
+ * The query that the segments run, and their columns, as the node reads
+ * them.  The share of the coordinator reads its own rows unfiltered;
+ * the segments read by the ownership of the rows
+ */
+static char *
+gp_gather_sql_rel(Relation rel, bool inh, bool filtered)
 {
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	StringInfoData cols;
+	char	   *own = NULL;
 	char	   *sql;
 
 	initStringInfo(&cols);
@@ -714,10 +754,13 @@ gp_gather_sql_rel(Relation rel, bool inh)
 		appendStringInfo(&cols, "%s%s", cols.len > 0 ? ", " : "",
 						 quote_identifier(NameStr(att->attname)));
 	}
-	sql = psprintf("SELECT %s FROM %s%s", cols.data,
+	if (filtered)
+		own = gp_gather_own_qual(rel);
+	sql = psprintf("SELECT %s FROM %s%s%s", cols.data,
 				   inh ? "" : "ONLY ",
 				   quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
-											  RelationGetRelationName(rel)));
+											  RelationGetRelationName(rel)),
+				   own != NULL ? own : "");
 	return sql;
 }
 
@@ -725,7 +768,7 @@ static char *
 gp_gather_sql(RangeTblEntry *rte)
 {
 	Relation	rel = table_open(rte->relid, NoLock);
-	char	   *sql = gp_gather_sql_rel(rel, rte->inh);
+	char	   *sql = gp_gather_sql_rel(rel, rte->inh, true);
 
 	table_close(rel, NoLock);
 	return sql;

@@ -54,6 +54,8 @@
 #define GP_HASH_SEED UINT64CONST(0x7A5B9C3D1E2F4A6B)
 
 PG_FUNCTION_INFO_V1(gp_bucket);
+PG_FUNCTION_INFO_V1(gp_self_segment);
+PG_FUNCTION_INFO_V1(gp_row_owned);
 PG_FUNCTION_INFO_V1(gp_check_distribution_key);
 
 /*
@@ -188,6 +190,75 @@ gp_key_bucket(int nbuckets, int nkeys, const Datum *values, const bool *nulls,
 /*
  * gp.bucket(nbuckets, VARIADIC key): the bucket of a key among nbuckets
  */
+/* The segment this server runs as, read once and kept */
+static int
+gp_self_segment_value(void)
+{
+	static int	self_segment = -1;
+
+	if (self_segment < 0)
+	{
+		const char *setting = GetConfigOption("gp.segment_id", true, false);
+
+		self_segment = setting != NULL ? atoi(setting) : 0;
+	}
+	return self_segment;
+}
+
+Datum
+gp_self_segment(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(gp_self_segment_value());
+}
+
+/*
+ * Whether the segment that runs the query owns the row: the bucket of
+ * the key, by the map of the group that rides in the query, names it.
+ * The ownership conditions of the gathered rows run by it
+ */
+Datum
+gp_row_owned(PG_FUNCTION_ARGS)
+{
+	int32		nbuckets;
+	ArrayType  *map;
+	Datum	   *args;
+	Oid		   *types;
+	bool	   *nulls;
+	Datum	   *mapvals;
+	bool	   *mapnulls;
+	int			nargs;
+	int			nmap;
+	int			bucket;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		PG_RETURN_BOOL(false);
+	nbuckets = PG_GETARG_INT32(0);
+	if (nbuckets <= 0)
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("number of buckets must be positive"));
+	map = PG_GETARG_ARRAYTYPE_P(1);
+	deconstruct_array(map, INT4OID, sizeof(int32), true, 'i',
+					  &mapvals, &mapnulls, &nmap);
+	if (nmap != nbuckets)
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("the map has %d buckets, %d are named", nmap,
+					   nbuckets));
+
+	nargs = extract_variadic_args(fcinfo, 2, true, &args, &types, &nulls);
+	if (nargs < 1)
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("a key has at least one column"));
+
+	bucket = gp_key_bucket(nbuckets, nargs, args, nulls, types,
+						   PG_GET_COLLATION());
+	if (bucket < 0 || bucket >= nmap || mapnulls[bucket])
+		PG_RETURN_BOOL(false);
+	PG_RETURN_BOOL(DatumGetInt32(mapvals[bucket]) == gp_self_segment_value());
+}
+
 Datum
 gp_bucket(PG_FUNCTION_ARGS)
 {

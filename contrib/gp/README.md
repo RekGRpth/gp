@@ -412,6 +412,12 @@ WHERE and the filters read the answers above the gather.
 The fragments travel in ordinary sessions of the segments: the gather, its
 merge, and the slices, whose pull of a motion rides in the query itself as
 `gp.peer_query()`.
+The gathered read answers by the owner of the rows: the map of the
+colocation group rides in the remote SQL as an array, and a row answers
+when `gp.row_owned()` names the segment that runs the read — the rows
+that a broken move left on a foreign segment keep out of the answers
+while they sit there, and a keyed read answers the row of the owner
+once.
 The conditions of the query and the projection run on the coordinator, so the
 result is always correct, if not always cheap: all rows of the table come,
 none is chosen on the segments, and the planner does not yet know how many
@@ -946,9 +952,9 @@ by the patch and `contrib/gp`.
    write loses one; a move that a crash broke in the middle repeats:
    the copy starts clean on the new segment.
 
-Later: the reads that answer by the owner of their rows: a scan keeps
-to the segments the map names, and the rows that a broken move left on
-a foreign segment never double the answer.
+Later: the reads of the slices answer by the owner of their rows too —
+the aggregate that a slice replays reads the rows of the table as the
+query names them, and the ownership of the rows keeps out of it.
 
 ## License
 
