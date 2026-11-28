@@ -761,7 +761,7 @@ All are set at server start unless noted.
 | `gp.policy_changed(relation)` | Make every session read the policy of a table again; `gp.distribute()` calls it |
 | `gp.segment_id()` | The segment this server is: 0 on the coordinator, and its number on a segment.  A query the segments answer takes the value of the server that read every row: a plain read names the segment of each of its rows, a grouping keyed by it keeps every group on one segment — the skew of the data by the segments — and a condition by it names the segments whose rows pass.  An aggregate above a gather answers it as 0, for no row of theirs is the answer of one server |
 | `gp.dispatches()` | How many statements and row streams of this session have gone to the segments.  A query over the tables that keep their rows on the coordinator leaves it unchanged |
-| `gp.shrink_segment(segment)` | Shrink the cluster: every bucket the segment keeps moves to the segments that stay, the segment stops, and its row goes away; superusers only |
+| `gp.shrink_segment(segment)` | Shrink the cluster: every bucket the segment keeps moves to the segments that stay, the segment stops, and its row goes away; a mirror of the segment leaves beside it (the standby server itself stops by the deployment tool); superusers only |
 | `gp.expand_segment(segment)` | Finish the joining of a segment that started from a copy of the coordinator: the coordinator-share rows truncate on it, and the buckets of every hash group spread over the registered segments; superusers only |
 | `gp.rebalance_segments()` | Spread the buckets of every hash colocation group over the registered segments by the even share; superusers only |
 

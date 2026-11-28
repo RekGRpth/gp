@@ -29,6 +29,12 @@ SELECT gp.distribute('r', NULL);
 INSERT INTO r VALUES (1), (2);
 DDL
 
+# A mirror of the leaving segment leaves beside it: the row of the
+# mirror is registered, and the shrink takes both rows away (the standby
+# server itself stops by the deployment tool)
+run("SELECT gp.register_mirror(3, '/tmp', 23987)");
+ok(run('SELECT count(*) FROM gp.mirrors WHERE segment_id = 3'), 'the mirror registered');
+
 # The leaving segment stops, its buckets move to the ones that stay,
 # and its row leaves the copy of the segments
 is(run('SELECT gp.shrink_segment(3)'), '',
@@ -37,6 +43,8 @@ is(run('SELECT count(*) FROM gp.segments WHERE segment_id = 3'), 0,
 	'the row of the segment goes away');
 is(run('SELECT count(*) FROM gp.cluster_segments()'), 2,
 	'and the copy of the segments loses it');
+is(run('SELECT count(*) FROM gp.mirrors WHERE segment_id = 3'), 0,
+	'and the mirror row goes away with it');
 
 # The answers of the cluster are the truth of the whole
 is(run('SELECT sum(a), count(*) FROM t'), '465|30',
