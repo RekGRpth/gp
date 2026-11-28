@@ -129,6 +129,7 @@ tests += {
       't/068_shrink.pl',
       't/069_expansion.pl',
       't/070_mixed_sublinks.pl',
+      't/071_move_readers.pl',
     ],
   },
 }
