@@ -93,7 +93,8 @@ if ($ENV{enable_injection_points} eq 'yes')
 	   . "SELECT injection_points_attach('gp-move-copied', 'wait')");
 	my $mover = $coordinator->background_psql('postgres', on_error_stop => 1);
 	$mover->query_until(qr/go/,
-		"\\echo go\nSELECT gp.move_bucket('t', $other, 3);\n");
+		"\\echo go\nSET statement_timeout = '120s';\n"
+		. "SELECT gp.move_bucket('t', $other, 3);\n");
 	$coordinator->wait_for_event('client backend', 'gp-move-copied');
 
 	# A key whose bucket takes no part in the move
@@ -108,7 +109,7 @@ if ($ENV{enable_injection_points} eq 'yes')
 
 	run("SELECT injection_points_detach('gp-move-copied');\n"
 		. "SELECT injection_points_wakeup('gp-move-copied');\n");
-	$mover->query('SELECT 1');
+	$mover->quit;
 	is(run('SELECT sum(a), count(*) FROM t'), '465|30',
 		'and the move after it keeps the truth of the whole');
 }

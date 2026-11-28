@@ -40,7 +40,8 @@ if ($ENV{enable_injection_points} eq 'yes')
 	$reader->query("BEGIN;\nDECLARE c CURSOR FOR SELECT * FROM t;\n"
 				   . "FETCH 1 FROM c;\n");
 	my $mover = $coordinator->background_psql('postgres', on_error_stop => 1);
-	$mover->query_until(qr/go/, "\\echo go\nSELECT gp.move_bucket('t', 0, 3);\n");
+	$mover->query_until(qr/go/, "\\echo go\nSET statement_timeout = '120s';\n"
+		. "SELECT gp.move_bucket('t', 0, 3);\n");
 	$coordinator->wait_for_event('client backend', 'gp-move-copied');
 	is(run('SELECT sum(a), count(*) FROM t'), '465|30',
 		'the cluster reads the old side once while the copy waits');
@@ -51,7 +52,7 @@ if ($ENV{enable_injection_points} eq 'yes')
 	$reader->quit;
 	run("SELECT injection_points_detach('gp-move-copied');\n"
 		. "SELECT injection_points_wakeup('gp-move-copied');\n");
-	$mover->query('SELECT 1');
+	$mover->quit;
 }
 else
 {
