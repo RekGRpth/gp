@@ -36,6 +36,11 @@ WHERE colocation_id = (SELECT colocation_id FROM gp.distribution_policy
 SQL
 run("UPDATE gp.distribution_policy SET colocation_id = (SELECT max(colocation_id) FROM gp.colocation_groups) WHERE relid = 'small'::regclass");
 run("SELECT gp.policy_changed('small')");
+
+# The rows of small take the places of the turned map, the way the moves
+# of the buckets would place them
+run('DELETE FROM small');
+run("INSERT INTO small SELECT i, 's' || i FROM generate_series(1, 10) i");
 run('CREATE TABLE lb AS SELECT * FROM big');
 run('CREATE TABLE ls AS SELECT * FROM small');
 run('ANALYZE big, small');

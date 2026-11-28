@@ -41,6 +41,11 @@ WHERE colocation_id = (SELECT colocation_id FROM gp.distribution_policy
 SQL
 run("UPDATE gp.distribution_policy SET colocation_id = (SELECT max(colocation_id) FROM gp.colocation_groups) WHERE relid = 'u'::regclass");
 run("SELECT gp.policy_changed('u')");
+
+# The rows of u take the places of the turned map, the way the moves of
+# the buckets would place them
+run('DELETE FROM u');
+run('INSERT INTO u SELECT i, i FROM generate_series(1, 100) i');
 run('CREATE TABLE l1 AS SELECT * FROM t1');
 run('CREATE TABLE l2 AS SELECT * FROM t2');
 run('CREATE TABLE lr AS SELECT * FROM r');

@@ -230,7 +230,7 @@ gp_row_owned(PG_FUNCTION_ARGS)
 	int			nmap;
 	int			bucket;
 
-	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_NARGS() < 3)
 		PG_RETURN_BOOL(false);
 	nbuckets = PG_GETARG_INT32(0);
 	if (nbuckets <= 0)

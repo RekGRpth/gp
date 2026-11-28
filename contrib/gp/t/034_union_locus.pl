@@ -69,6 +69,11 @@ WHERE p.relid = 't3'::regclass
 SQL
 run("SELECT gp.policy_changed('t3')");
 
+# The rows of t3 take the places of the turned map, the way the moves of
+# the buckets would place them
+run('DELETE FROM t3');
+run("INSERT INTO t3 VALUES (6, 'f'), (7, 'g')");
+
 run('CREATE TABLE m1 (a int, b int, v text)');
 run("SELECT gp.distribute('m1', ARRAY['a', 'b'])");
 run('CREATE TABLE m2 (a int, b int, v text)');

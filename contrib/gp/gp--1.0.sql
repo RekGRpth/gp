@@ -484,7 +484,7 @@ LANGUAGE C IMMUTABLE STRICT;
 CREATE FUNCTION gp.row_owned(nbuckets int, map int[], VARIADIC key "any")
 RETURNS boolean
 AS 'MODULE_PATHNAME', 'gp_row_owned'
-LANGUAGE C IMMUTABLE STRICT;
+LANGUAGE C IMMUTABLE;
 
 CREATE FUNCTION gp.bucket_segment(colocation_id int, bucket int)
 RETURNS int

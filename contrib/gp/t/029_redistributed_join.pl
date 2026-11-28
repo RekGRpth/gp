@@ -52,6 +52,12 @@ WHERE p.relid = 't2'::regclass
 SQL
 run("SELECT gp.policy_changed('t2')");
 
+# The rows of t2 take the places of the turned map, the way the moves of
+# the buckets would place them
+run('DELETE FROM t2');
+run("INSERT INTO t2 SELECT g, 'c' || g FROM generate_series(41, 120) g");
+run("INSERT INTO t2 VALUES (NULL, 'cnull1'), (NULL, 'cnull2')");
+
 # t3 has a third map, turned by two buckets; t4 stays with t1
 run(<<'SQL');
 INSERT INTO gp.colocation_groups (key_types, nbuckets, map)
@@ -65,6 +71,10 @@ SET colocation_id = (SELECT max(colocation_id) FROM gp.colocation_groups)
 WHERE p.relid = 't3'::regclass
 SQL
 run("SELECT gp.policy_changed('t3')");
+
+# The rows of t3 take the places of their turned map the same way
+run('DELETE FROM t3');
+run("INSERT INTO t3 SELECT g, 'd' || g FROM generate_series(61, 140) g");
 
 # The same rows in tables of the coordinator, to compare the answers with
 run('CREATE TABLE l1 AS SELECT * FROM t1');
