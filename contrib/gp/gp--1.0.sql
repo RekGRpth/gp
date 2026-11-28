@@ -302,6 +302,9 @@ DECLARE
 	remaining int[];
 	moved int;
 	wait int;
+	mirrorhost text;
+	mirrorport int;
+	mirrorknown bool;
 BEGIN
 	IF current_setting('gp.role', true) IS DISTINCT FROM 'coordinator' THEN
 		RAISE EXCEPTION 'the cluster shrinks on the coordinator only';
@@ -311,11 +314,6 @@ BEGIN
 		RAISE EXCEPTION 'segment % is not registered',
 			shrink_segment.segment_id;
 	END IF;
-	IF EXISTS (SELECT FROM gp.mirrors m
-			   WHERE m.segment_id = shrink_segment.segment_id) THEN
-		RAISE EXCEPTION 'segment % keeps a mirror; remove the mirror first',
-			shrink_segment.segment_id;
-	END IF;
 	SELECT array_agg(s2.segment_id ORDER BY s2.segment_id)
 	INTO remaining
 	FROM gp.segments s2
@@ -323,6 +321,13 @@ BEGIN
 	IF remaining IS NULL OR cardinality(remaining) = 0 THEN
 		RAISE EXCEPTION 'the cluster keeps no other segment';
 	END IF;
+
+	-- A mirror of the segment leaves beside it: the deployment tool stops
+	-- the standby server, and the row of the mirror goes away with the
+	-- row of the segment
+	SELECT m.host, m.port INTO mirrorhost, mirrorport
+	FROM gp.mirrors m WHERE m.segment_id = shrink_segment.segment_id;
+	mirrorknown := FOUND;
 
 	-- Every bucket the segment keeps moves to the segments that stay, in
 	-- turn, so the shares even out
@@ -357,6 +362,10 @@ BEGIN
 	FOR wait IN 1 .. 30 LOOP
 		DELETE FROM gp.segments del
 		WHERE del.segment_id = shrink_segment.segment_id;
+		IF mirrorknown THEN
+			DELETE FROM gp.mirrors delm
+			WHERE delm.segment_id = shrink_segment.segment_id;
+		END IF;
 		EXIT WHEN NOT EXISTS (SELECT FROM gp.segments s
 							  WHERE s.segment_id = shrink_segment.segment_id);
 		PERFORM pg_sleep(1);
@@ -369,6 +378,11 @@ BEGIN
 	IF EXISTS (SELECT FROM gp.segments s
 			   WHERE s.segment_id = shrink_segment.segment_id) THEN
 		RAISE EXCEPTION 'segment % did not leave the cluster',
+			shrink_segment.segment_id;
+	END IF;
+	IF mirrorknown AND EXISTS (SELECT FROM gp.mirrors m
+							   WHERE m.segment_id = shrink_segment.segment_id) THEN
+		RAISE EXCEPTION 'the mirror of the segment % did not leave the cluster',
 			shrink_segment.segment_id;
 	END IF;
 END
