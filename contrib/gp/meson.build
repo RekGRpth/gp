@@ -131,6 +131,7 @@ tests += {
       't/070_mixed_sublinks.pl',
       't/071_move_readers.pl',
       't/072_write_gate.pl',
+      't/073_move_heal.pl',
     ],
   },
 }

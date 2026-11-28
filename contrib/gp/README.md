@@ -242,10 +242,17 @@ of its own; the bucket goes to a segment by a map.
 `gp.move_bucket(table, bucket, segment)` moves a bucket of the
 colocation group of a table to another segment: the rows of the bucket
 copy to the new segment, the bucket's row of the map switches in one
-transaction, and the rows go away from the old segment.  The tables of
-the group are locked against the statements of the cluster while the
-rows are in two places, and the sessions drop their cached policies
-after.  Every hash table of the group moves its share, so the joins by
+transaction, and the rows go away from the old segment.  The copy
+goes while the readers answer: the rows of it stay uncommitted on the
+new segment, and every row of the bucket reads from one place.  Then a
+short window holds the readers while the copy commits, the map
+switches, and the rows go away from the old segment.  The copy starts
+clean on the new segment, so a move that a crash broke in the middle
+repeats, a bucket never doubling.  The writes of the bucket wait at the
+advisory locks of the group the whole move, the writes of the other
+buckets answer under the copy, and the sessions drop their cached
+policies after.  Every hash table of the
+group moves its share, so the joins by the key stay local.  Moving the buckets is how a cluster grows and
 the key stay local.  Moving the buckets is how a cluster grows and
 shrinks: a new segment registers and takes buckets one by one, and a
 leaving segment hands out all of its buckets before its row goes away.
@@ -931,13 +938,14 @@ by the patch and `contrib/gp`.
    joins a copy of the coordinator as a segment, `gp.expand_cleanup`
    cleans its copies of the tables).  A move gates the writes by the
    advisory locks of the group: a write of the moving bucket waits,
-   the writes of the other buckets and the readers answer while the
-   rows are in two places, and a write that runs on the segments holds
-   the whole group, for it may touch any bucket of it.  The map commits
-   in one transaction, so no read doubles a row and no write loses one.
+   a write that runs on the segments holds the whole group, for it may
+   touch any bucket of it, and the writes of the other buckets answer
+   under the copy.  The copy goes while the readers answer, and a short
+   window of the switch holds them, so no read doubles a row and no
+   write loses one; a move that a crash broke in the middle repeats:
+   the copy starts clean on the new segment.
 
-Later: the repair of a move that a crash breaks in the middle; the
-queries whose derived tables ride mixed levels.
+Later: the queries whose derived tables ride mixed levels.
 
 ## License
 

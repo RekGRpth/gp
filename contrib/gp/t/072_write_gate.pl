@@ -6,7 +6,9 @@
 # while the writes of the other buckets answer; a write that runs on the
 # segments may touch any bucket of the group, and takes the lock of the
 # whole group; the move itself takes the exclusive locks of its bucket
-# and of the group, and waits for every holder of them
+# and of the group, and waits for every holder of them.  The writes of
+# the other buckets answer under the copy of a move too, while the
+# window of the switch waits for their transactions to end
 
 use strict;
 use warnings FATAL => 'all';
@@ -37,7 +39,7 @@ my $bk = run('SELECT gp.bucket(1024, 500)');
 my $other = ($bk + 1) % 1024;
 
 # A routed insert holds the gate of its bucket: the move of the bucket
-# waits, and the move of another bucket answers while the insert runs
+# waits for it
 my $writer = $coordinator->background_psql('postgres', on_error_stop => 1);
 $writer->query("BEGIN;\nINSERT INTO t VALUES (500, 'w');\n");
 eval {
@@ -45,8 +47,6 @@ eval {
 };
 like($@, qr/lock timeout/,
 	'the move of the bucket of a routed insert waits for it');
-run("SET lock_timeout = '3s'; SELECT gp.move_bucket('t', $other, 3)");
-pass('the move of another bucket answers while the insert runs');
 
 # A write that runs on the segments may touch any bucket of the group,
 # and holds the whole group: the move of any bucket waits for it
@@ -84,6 +84,39 @@ eval {
 like($@, qr/lock timeout/, 'the move waits for a holder of the whole group');
 $holder->query("ROLLBACK;\n");
 $holder->quit;
+
+# Under the copy of a move the writes of the other buckets answer, and
+# the window of the switch waits for their transaction to end
+if ($ENV{enable_injection_points} eq 'yes')
+{
+	run("CREATE EXTENSION injection_points;\n"
+	   . "SELECT injection_points_attach('gp-move-copied', 'wait')");
+	my $mover = $coordinator->background_psql('postgres', on_error_stop => 1);
+	$mover->query_until(qr/go/,
+		"\\echo go\nSELECT gp.move_bucket('t', $other, 3);\n");
+	$coordinator->wait_for_event('client backend', 'gp-move-copied');
+
+	# A key whose bucket takes no part in the move
+	my $free = 501;
+	$free++ while run("SELECT gp.bucket(1024, $free)") == $other;
+
+	my $copier = $coordinator->background_psql('postgres', on_error_stop => 1);
+	$copier->query("BEGIN;\nINSERT INTO t VALUES ($free, 'c');\n");
+	pass('a write of another bucket answers under the copy of a move');
+	$copier->query("ROLLBACK;\n");
+	$copier->quit;
+
+	run("SELECT injection_points_detach('gp-move-copied');\n"
+		. "SELECT injection_points_wakeup('gp-move-copied');\n");
+	$mover->query('SELECT 1');
+	is(run('SELECT sum(a), count(*) FROM t'), '465|30',
+		'and the move after it keeps the truth of the whole');
+}
+else
+{
+	pass('injection points are not supported by this build');
+	pass('injection points are not supported by this build');
+}
 
 # The moves after the holders left answer, and the whole stays whole
 run("SET lock_timeout = '3s'; SELECT gp.move_bucket('t', $bk, 2)");
