@@ -471,6 +471,21 @@ AS 'MODULE_PATHNAME', 'gp_bucket'
 LANGUAGE C IMMUTABLE PARALLEL SAFE;
 
 -- The segment of a bucket of a colocation group
+-- The segment this server runs as: the ownership conditions of the
+-- gathered rows compare it, and the planner folds it to a constant
+CREATE FUNCTION gp.self_segment()
+RETURNS int4
+AS 'MODULE_PATHNAME', 'gp_self_segment'
+LANGUAGE C IMMUTABLE STRICT;
+
+-- Whether the segment that runs the query owns the row of the key: the
+-- map of the group rides in the query, and a row answers when the map
+-- names the segment that runs it
+CREATE FUNCTION gp.row_owned(nbuckets int, map int[], VARIADIC key "any")
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'gp_row_owned'
+LANGUAGE C IMMUTABLE;
+
 CREATE FUNCTION gp.bucket_segment(colocation_id int, bucket int)
 RETURNS int
 LANGUAGE sql STABLE PARALLEL SAFE

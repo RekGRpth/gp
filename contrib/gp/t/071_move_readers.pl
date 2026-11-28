@@ -3,7 +3,8 @@
 
 # A move of a bucket copies while the readers answer: the rows of the
 # copy wait uncommitted on the new segment, and the cluster reads the
-# old side, once each.  Then a short window holds the readers while the
+# old side, once each; a reader that holds its snapshot keeps its rows
+# through the copy.  Then a short window holds the readers while the
 # copy commits, the map switches, and the rows go away from the old
 # segment.  The writers wait at the locks of the gate: a
 # share-row-exclusive holder of the table, and an uncommitted write of
@@ -30,28 +31,28 @@ INSERT INTO t SELECT g, 'r' || g FROM generate_series(1, 30) gs(g);
 INSERT INTO u SELECT g % 4, g * 1.5 FROM generate_series(1, 30) gs(g);
 DDL
 
-# The copy goes under an open reader, and the window of the switch
-# waits for the reader's transaction to end
+# The copy goes under a reader that holds its snapshot, and the window
+# of the switch waits for the reader's transaction to end
 if ($ENV{enable_injection_points} eq 'yes')
 {
 	run("CREATE EXTENSION injection_points;\n"
 	   . "SELECT injection_points_attach('gp-move-copied', 'wait')");
 	my $reader = $coordinator->background_psql('postgres', on_error_stop => 1);
-	$reader->query("BEGIN;\nDECLARE c CURSOR FOR SELECT * FROM t;\n"
-				   . "FETCH 1 FROM c;\n");
+	$reader->query("BEGIN ISOLATION LEVEL REPEATABLE READ;\n"
+				   . "SELECT count(*) FROM t;\n");
 	my $mover = $coordinator->background_psql('postgres', on_error_stop => 1);
-	$mover->query_until(qr/go/, "\\echo go\nSELECT gp.move_bucket('t', 0, 3);\n");
+	$mover->query_until(qr/go/, "\\echo go\nSET statement_timeout = '120s';\n"
+		. "SELECT gp.move_bucket('t', 0, 3);\n");
 	$coordinator->wait_for_event('client backend', 'gp-move-copied');
 	is(run('SELECT sum(a), count(*) FROM t'), '465|30',
 		'the cluster reads the old side once while the copy waits');
-	my $seen = $reader->query("FETCH ALL FROM c");
-	is(scalar(grep { length } split(/\n/, $seen)), 29,
-		'the open cursor of the reader keeps its rows through the copy');
+	is($reader->query('SELECT count(*) FROM t'), 30,
+		'the snapshot of the reader keeps its rows through the copy');
 	$reader->query("ROLLBACK;\n");
 	$reader->quit;
 	run("SELECT injection_points_detach('gp-move-copied');\n"
 		. "SELECT injection_points_wakeup('gp-move-copied');\n");
-	$mover->query('SELECT 1');
+	$mover->quit;
 }
 else
 {
