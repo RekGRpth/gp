@@ -921,9 +921,23 @@ by the patch and `contrib/gp`.
    nodes, the stop of a node, the tail of a log, and settings on all
    servers.
 
-Later: mirrors.  The moving of the buckets is the base of growing and
-shrinking the cluster; the commands of the growth and the shrink on top
-of it are yet to come.
+10. **Growth and shrink of the cluster** — done: mirrors (a mirror
+   streams from its primary and takes its place when the primary dies; a
+   mirror of a shrinking primary may stay and take its place), the move
+   of a bucket of a colocation group (`gp.move_bucket`), the even-share
+   rebalance of the buckets over the segments
+   (`gp.rebalance_segments`), the shrink of a segment
+   (`gp.shrink_segment`), and the growth of one (`gp.expand_segment`
+   joins a copy of the coordinator as a segment, `gp.expand_cleanup`
+   cleans its copies of the tables).  A move holds the tables of the
+   group against the writes of the cluster and lets the readers answer
+   while the rows are in two places: the map commits in one transaction,
+   so no read doubles a row and no write loses one.
+
+Later: a thinner lock of a move — the writes of the moving bucket wait,
+the writes of the other buckets answer; the repair of a move that a
+crash breaks in the middle; the queries whose derived tables ride mixed
+levels.
 
 ## License
 

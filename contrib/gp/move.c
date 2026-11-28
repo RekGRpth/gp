@@ -6,9 +6,12 @@
  * A bucket moves in three steps: the rows of the bucket copy from the old
  * segment of the bucket to the new one, the bucket's row of the map
  * switches in one transaction, and the rows go away from the old segment.
- * The tables of the group take an exclusive lock on the coordinator for
- * the move, so no statement of the cluster reads or writes the bucket in
- * the middle of it, and the sessions drop their cached policies after.
+ * The tables of the group take a share-row-exclusive lock on the
+ * coordinator for the move: the writers of the tables wait while the
+ * rows are in two places, and the readers answer — the map commits in
+ * one transaction, so a read keeps to the side of the switch its
+ * snapshot took and never doubles a row.  The sessions drop their cached
+ * policies after.
  * The number of the segment that owns a bucket is a name, not a position:
  * a move never renumbers anything else.
  *
@@ -273,15 +276,16 @@ gp_move_bucket(PG_FUNCTION_ARGS)
 	SPI_finish();
 
 	/*
-	 * The move holds the tables of the group against every statement of
-	 * the cluster while the rows are in two places, so no read doubles a
-	 * row and no write loses one
+	 * The move holds the tables of the group against the writes of the
+	 * cluster while the rows are in two places, so no write loses one;
+	 * the readers answer, and the one-transaction switch of the map keeps
+	 * every read on one side of it
 	 */
 	for (int k = 0; k < ntables; k++)
 	{
-		Relation	rel = table_open(tables[k].relid, AccessExclusiveLock);
+		Relation	rel = table_open(tables[k].relid, ShareRowExclusiveLock);
 
-		table_close(rel, AccessExclusiveLock);
+		table_close(rel, ShareRowExclusiveLock);
 	}
 
 	/* The connections of the two segments */
